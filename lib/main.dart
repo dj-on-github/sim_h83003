@@ -1,0 +1,1991 @@
+// Mobile/desktop UI for the H8/3003 (H8/300H) simulator.
+//
+// This file owns only presentation and user interaction. It instantiates a
+// single [H8Cpu] model and renders: the register/PC/CCR panel, a scrollable
+// window into the 16-Mbyte sparse memory, a disassembly of the allocated
+// regions, a profiler view, and a control bar (Pause / Step / Run, NMI,
+// IRQ) along the bottom. A hex loader and tap-to-edit memory let the user
+// get a program into memory. Follows the same scheme as sim_6502.
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import 'h8300h.dart';
+import 'hex_files.dart';
+import 'sparse_memory.dart';
+// Writes a file to a chosen path on desktop/mobile; no-op stub on web.
+import 'file_save_stub.dart' if (dart.library.io) 'file_save_io.dart';
+// Reads a hex file named on the command line. Uses dart:io on desktop/mobile,
+// and a no-op stub on web (which has no command-line file access).
+import 'hex_startup_stub.dart' if (dart.library.io) 'hex_startup_io.dart';
+
+void main(List<String> args) {
+  // On the desktop builds the runner forwards command line arguments here,
+  // so `sim_h83003 program.mot` loads that file at startup.
+  final startup = readStartupHexFile(args);
+  runApp(SimH8App(startup: startup));
+}
+
+/// Shown in the in-app About dialog. Keep [kAppVersion] in step with the
+/// `version:` field in pubspec.yaml.
+const String kAppVersion = '1.0.0';
+const String kAppCopyright = 'Copyright © 2026 David Johnston';
+
+/// User-adjustable settings (see the gear button in the toolbar).
+class AppSettings {
+  const AppSettings({
+    this.darkMode = true,
+    this.fontFamily = 'monospace',
+    this.cpuHz = 0,
+  });
+
+  final bool darkMode;
+  final String fontFamily;
+
+  /// Target CPU clock in Hz used to pace Run mode. 0 means "max speed"
+  /// (run flat-out within each frame's time budget).
+  final int cpuHz;
+
+  AppSettings copyWith({
+    bool? darkMode,
+    String? fontFamily,
+    int? cpuHz,
+  }) =>
+      AppSettings(
+        darkMode: darkMode ?? this.darkMode,
+        fontFamily: fontFamily ?? this.fontFamily,
+        cpuHz: cpuHz ?? this.cpuHz,
+      );
+}
+
+class SimH8App extends StatefulWidget {
+  const SimH8App({super.key, this.startup});
+
+  /// A hex file named on the command line (path/contents/error), if any.
+  final StartupHex? startup;
+
+  @override
+  State<SimH8App> createState() => _SimH8AppState();
+}
+
+class _SimH8AppState extends State<SimH8App> {
+  AppSettings _settings = const AppSettings();
+
+  ThemeData _theme(Brightness b) => ThemeData(
+        useMaterial3: true,
+        brightness: b,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF2A7FFF),
+          brightness: b,
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'H8/3003 Simulator',
+      debugShowCheckedModeBanner: false,
+      theme: _theme(Brightness.light),
+      darkTheme: _theme(Brightness.dark),
+      themeMode: _settings.darkMode ? ThemeMode.dark : ThemeMode.light,
+      home: SimulatorPage(
+        startup: widget.startup,
+        settings: _settings,
+        onSettingsChanged: (s) => setState(() => _settings = s),
+      ),
+    );
+  }
+}
+
+class SimulatorPage extends StatefulWidget {
+  const SimulatorPage({
+    super.key,
+    this.startup,
+    required this.settings,
+    required this.onSettingsChanged,
+  });
+
+  /// A hex file named on the command line, to load once at startup.
+  final StartupHex? startup;
+
+  /// Current user settings and a callback to change them.
+  final AppSettings settings;
+  final ValueChanged<AppSettings> onSettingsChanged;
+
+  @override
+  State<SimulatorPage> createState() => _SimulatorPageState();
+}
+
+/// One row of the disassembly list: an instruction, or a gap marker
+/// between allocated regions.
+typedef _DisasmEntry = ({int addr, int len, String text, bool gap});
+
+class _SimulatorPageState extends State<SimulatorPage>
+    with SingleTickerProviderStateMixin {
+  final H8Cpu cpu = H8Cpu();
+
+  /// Top address shown in the memory window (drives the header label).
+  int _memBase = 0x000100;
+
+  /// Scroll controllers for the two heavy views.
+  final ScrollController _memScroll = ScrollController();
+  final ScrollController _disasmScroll = ScrollController();
+
+  /// Tab controller for the Memory / Disassembly / Profile tabs.
+  late final TabController _tab;
+
+  /// Cached linear-sweep disassembly of the *allocated* memory regions,
+  /// rebuilt only when the memory contents change (tracked by [_memRev]).
+  List<_DisasmEntry> _disasm = const [];
+  int _memRev = 0; // bumped whenever memory may have changed
+  int _disasmRev = -1; // _memRev the cache was built for
+
+  /// Optional address -> label map loaded from an assembler symbol-table
+  /// JSON. When present, the disassembly view shows labels at their
+  /// addresses and substitutes symbolic names for operand addresses.
+  Map<int, String> _symbols = const {};
+
+  /// Periodic ticker used by Run mode.
+  Timer? _runTimer;
+  bool get _running => _runTimer != null;
+
+  /// Measured effective clock speed (Hz) of the most recent Run.
+  double _effHz = 0;
+
+  static const int _bytesPerRow = 8;
+
+  /// Fixed pixel height of one memory/disassembly row.
+  static const double _rowExtent = 22.0;
+
+  /// Width of each character cell in the memory view's ASCII column.
+  static const double _asciiCharW = 13.0;
+
+  /// Background colour for breakpoint cells/rows.
+  static const Color _breakColor = Color(0xFFC62828);
+
+  /// Below this many logical pixels for two panes, only one view fits and
+  /// the UI falls back to a single tabbed view.
+  static const double _minViewWidth = 380.0;
+
+  /// True when the window is wide enough to show more than one view.
+  bool _wide = false;
+
+  /// Which views are shown in the wide (side-by-side) layout.
+  bool _viewMem = true;
+  bool _viewDis = true;
+  bool _viewProfile = false;
+
+  /// Stable keys so each pane is *moved* (not rebuilt) when the layout
+  /// switches between the tabbed and side-by-side arrangements.
+  final GlobalKey _memKey = GlobalKey();
+  final GlobalKey _disKey = GlobalKey();
+  final GlobalKey _profKey = GlobalKey();
+
+  /// True only when [c] is attached to exactly one scrollable.
+  bool _attached(ScrollController c) => c.positions.length == 1;
+
+  /// The monospace-style font family chosen in settings.
+  String get _font => widget.settings.fontFamily;
+
+  /// Theme-aware "ink" colour for text on the current background.
+  Color get _ink => Theme.of(context).colorScheme.onSurface;
+  Color _inkA(double a) =>
+      Theme.of(context).colorScheme.onSurface.withValues(alpha: a);
+
+  /// Accent used for register values and address columns.
+  Color get _accent => Theme.of(context).brightness == Brightness.dark
+      ? const Color(0xFF7FB5FF)
+      : const Color(0xFF1A5FC4);
+
+  static const Color _accentFixed = Color(0xFF2A7FFF);
+
+  @override
+  void initState() {
+    super.initState();
+    _tab = TabController(length: 3, vsync: this);
+    _loadDemo();
+    _applyStartupHex(); // override the demo if a hex file was given on CLI
+    _memScroll.addListener(_onMemScroll);
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => _scrollToAddress(_memBase));
+  }
+
+  /// If a hex file was named on the command line, load it over the demo.
+  void _applyStartupHex() {
+    final startup = widget.startup;
+    if (startup == null) return;
+
+    final text = startup.contents;
+    if (text == null) {
+      if (startup.path != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => _showSnack(
+            'Could not read ${startup.path}: ${startup.error ?? "unreadable"}.'));
+      }
+      return;
+    }
+
+    final result = parseHexFile(text, cpu.mem.poke);
+    if (result.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _showSnack(
+          'Could not load ${startup.path} as Intel HEX or S-records.'));
+      return;
+    }
+    _memRev++;
+    if (result.startAddress != null) cpu.pc = result.startAddress!;
+    _memBase =
+        ((result.startAddress ?? result.minAddress ?? _memBase) & 0xFFFFF8);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollToAddress(cpu.pc);
+      _showSnack('Loaded ${result.bytesLoaded} bytes from ${startup.path}.');
+    });
+  }
+
+  @override
+  void dispose() {
+    _runTimer?.cancel();
+    _tab.dispose();
+    _memScroll.removeListener(_onMemScroll);
+    _memScroll.dispose();
+    _disasmScroll.dispose();
+    super.dispose();
+  }
+
+  /// Keep the header label in sync with the top visible row.
+  void _onMemScroll() {
+    if (!_attached(_memScroll)) return;
+    final topAddr = ((_memScroll.position.pixels / _rowExtent).floor() *
+            _bytesPerRow) &
+        SparseMemory.addrMask;
+    if (topAddr != _memBase) setState(() => _memBase = topAddr);
+  }
+
+  /// Scrolls both views so [addr] is at (or near) the top.
+  void _scrollToAddress(int addr) {
+    addr &= SparseMemory.addrMask;
+    if (_attached(_memScroll)) {
+      final row = addr ~/ _bytesPerRow;
+      final target =
+          (row * _rowExtent).clamp(0.0, _memScroll.position.maxScrollExtent);
+      _memScroll.jumpTo(target);
+    }
+    _scrollDisasmTo(addr);
+  }
+
+  /// Scrolls the disassembly list so the instruction at/just before [addr]
+  /// is at the top.
+  void _scrollDisasmTo(int addr) {
+    if (!_attached(_disasmScroll)) return;
+    _rebuildDisasmIfNeeded();
+    final i = _disasmIndexForAddr(addr & SparseMemory.addrMask);
+    if (i < 0) return;
+    final target =
+        (i * _rowExtent).clamp(0.0, _disasmScroll.position.maxScrollExtent);
+    _disasmScroll.jumpTo(target);
+  }
+
+  /// Rebuilds the cached disassembly when memory has changed. Only the
+  /// allocated regions of the sparse memory are swept; a gap row marks
+  /// each skipped unallocated stretch.
+  void _rebuildDisasmIfNeeded() {
+    if (_disasmRev == _memRev && _disasm.isNotEmpty) return;
+    final list = <_DisasmEntry>[];
+    var lastEnd = 0;
+    for (final (start, end) in cpu.mem.regions()) {
+      if (start > lastEnd) {
+        list.add((addr: lastEnd, len: start - lastEnd, text: '', gap: true));
+      }
+      var a = start;
+      while (a < end) {
+        final d = cpu.disassemble(a);
+        list.add((addr: a, len: d.length, text: d.text, gap: false));
+        a += d.length;
+      }
+      lastEnd = end;
+    }
+    if (lastEnd < SparseMemory.size) {
+      list.add((
+        addr: lastEnd,
+        len: SparseMemory.size - lastEnd,
+        text: '',
+        gap: true
+      ));
+    }
+    _disasm = list;
+    _disasmRev = _memRev;
+  }
+
+  /// Binary-searches the (address-sorted) disassembly for the entry whose
+  /// range contains [addr].
+  int _disasmIndexForAddr(int addr) {
+    if (_disasm.isEmpty) return -1;
+    var lo = 0, hi = _disasm.length - 1, ans = 0;
+    while (lo <= hi) {
+      final mid = (lo + hi) >> 1;
+      if (_disasm[mid].addr <= addr) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  // --------------------------------------------------------------------
+  // A small demo program: sums 1..10 (= 55 / H'37) and stores the result
+  // at the start of the on-chip RAM (H'FFFD10), then sleeps.
+  // --------------------------------------------------------------------
+  void _loadDemo() {
+    cpu.mem.clear();
+
+    // Reset vector (vector 0): program start H'000100.
+    const resetVector = [0x00, 0x00, 0x01, 0x00];
+    for (var i = 0; i < resetVector.length; i++) {
+      cpu.mem.poke(i, resetVector[i]);
+    }
+
+    const program = <int>[
+      0x7A, 0x07, 0x00, 0xFF, 0xFF, 0x00, //       MOV.L  #H'00FFFF00,ER7  (SP)
+      0xF8, 0x00, //                               MOV.B  #H'00,R0L        sum
+      0xF9, 0x01, //                               MOV.B  #H'01,R1L        i
+      0x08, 0x98, //                        loop:  ADD.B  R1L,R0L
+      0x0A, 0x09, //                               INC.B  R1L
+      0xA9, 0x0B, //                               CMP.B  #H'0B,R1L
+      0x46, 0xF8, //                               BNE    loop
+      0x6A, 0xA8, 0x00, 0xFF, 0xFD, 0x10, //       MOV.B  R0L,@H'FFFD10:24
+      0x01, 0x80, //                        done:  SLEEP
+      0x40, 0xFC, //                               BRA    done
+    ];
+    for (var i = 0; i < program.length; i++) {
+      cpu.mem.poke(0x000100 + i, program[i]);
+    }
+
+    // Pre-allocate the bank holding the on-chip RAM (H'FFFD10-H'FFFF0F)
+    // so it shows as real memory from the start, like the actual chip.
+    cpu.mem.allocate(0xFFFD10);
+
+    cpu.reset();
+    _memBase = 0x000100;
+    _memRev++;
+  }
+
+  // --------------------------------------------------------------------
+  // Simulator controls
+  // --------------------------------------------------------------------
+
+  void _step() {
+    setState(() {
+      cpu.step();
+      _memRev++;
+      _followPc();
+    });
+  }
+
+  /// Effective clock speed of the current/last Run.
+  String _speedLabel() {
+    if (_effHz <= 0) return '—';
+    final mhz = _effHz / 1e6;
+    return mhz >= 1
+        ? '${mhz.toStringAsFixed(1)} MHz'
+        : '${(mhz * 1000).toStringAsFixed(0)} kHz';
+  }
+
+  void _run() {
+    if (_running) return;
+    // Allow the very first instruction to execute even if it sits on an
+    // instruction breakpoint, so Run resumes from where it was paused.
+    var firstStep = true;
+    // The CPU runs decoupled from the 16ms frame timer: each tick executes
+    // as many instructions as fit in a wall-clock budget, optionally paced
+    // to a target clock speed. The views repaint at most once per 300ms.
+    final wall = Stopwatch()..start();
+    final startCycles = cpu.cycles;
+    var lastPaintMs = -300; // ensures the first tick repaints
+    _effHz = 0;
+    setState(() {
+      _runTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+        final targetHz = widget.settings.cpuHz; // 0 == max speed
+        const budgetUs = 10000; // up to ~10ms of CPU work per 16ms frame
+        final tickStartUs = wall.elapsedMicroseconds;
+        var paused = false;
+        var stopped = false;
+        while (!stopped) {
+          if (targetHz > 0) {
+            final allowed = (wall.elapsedMicroseconds * targetHz) ~/ 1000000;
+            if (cpu.cycles - startCycles >= allowed) break;
+          }
+          if (wall.elapsedMicroseconds - tickStartUs >= budgetUs) break;
+          // Run a small batch between clock reads to amortise their cost.
+          for (var i = 0; i < 128; i++) {
+            if (!firstStep &&
+                cpu.instrBreaks.isNotEmpty &&
+                cpu.instrBreaks.contains(cpu.pc)) {
+              paused = true;
+              stopped = true;
+              break;
+            }
+            firstStep = false;
+            cpu.breakHit = false;
+            cpu.step();
+            if (cpu.halted) {
+              stopped = true;
+              break;
+            }
+            if (cpu.breakHit) {
+              paused = true;
+              stopped = true;
+              break;
+            }
+          }
+        }
+        final stopping = cpu.halted || paused;
+        final nowMs = wall.elapsedMilliseconds;
+        if (stopping || nowMs - lastPaintMs >= 300) {
+          final secs = wall.elapsedMicroseconds / 1e6;
+          _effHz = secs > 0 ? (cpu.cycles - startCycles) / secs : 0;
+          lastPaintMs = nowMs;
+          setState(() {
+            _memRev++;
+            _followPc();
+            if (stopping) _pause();
+          });
+        }
+      });
+    });
+  }
+
+  void _pause() {
+    _runTimer?.cancel();
+    _runTimer = null;
+    if (mounted) setState(() {});
+  }
+
+  void _reset() {
+    _pause();
+    setState(cpu.reset);
+    _scrollToAddress(cpu.pc);
+  }
+
+  /// Fires the non-maskable interrupt (vector 7).
+  void _nmi() {
+    setState(() {
+      cpu.nmi();
+      _memRev++;
+    });
+    _scrollToAddress(cpu.pc);
+  }
+
+  /// Fires IRQ0 (vector 12). If the I bit has it masked, the CPU state is
+  /// unchanged and we tell the user why nothing happened.
+  void _irq() {
+    final taken = cpu.irq(0);
+    setState(() {
+      if (taken) _memRev++;
+    });
+    if (taken) {
+      _scrollToAddress(cpu.pc);
+    } else {
+      _showSnack('IRQ0 ignored — the I (interrupt mask) bit is set.');
+    }
+  }
+
+  /// Keep the PC visible in whichever view(s) are showing while running.
+  void _followPc() {
+    if (_wide) {
+      if (_viewMem) _ensurePcVisibleHex();
+      if (_viewDis) _ensurePcVisibleDisasm();
+    } else if (_tab.index == 0) {
+      _ensurePcVisibleHex();
+    } else if (_tab.index == 1) {
+      _ensurePcVisibleDisasm();
+    }
+  }
+
+  void _ensurePcVisibleHex() {
+    if (!_attached(_memScroll)) return;
+    final pos = _memScroll.position;
+    final firstRow = (pos.pixels / _rowExtent).floor();
+    final visibleRows = (pos.viewportDimension / _rowExtent).floor();
+    final pcRow = cpu.pc ~/ _bytesPerRow;
+    if (pcRow < firstRow || pcRow >= firstRow + visibleRows) {
+      final target = ((pcRow - 2) * _rowExtent).clamp(0.0, pos.maxScrollExtent);
+      _memScroll.jumpTo(target);
+    }
+  }
+
+  void _ensurePcVisibleDisasm() {
+    if (!_attached(_disasmScroll)) return;
+    _rebuildDisasmIfNeeded();
+    final idx = _disasmIndexForAddr(cpu.pc);
+    if (idx < 0) return;
+    final pos = _disasmScroll.position;
+    final firstRow = (pos.pixels / _rowExtent).floor();
+    final visibleRows = (pos.viewportDimension / _rowExtent).floor();
+    if (idx < firstRow || idx >= firstRow + visibleRows) {
+      final target = ((idx - 2) * _rowExtent).clamp(0.0, pos.maxScrollExtent);
+      _disasmScroll.jumpTo(target);
+    }
+  }
+
+  // --------------------------------------------------------------------
+  // Editing & navigation dialogs
+  // --------------------------------------------------------------------
+
+  /// A text controller pre-populated with [text] and with all of it
+  /// selected, so the first keystroke replaces the existing value.
+  TextEditingController _selectedController(String text) {
+    return TextEditingController(text: text)
+      ..selection = TextSelection(baseOffset: 0, extentOffset: text.length);
+  }
+
+  Future<void> _editByte(int addr) async {
+    final controller = _selectedController(_hex2(cpu.mem.peek(addr)));
+    var brk = cpu.dataBreaks.contains(addr);
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: Text("Edit H'${_hex6(addr)}"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: controller,
+                autofocus: true,
+                textCapitalization: TextCapitalization.characters,
+                inputFormatters: [
+                  LengthLimitingTextInputFormatter(2),
+                  FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+                ],
+                decoration: const InputDecoration(
+                  labelText: 'Hex byte (00-FF)',
+                  prefixText: "H'",
+                ),
+                onSubmitted: (_) => Navigator.pop(
+                    ctx, int.tryParse(controller.text, radix: 16)),
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Data breakpoint'),
+                subtitle: const Text('Pause Run on read or write here'),
+                value: brk,
+                onChanged: (v) => setLocal(() => brk = v ?? false),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+              child: const Text('Set'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result != null) {
+      setState(() {
+        cpu.mem.poke(addr, result);
+        cpu.breakHit = false; // don't let the UI edit arm a stale break
+        if (brk) {
+          cpu.dataBreaks.add(addr);
+        } else {
+          cpu.dataBreaks.remove(addr);
+        }
+        _memRev++;
+      });
+    }
+  }
+
+  Future<void> _gotoAddress() async {
+    final controller = _selectedController(_hex6(_memBase));
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Go to address'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.characters,
+          inputFormatters: [
+            LengthLimitingTextInputFormatter(6),
+            FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+          ],
+          decoration: const InputDecoration(
+            labelText: 'Hex address (000000-FFFFFF)',
+            prefixText: "H'",
+          ),
+          onSubmitted: (_) =>
+              Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final v = int.tryParse(controller.text, radix: 16);
+              Navigator.pop(ctx, v);
+            },
+            child: const Text('Go'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      _scrollToAddress(result & SparseMemory.addrMask);
+    }
+  }
+
+  Future<void> _loadHex() async {
+    final addrCtrl = _selectedController(_hex6(_memBase));
+    final bytesCtrl = TextEditingController();
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Load hex bytes'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: addrCtrl,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [
+                LengthLimitingTextInputFormatter(6),
+                FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+              ],
+              decoration: const InputDecoration(
+                labelText: 'Start address',
+                prefixText: "H'",
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: bytesCtrl,
+              autofocus: true,
+              maxLines: 4,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F \n,]')),
+              ],
+              decoration: const InputDecoration(
+                labelText: 'Bytes, e.g. F8 00 F9 01',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Load'),
+          ),
+        ],
+      ),
+    );
+    if (result == true) {
+      final start = int.tryParse(addrCtrl.text, radix: 16) ?? _memBase;
+      final tokens =
+          bytesCtrl.text.split(RegExp(r'[\s,]+')).where((t) => t.isNotEmpty);
+      setState(() {
+        var addr = start & SparseMemory.addrMask;
+        for (final t in tokens) {
+          final v = int.tryParse(t, radix: 16);
+          if (v != null) cpu.mem.poke(addr++, v);
+        }
+        _memRev++;
+      });
+      _scrollToAddress(start & SparseMemory.addrMask);
+    }
+  }
+
+  /// Picks a hex/S-record file (local storage or a cloud provider, via the
+  /// OS document picker) and loads it.
+  Future<void> _loadHexFile() async {
+    _pause();
+    FilePickerResult? picked;
+    try {
+      picked = await FilePicker.pickFiles(
+        // FileType.any keeps cloud sources selectable; some providers hide
+        // files when a custom extension filter is applied.
+        type: FileType.any,
+        withData: true,
+      );
+    } catch (e) {
+      _showSnack('Could not open the file picker: $e');
+      return;
+    }
+    if (picked == null || picked.files.isEmpty) return; // user cancelled
+
+    final file = picked.files.first;
+    final data = file.bytes;
+    if (data == null) {
+      _showSnack('Could not read "${file.name}".');
+      return;
+    }
+
+    // Intel HEX and S-records are plain ASCII text.
+    final text = String.fromCharCodes(data);
+    final result = parseHexFile(text, cpu.mem.poke);
+
+    if (result.isEmpty) {
+      final why = result.errors.isNotEmpty
+          ? result.errors.first
+          : 'no data records found';
+      _showSnack('Nothing loaded from "${file.name}" ($why).');
+      return;
+    }
+
+    setState(() {
+      _memRev++;
+      if (result.startAddress != null) cpu.pc = result.startAddress!;
+    });
+
+    final target = result.startAddress ?? result.minAddress ?? _memBase;
+    _scrollToAddress(target);
+
+    final msg = StringBuffer('Loaded ${result.bytesLoaded} bytes');
+    if (result.minAddress != null) {
+      msg.write(
+          " (H'${_hex6(result.minAddress!)}–H'${_hex6(result.maxAddress!)})");
+    }
+    if (result.startAddress != null) {
+      msg.write(", start H'${_hex6(result.startAddress!)}");
+    }
+    if (result.errors.isNotEmpty) {
+      msg.write(' — ${result.errors.length} warning(s)');
+    }
+    _showSnack(msg.toString());
+
+    // If the assembler wrote a "<name>_sym.json" beside the file, load it
+    // so the disassembly shows labels without picking the file by hand.
+    await _autoLoadSymbols(file.path);
+  }
+
+  /// Saves the allocated memory regions as an Intel HEX file.
+  Future<void> _saveHexFile() async {
+    _pause();
+    final text = memoryToIntelHex(cpu.mem);
+    final bytes = Uint8List.fromList(text.codeUnits);
+    try {
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save memory as Intel HEX',
+        fileName: 'memory.hex',
+        bytes: bytes,
+      );
+      if (path == null) {
+        _showSnack('Save cancelled.');
+        return;
+      }
+      // On desktop, saveFile returns a path without writing — write here.
+      await writeBytesToPath(path, bytes);
+      _showSnack('Saved allocated memory to $path');
+    } catch (e) {
+      _showSnack('Save failed: $e');
+    }
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _openAbout() {
+    showAboutDialog(
+      context: context,
+      applicationName: 'sim_h83003',
+      applicationVersion: 'Version $kAppVersion',
+      applicationIcon: const Icon(Icons.memory, size: 40),
+      applicationLegalese: kAppCopyright,
+      children: const [
+        SizedBox(height: 12),
+        Text(
+          'An interactive H8/3003 (H8/300H core, advanced mode) '
+          'microcontroller simulator: live ER0-ER7 registers and CCR '
+          'flags, a hex memory view, a disassembler, and a profiler, over '
+          'a sparse 16-Mbyte address space where 64K banks are allocated '
+          'as they are touched. On-chip RAM lives at H\'FFFD10-H\'FFFF0F; '
+          'the exception vector table starts at H\'000000 with the reset '
+          'vector.',
+        ),
+      ],
+    );
+  }
+
+  /// Opens the settings dialog (theme, font, run speed).
+  Future<void> _openSettings() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        var s = widget.settings;
+        var clearBreakpoints = false;
+        return StatefulBuilder(
+          builder: (ctx, setLocal) {
+            void apply(AppSettings ns) {
+              setLocal(() => s = ns);
+              widget.onSettingsChanged(ns);
+            }
+
+            return AlertDialog(
+              title: const Text('Settings'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Text('Theme'),
+                      const Spacer(),
+                      SegmentedButton<bool>(
+                        segments: const [
+                          ButtonSegment(
+                              value: false,
+                              label: Text('Light'),
+                              icon: Icon(Icons.light_mode_outlined)),
+                          ButtonSegment(
+                              value: true,
+                              label: Text('Dark'),
+                              icon: Icon(Icons.dark_mode_outlined)),
+                        ],
+                        selected: {s.darkMode},
+                        onSelectionChanged: (sel) =>
+                            apply(s.copyWith(darkMode: sel.first)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Text('Font'),
+                      const Spacer(),
+                      DropdownButton<String>(
+                        value: s.fontFamily,
+                        items: const [
+                          DropdownMenuItem(
+                              value: 'monospace', child: Text('Monospace')),
+                          DropdownMenuItem(
+                              value: 'sans-serif', child: Text('Sans-serif')),
+                          DropdownMenuItem(value: 'serif', child: Text('Serif')),
+                        ],
+                        onChanged: (v) =>
+                            v == null ? null : apply(s.copyWith(fontFamily: v)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Text('Run speed'),
+                      const Spacer(),
+                      DropdownButton<int>(
+                        value: s.cpuHz,
+                        items: const [
+                          DropdownMenuItem(value: 0, child: Text('Max')),
+                          DropdownMenuItem(
+                              value: 16000000, child: Text('16 MHz')),
+                          DropdownMenuItem(
+                              value: 8000000, child: Text('8 MHz')),
+                          DropdownMenuItem(
+                              value: 2000000, child: Text('2 MHz')),
+                          DropdownMenuItem(
+                              value: 1000000, child: Text('1 MHz')),
+                        ],
+                        onChanged: (v) =>
+                            v == null ? null : apply(s.copyWith(cpuHz: v)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Delete all breakpoints'),
+                    subtitle: Text(
+                        'Clears the ${cpu.instrBreaks.length + cpu.dataBreaks.length} '
+                        'breakpoint(s) when you press OK'),
+                    value: clearBreakpoints,
+                    onChanged: (v) =>
+                        setLocal(() => clearBreakpoints = v ?? false),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    if (clearBreakpoints) {
+                      setState(() {
+                        cpu.instrBreaks.clear();
+                        cpu.dataBreaks.clear();
+                        _memRev++;
+                      });
+                    }
+                    Navigator.pop(ctx);
+                  },
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // --------------------------------------------------------------------
+  // Build
+  // --------------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    _wide = MediaQuery.of(context).size.width >= 2 * _minViewWidth;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('H8/3003 Simulator'),
+        actions: [
+          Tooltip(
+            message: cpu.profiling
+                ? 'Profiling on — turn off to keep the counts for viewing'
+                : 'Profiling off — turn on to zero the counts and record',
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.insights,
+                    size: 18, color: cpu.profiling ? _accentFixed : null),
+                Switch(
+                  value: cpu.profiling,
+                  onChanged: _setProfiling,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            onPressed: _openSettings,
+            icon: const Icon(Icons.settings),
+          ),
+          IconButton(
+            tooltip: 'Paste hex bytes',
+            onPressed: _loadHex,
+            icon: const Icon(Icons.file_upload_outlined),
+          ),
+          IconButton(
+            tooltip: 'Open Intel HEX / S-record file',
+            onPressed: _loadHexFile,
+            icon: const Icon(Icons.folder_open_outlined),
+          ),
+          IconButton(
+            tooltip: 'Save allocated memory to .hex file (Intel HEX)',
+            onPressed: _saveHexFile,
+            icon: const Icon(Icons.save_outlined),
+          ),
+          IconButton(
+            tooltip: "Reset (load reset vector at H'000000)",
+            onPressed: _reset,
+            icon: const Icon(Icons.restart_alt),
+          ),
+          IconButton(
+            tooltip: 'Reload demo',
+            onPressed: () {
+              _pause();
+              setState(_loadDemo);
+              _scrollToAddress(_memBase);
+            },
+            icon: const Icon(Icons.refresh),
+          ),
+          IconButton(
+            tooltip: 'About sim_h83003',
+            onPressed: _openAbout,
+            icon: const Icon(Icons.info_outline),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          _registerPanel(),
+          _nextInstruction(),
+          Expanded(child: _wide ? _multiView() : _tabbedView()),
+        ],
+      ),
+      bottomNavigationBar: _controlBar(),
+    );
+  }
+
+  /// Narrow layout: a tab bar with one view visible at a time.
+  Widget _tabbedView() {
+    return Column(
+      children: [
+        TabBar(
+          controller: _tab,
+          isScrollable: true,
+          tabAlignment: TabAlignment.start,
+          tabs: const [
+            Tab(text: 'Memory'),
+            Tab(text: 'Disassembly'),
+            Tab(text: 'Profile'),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tab,
+            physics: const NeverScrollableScrollPhysics(),
+            children: [
+              KeyedSubtree(
+                  key: _memKey, child: _KeepAlive(child: _memoryView())),
+              KeyedSubtree(
+                  key: _disKey, child: _KeepAlive(child: _disasmView())),
+              KeyedSubtree(
+                  key: _profKey, child: _KeepAlive(child: _profileView())),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Wide layout: the checked views shown side by side.
+  Widget _multiView() {
+    const wideFlex = 2;
+    final entries = <({Widget pane, int flex})>[
+      if (_viewMem)
+        (
+          pane:
+              KeyedSubtree(key: _memKey, child: _KeepAlive(child: _memoryView())),
+          flex: wideFlex
+        ),
+      if (_viewDis)
+        (
+          pane:
+              KeyedSubtree(key: _disKey, child: _KeepAlive(child: _disasmView())),
+          flex: wideFlex
+        ),
+      if (_viewProfile)
+        (
+          pane: KeyedSubtree(
+              key: _profKey, child: _KeepAlive(child: _profileView())),
+          flex: 1
+        ),
+    ];
+    if (entries.isEmpty) {
+      return const Center(child: Text('Select a view above'));
+    }
+    final children = <Widget>[];
+    for (var i = 0; i < entries.length; i++) {
+      if (i > 0) children.add(const VerticalDivider(width: 1, thickness: 1));
+      children.add(Expanded(flex: entries[i].flex, child: entries[i].pane));
+    }
+    return Row(children: children);
+  }
+
+  // ---- Registers -------------------------------------------------------
+
+  Widget _registerPanel() {
+    return Container(
+      width: double.infinity,
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 14,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _reg('PC', _hex6(cpu.pc),
+                  onTap: () => _editRegister(
+                      'PC', cpu.pc, 6, (v) => cpu.pc = v & 0xFFFFFF)),
+              for (var i = 0; i < 8; i++)
+                _reg(i == 7 ? 'ER7/SP' : 'ER$i', _hex8(cpu.er[i]),
+                    onTap: () => _editRegister(i == 7 ? 'ER7 (SP)' : 'ER$i',
+                        cpu.er[i], 8, (v) => cpu.er[i] = v)),
+              _viewToggles(),
+              _cpuChip(),
+              // Cycle count last: it is decimal and variable-width, so
+              // keeping it rightmost stops the pills jittering.
+              _reg('CYC', cpu.cycles.toString(), hex: false),
+              _reg('SPD', _speedLabel(), hex: false),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _flagsRow(),
+        ],
+      ),
+    );
+  }
+
+  /// Toggles selecting which views are shown in the wide layout.
+  Widget _viewToggles() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _viewToggle('MEM', _viewMem, (v) => _viewMem = v),
+        const SizedBox(width: 4),
+        _viewToggle('DIS', _viewDis, (v) => _viewDis = v),
+        const SizedBox(width: 4),
+        _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
+      ],
+    );
+  }
+
+  Widget _viewToggle(String label, bool on, void Function(bool) apply) {
+    final enabled = _wide;
+    final selectedCount =
+        (_viewMem ? 1 : 0) + (_viewDis ? 1 : 0) + (_viewProfile ? 1 : 0);
+    return Tooltip(
+      message: enabled
+          ? 'Show the $label view'
+          : 'Widen the window to show more than one view',
+      child: InkWell(
+        onTap: enabled
+            ? () {
+                if (on && selectedCount <= 1) return;
+                setState(() => apply(!on));
+              }
+            : null,
+        borderRadius: BorderRadius.circular(4),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+          decoration: BoxDecoration(
+            color: (enabled && on)
+                ? _accentFixed
+                : Theme.of(context).colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: Colors.black26),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                on ? Icons.check_box : Icons.check_box_outline_blank,
+                size: 13,
+                color:
+                    !enabled ? _inkA(0.25) : (on ? Colors.white : _inkA(0.55)),
+              ),
+              const SizedBox(width: 3),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: !enabled
+                      ? _inkA(0.25)
+                      : (on ? Colors.white : _inkA(0.7)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A pill showing the emulated CPU and memory footprint.
+  Widget _cpuChip() {
+    final banks = cpu.mem.allocatedBankCount;
+    return Tooltip(
+      message: 'H8/3003 — H8/300H CPU, advanced mode, 16-Mbyte address '
+          'space. $banks of ${SparseMemory.numBanks} 64K banks allocated.',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: _accentFixed,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.black26),
+        ),
+        child: Text(
+          'H8/3003 · $banks×64K',
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+            color: Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _reg(String label, String value,
+      {VoidCallback? onTap, bool hex = true}) {
+    final content = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('$label ',
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+        Text(hex ? "H'$value" : value,
+            style: TextStyle(fontFamily: _font, fontSize: 14, color: _accent)),
+        if (onTap != null) ...[
+          const SizedBox(width: 2),
+          Icon(Icons.edit, size: 11, color: _inkA(0.3)),
+        ],
+      ],
+    );
+    if (onTap == null) return content;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(4),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        child: content,
+      ),
+    );
+  }
+
+  /// Pops a hex-entry dialog to edit a register. [digits] is 6 for the
+  /// 24-bit PC and 8 for the 32-bit ERn registers.
+  Future<void> _editRegister(
+    String name,
+    int current,
+    int digits,
+    void Function(int) apply,
+  ) async {
+    final controller = _selectedController(
+      current.toRadixString(16).toUpperCase().padLeft(digits, '0'),
+    );
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Edit $name'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.characters,
+          inputFormatters: [
+            LengthLimitingTextInputFormatter(digits),
+            FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+          ],
+          decoration: InputDecoration(
+            labelText: 'Hex ($digits digits)',
+            prefixText: "H'",
+          ),
+          onSubmitted: (_) =>
+              Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+            child: const Text('Set'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      setState(() => apply(result));
+      if (name == 'PC') _scrollToAddress(cpu.pc);
+    }
+  }
+
+  Widget _flagsRow() {
+    // H8/300H condition-code register: I UI H U N Z V C.
+    const flags = [
+      ('I', H8Flag.i),
+      ('UI', H8Flag.ui),
+      ('H', H8Flag.h),
+      ('U', H8Flag.u),
+      ('N', H8Flag.n),
+      ('Z', H8Flag.z),
+      ('V', H8Flag.v),
+      ('C', H8Flag.c),
+    ];
+    return Row(
+      children: [
+        const Text('CCR ',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+        for (final f in flags)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 3),
+            child: _flagChip(f.$1, cpu.getFlag(f.$2),
+                onTap: () => _toggleFlag(f.$2)),
+          ),
+      ],
+    );
+  }
+
+  void _toggleFlag(int mask) {
+    setState(() => cpu.setFlag(mask, !cpu.getFlag(mask)));
+  }
+
+  Widget _flagChip(String name, bool on, {VoidCallback? onTap}) {
+    final chip = Container(
+      width: name.length > 1 ? 28 : 22,
+      height: 22,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: on
+            ? _accentFixed
+            : Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: Colors.black26),
+      ),
+      child: Text(
+        name,
+        style: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+          color: on ? Colors.white : _inkA(0.45),
+        ),
+      ),
+    );
+    if (onTap == null) return chip;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(4),
+      child: chip,
+    );
+  }
+
+  Widget _nextInstruction() {
+    final d = cpu.disassemble(cpu.pc);
+    final label = cpu.halted ? (cpu.sleeping ? 'SLEEPING' : 'HALTED') : 'NEXT';
+    return Container(
+      width: double.infinity,
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Row(
+        children: [
+          Text(label,
+              style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color: cpu.halted ? Colors.orangeAccent : _inkA(0.55))),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              cpu.halted && !cpu.sleeping
+                  ? "H'${_hex6(cpu.pc)}:  ${cpu.haltReason}"
+                  : "H'${_hex6(cpu.pc)}:  ${d.text}",
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontFamily: _font, fontSize: 14, color: _ink),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- Memory window -----------------------------------------------------
+
+  Widget _memoryView() {
+    return Column(
+      children: [
+        _memHeader(),
+        Expanded(
+          child: ListView.builder(
+            controller: _memScroll,
+            itemExtent: _rowExtent,
+            itemCount: SparseMemory.size ~/ _bytesPerRow,
+            itemBuilder: (ctx, row) => _memRow(row * _bytesPerRow),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _memHeader() {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.memory, size: 18),
+          const SizedBox(width: 6),
+          const Text('Memory', style: TextStyle(fontWeight: FontWeight.bold)),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: TextButton.icon(
+                  onPressed: _gotoAddress,
+                  icon: const Icon(Icons.my_location, size: 16),
+                  label: Text("Go to  H'${_hex6(_memBase)}"),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _memRow(int rowAddr) {
+    final pcInRow = cpu.pc >= rowAddr && cpu.pc < rowAddr + _bytesPerRow;
+    final allocated = cpu.mem.isAllocated(rowAddr);
+    return Container(
+      color: pcInRow ? const Color(0x222A7FFF) : Colors.transparent,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 76,
+            child: Text("H'${_hex6(rowAddr)}",
+                style: TextStyle(
+                    fontFamily: _font,
+                    fontSize: 13,
+                    color: allocated ? _accent : _inkA(0.3))),
+          ),
+          for (var i = 0; i < _bytesPerRow; i++)
+            _memCell(rowAddr + i, allocated),
+          const SizedBox(width: 8),
+          _asciiColumn(rowAddr, allocated),
+        ],
+      ),
+    );
+  }
+
+  /// The character column on the right (plain ASCII; other bytes show as
+  /// a dot). Fixed one-em cells keep the hex columns aligned.
+  Widget _asciiColumn(int rowAddr, bool allocated) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (var i = 0; i < _bytesPerRow; i++)
+          SizedBox(
+            width: _asciiCharW,
+            child: Text(
+              allocated ? _asciiGlyph(cpu.mem.peek(rowAddr + i)) : '·',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontFamily: _font,
+                fontSize: 13,
+                color: _inkA(allocated ? 0.6 : 0.2),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  static String _asciiGlyph(int code) =>
+      (code >= 0x20 && code < 0x7F) ? String.fromCharCode(code) : '·';
+
+  Widget _memCell(int addr, bool allocated) {
+    final isPc = addr == cpu.pc;
+    final isBreak = cpu.dataBreaks.contains(addr);
+    final Color? bg = isPc ? _accentFixed : (isBreak ? _breakColor : null);
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _editByte(addr),
+        child: Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(vertical: 1),
+          margin: const EdgeInsets.symmetric(horizontal: 1),
+          decoration: bg != null
+              ? BoxDecoration(
+                  color: bg,
+                  borderRadius: BorderRadius.circular(3),
+                  // PC sitting on a data breakpoint: fill + red outline.
+                  border: (isPc && isBreak)
+                      ? Border.all(color: _breakColor, width: 1.5)
+                      : null,
+                )
+              : null,
+          child: Text(
+            _hex2(cpu.mem.peek(addr)),
+            style: TextStyle(
+              fontFamily: _font,
+              fontSize: 13,
+              color: isPc
+                  ? Colors.white
+                  : (isBreak
+                      ? Colors.white
+                      : (allocated ? _ink : _inkA(0.25))),
+              fontWeight:
+                  (isPc || isBreak) ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---- Disassembly view ----------------------------------------------------
+
+  /// Opens a JSON symbol table and maps its addresses to labels. Accepts a
+  /// `{ "label": address }` object (address as an int or a hex string), or
+  /// a list of `"name = H'hhhhhh"`-style listing lines.
+  Future<void> _loadSymbols() async {
+    try {
+      final picked =
+          await FilePicker.pickFiles(type: FileType.any, withData: true);
+      if (picked == null || picked.files.isEmpty) return;
+      final bytes = picked.files.first.bytes;
+      if (bytes == null) {
+        _showSnack('Could not read that file.');
+        return;
+      }
+      final n = _applySymbolBytes(bytes);
+      if (n == 0) {
+        _showSnack('No symbols found in that file.');
+        return;
+      }
+      _showSnack('Loaded $n symbols.');
+    } catch (e) {
+      _showSnack('Symbol load failed: $e');
+    }
+  }
+
+  /// Parses a symbol-table JSON from [bytes] and installs it, returning
+  /// the number of symbols loaded.
+  int _applySymbolBytes(List<int> bytes) {
+    final map = <int, String>{};
+    try {
+      final decoded = json.decode(utf8.decode(bytes));
+      if (decoded is Map) {
+        decoded.forEach((k, v) {
+          final addr = _asAddress(v);
+          if (addr != null) map[addr] = k.toString();
+        });
+      } else if (decoded is List) {
+        final re = RegExp(
+            r"^\s*([A-Za-z_.$][\w.$]*)\s*=\s*(?:H'|\$|0x)?([0-9A-Fa-f]+)");
+        for (final item in decoded) {
+          final m = re.firstMatch(item.toString());
+          if (m != null) {
+            map[int.parse(m.group(2)!, radix: 16) & SparseMemory.addrMask] =
+                m.group(1)!;
+          }
+        }
+      }
+    } catch (_) {
+      return 0;
+    }
+    if (map.isEmpty) return 0;
+    setState(() => _symbols = map);
+    return map.length;
+  }
+
+  /// After loading a hex file at [hexPath], look for a sibling symbol
+  /// table `<name>_sym.json` and load it automatically.
+  Future<void> _autoLoadSymbols(String? hexPath) async {
+    if (hexPath == null) return;
+    final dot = hexPath.lastIndexOf('.');
+    if (dot <= 0) return;
+    final symPath = '${hexPath.substring(0, dot)}_sym.json';
+    final bytes = await readBytesFromPath(symPath);
+    if (bytes == null) return; // no sibling symbol file
+    final n = _applySymbolBytes(bytes);
+    if (n > 0) _showSnack('Auto-loaded $n symbols from ${_baseName(symPath)}.');
+  }
+
+  String _baseName(String path) => path.split(RegExp(r'[\\/]')).last;
+
+  /// Coerces a symbol-table value to a 24-bit address.
+  int? _asAddress(dynamic v) {
+    if (v is int) return v & SparseMemory.addrMask;
+    if (v is String) {
+      var s = v.trim();
+      if (s.startsWith("H'")) s = s.substring(2);
+      if (s.startsWith('\$')) s = s.substring(1);
+      if (s.startsWith('0x') || s.startsWith('0X')) s = s.substring(2);
+      final hex = int.tryParse(s, radix: 16);
+      if (hex != null) return hex & SparseMemory.addrMask;
+      final dec = int.tryParse(s);
+      if (dec != null) return dec & SparseMemory.addrMask;
+    }
+    return null;
+  }
+
+  /// Replaces `H'xxxxxx` operand addresses in a disassembly line with
+  /// their symbol names (leaving `#H'xx` immediates alone).
+  String _subSymbols(String text) {
+    if (_symbols.isEmpty) return text;
+    return text.replaceAllMapped(
+      RegExp(r"(?<!#)H'([0-9A-Fa-f]{4}|[0-9A-Fa-f]{6})(?![0-9A-Fa-f])"),
+      (m) {
+        final addr = int.parse(m.group(1)!, radix: 16) & SparseMemory.addrMask;
+        return _symbols[addr] ?? m.group(0)!;
+      },
+    );
+  }
+
+  Widget _disasmView() {
+    _rebuildDisasmIfNeeded();
+    return Column(
+      children: [
+        _disasmHeader(),
+        Expanded(
+          child: ListView.builder(
+            controller: _disasmScroll,
+            itemExtent: _rowExtent,
+            itemCount: _disasm.length,
+            itemBuilder: (ctx, i) => _disasmRow(_disasm[i]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _disasmHeader() {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.list_alt, size: 18),
+          const SizedBox(width: 6),
+          const Text('Disassembly',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton.icon(
+                      onPressed: _loadSymbols,
+                      icon: const Icon(Icons.label_outline, size: 16),
+                      label: Text(_symbols.isEmpty
+                          ? 'Symbols'
+                          : 'Symbols (${_symbols.length})'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _gotoAddress,
+                      icon: const Icon(Icons.my_location, size: 16),
+                      label: const Text('Go to'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _disasmRow(_DisasmEntry e) {
+    if (e.gap) {
+      final endAddr = e.addr + e.len - 1;
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+        alignment: Alignment.centerLeft,
+        child: Text(
+          "····  H'${_hex6(e.addr)}–H'${_hex6(endAddr)}  unallocated",
+          style: TextStyle(
+              fontFamily: _font,
+              fontSize: 12,
+              fontStyle: FontStyle.italic,
+              color: _inkA(0.35)),
+        ),
+      );
+    }
+    final isPc = cpu.pc >= e.addr && cpu.pc < e.addr + e.len;
+    final isBreak = cpu.instrBreaks.contains(e.addr);
+    // The raw bytes for this instruction (long ones get an ellipsis).
+    final shown = e.len > 6 ? 5 : e.len;
+    var bytes = [
+      for (var i = 0; i < shown; i++) _hex2(cpu.mem.peek(e.addr + i)),
+    ].join(' ');
+    if (shown < e.len) bytes = '$bytes …';
+    return GestureDetector(
+      // Tap a row to set/clear an instruction breakpoint at its address.
+      onTap: () => _toggleInstrBreak(e.addr),
+      child: Container(
+        color: isBreak
+            ? _breakColor
+            : (isPc ? const Color(0x222A7FFF) : Colors.transparent),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+        child: Row(
+          children: [
+            // PC marker.
+            SizedBox(
+              width: 14,
+              child: isPc
+                  ? Icon(Icons.play_arrow,
+                      size: 13, color: isBreak ? Colors.white : _accentFixed)
+                  : null,
+            ),
+            SizedBox(
+              width: 72,
+              child: Text("H'${_hex6(e.addr)}",
+                  style: TextStyle(
+                      fontFamily: _font,
+                      fontSize: 13,
+                      color: isBreak ? Colors.white : _accent)),
+            ),
+            SizedBox(
+              width: 132,
+              child: Text(bytes,
+                  style: TextStyle(
+                      fontFamily: _font,
+                      fontSize: 13,
+                      color: isBreak ? Colors.white70 : _inkA(0.45))),
+            ),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text.rich(
+                TextSpan(children: [
+                  // Show the label defined at this address, if any.
+                  if (_symbols[e.addr] != null)
+                    TextSpan(
+                      text: '${_symbols[e.addr]}: ',
+                      style: TextStyle(
+                          color:
+                              isBreak ? Colors.white : const Color(0xFFE0A030),
+                          fontWeight: FontWeight.bold),
+                    ),
+                  TextSpan(text: _subSymbols(e.text)),
+                ]),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontFamily: _font,
+                    fontSize: 13,
+                    fontWeight: isPc ? FontWeight.bold : FontWeight.normal,
+                    color: isBreak ? Colors.white : _ink),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _toggleInstrBreak(int addr) {
+    setState(() {
+      if (cpu.instrBreaks.contains(addr)) {
+        cpu.instrBreaks.remove(addr);
+      } else {
+        cpu.instrBreaks.add(addr);
+      }
+    });
+  }
+
+  // ---- Profiling -----------------------------------------------------------
+
+  /// Turns profiling on or off. Switching on zeroes the counters first;
+  /// switching off keeps them so the Profile view can still be read.
+  void _setProfiling(bool on) {
+    setState(() {
+      if (on && !cpu.profiling) cpu.resetProfile();
+      cpu.profiling = on;
+      _memRev++;
+    });
+  }
+
+  /// The nonzero entries of [counts] as (address, count), most frequent
+  /// first, capped at [limit] rows.
+  List<MapEntry<int, int>> _topCounts(SparseCounters counts, int limit) {
+    final entries = counts.nonZeroEntries();
+    entries.sort((x, y) => y.value.compareTo(x.value));
+    return entries.length > limit ? entries.sublist(0, limit) : entries;
+  }
+
+  Widget _profileView() {
+    final data = _topCounts(cpu.dataAccessCount, 512);
+    final instr = _topCounts(cpu.instrExecCount, 512);
+
+    if (data.isEmpty && instr.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            cpu.profiling
+                ? 'Profiling is on — run the program to collect counts.'
+                : 'No profile data yet.\n\nTurn on the Profile switch at the '
+                    'top, then Run. The counts are zeroed each time you '
+                    'switch profiling on, and kept when you switch it off.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: _inkA(0.6)),
+          ),
+        ),
+      );
+    }
+
+    Widget section(String title, List<MapEntry<int, int>> items,
+        String Function(int addr) detail) {
+      return Column(
+        children: [
+          Container(
+            width: double.infinity,
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Text('$title  (${items.length})',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          Expanded(
+            child: items.isEmpty
+                ? Center(child: Text('—', style: TextStyle(color: _inkA(0.4))))
+                : ListView.builder(
+                    itemCount: items.length,
+                    itemExtent: _rowExtent,
+                    itemBuilder: (_, i) =>
+                        _profileRow(items[i].key, items[i].value, detail),
+                  ),
+          ),
+        ],
+      );
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          child: section(
+              'Data accesses', data, (a) => "= H'${_hex2(cpu.mem.peek(a))}"),
+        ),
+        const Divider(height: 1, thickness: 1),
+        Expanded(
+          child: section(
+              'Instruction executions', instr, (a) => cpu.disassemble(a).text),
+        ),
+      ],
+    );
+  }
+
+  Widget _profileRow(int addr, int count, String Function(int addr) detail) {
+    final mono = TextStyle(fontFamily: _font, fontSize: 13, color: _ink);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      child: Row(
+        children: [
+          SizedBox(width: 72, child: Text("H'${_hex6(addr)}", style: mono)),
+          SizedBox(
+            width: 92,
+            child: Text(count.toString(),
+                textAlign: TextAlign.right,
+                style: mono.copyWith(color: _accent)),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(detail(addr),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: mono.copyWith(color: _inkA(0.75))),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- Control bar ---------------------------------------------------------
+
+  Widget _controlBar() {
+    return SafeArea(
+      top: false,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHigh,
+          border: Border(
+              top: BorderSide(color: Colors.black.withValues(alpha: 0.3))),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            _ctrlButton(
+              icon: Icons.pause,
+              label: 'Pause',
+              onPressed: _running ? _pause : null,
+            ),
+            _ctrlButton(
+              icon: Icons.skip_next,
+              label: 'Step',
+              onPressed: (_running || cpu.halted) ? null : _step,
+            ),
+            _ctrlButton(
+              icon: Icons.play_arrow,
+              label: 'Run',
+              onPressed: (_running || cpu.halted) ? null : _run,
+              primary: true,
+            ),
+            _ctrlButton(
+              icon: Icons.flash_on,
+              label: 'NMI',
+              onPressed: _nmi,
+            ),
+            _ctrlButton(
+              icon: Icons.bolt,
+              label: 'IRQ0',
+              onPressed: _irq,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _ctrlButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onPressed,
+    bool primary = false,
+  }) {
+    final child = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 26),
+        const SizedBox(height: 2),
+        Text(label, style: const TextStyle(fontSize: 12)),
+      ],
+    );
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: primary
+            ? FilledButton(
+                onPressed: onPressed,
+                style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 8)),
+                child: child,
+              )
+            : OutlinedButton(
+                onPressed: onPressed,
+                style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 8)),
+                child: child,
+              ),
+      ),
+    );
+  }
+
+  static String _hex2(int v) =>
+      (v & 0xFF).toRadixString(16).toUpperCase().padLeft(2, '0');
+  static String _hex6(int v) =>
+      (v & 0xFFFFFF).toRadixString(16).toUpperCase().padLeft(6, '0');
+  static String _hex8(int v) =>
+      (v & 0xFFFFFFFF).toRadixString(16).toUpperCase().padLeft(8, '0');
+}
+
+/// Keeps its child mounted (and therefore its scroll position intact)
+/// while it is off-screen inside a [TabBarView].
+class _KeepAlive extends StatefulWidget {
+  const _KeepAlive({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_KeepAlive> createState() => _KeepAliveState();
+}
+
+class _KeepAliveState extends State<_KeepAlive>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
+    return widget.child;
+  }
+}
