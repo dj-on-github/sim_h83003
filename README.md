@@ -47,6 +47,13 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
 - **Disassembly view** — tap a row to set/clear an instruction breakpoint.
   A JSON symbol table (`{"label": address}`) can be loaded to show labels;
   a `<name>_sym.json` next to a loaded hex file is picked up automatically.
+- **IO view** — a graphical picture of the GPIO ports (4–9, A–C, plus the
+  input-only port 7): one row of abutting bit boxes per port, bit numbers
+  above. Bits configured as outputs in the port's DDR are red with the
+  driven DR value (0/1) inside; input bits are green; positions without a
+  pin are dimmed. Register values are read live from the on-chip register
+  addresses (`H'FFFFC5`…`H'FFFFD7`), which a reset initializes to the
+  manual's mode 3/4 values.
 - **Profile view** — switch the profiler on (top bar), Run, and see the
   hottest data addresses and instructions.
 - **Files** — loads **Intel HEX** (with type 02/04 extended addressing) and
@@ -60,8 +67,8 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
 On startup (and via the reload button) a small program is assembled at
 `H'000100` with its reset vector at `H'000000`. It initialises SP, sums
 1..10 into R0L (= 55 = `H'37`), stores the result at the start of the
-on-chip RAM (`H'FFFD10`, allocating that bank on the way), and executes
-SLEEP:
+on-chip RAM (`H'FFFD10`, allocating that bank on the way), drives it out
+on port 4 (watch the IO tab), and executes SLEEP:
 
 ```
 000100  7A 07 00 FF FF 00   MOV.L  #H'00FFFF00,ER7   ; SP
@@ -72,8 +79,11 @@ SLEEP:
 00010E  A9 0B               CMP.B  #H'0B,R1L
 000110  46 F8               BNE    loop
 000112  6A A8 00 FF FD 10   MOV.B  R0L,@H'FFFD10:24
-000118  01 80        done:  SLEEP
-00011A  40 FC               BRA    done
+000118  F1 FF               MOV.B  #H'FF,R1H
+00011A  31 C5               MOV.B  R1H,@H'FFFFC5:8   ; P4DDR: all outputs
+00011C  38 C7               MOV.B  R0L,@H'FFFFC7:8   ; P4DR: the sum
+00011E  01 80        done:  SLEEP
+000120  40 FC               BRA    done
 ```
 
 ## Building
@@ -94,3 +104,22 @@ flutter run -d macos  # or linux, windows, chrome, an Android/iOS device
 | `lib/hex_files.dart` | Intel HEX / S-record parsing and Intel HEX generation |
 | `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
+| `tool/make_icons.py` | Regenerates the app icon and every platform variant |
+
+## The icon
+
+The icon matches the sim_6502 one so the two simulators read as a family: a
+black DIP package with silver pins, a top notch, a pin-1 dot and the part
+number across the body in heavy sans (with the same dotted zeros). The
+background is blue rather than green, matching this app's accent colour and
+keeping the two easy to tell apart in a dock or launcher.
+
+It is generated, not hand-drawn — `tool/make_icons.py` (Python + Pillow)
+writes the 1024px master to `assets/icon/app_icon_1024.png` and every
+platform variant: the macOS and iOS icon sets, the Android mipmaps, the web
+favicon and PWA icons (including maskable versions with a safe margin), and
+the multi-size Windows `.ico`. Rerun it after changing the artwork:
+
+```bash
+python3 tool/make_icons.py
+```

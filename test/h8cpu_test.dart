@@ -733,6 +733,9 @@ void main() {
         0xA9, 0x0B, // CMP.B #11,R1L
         0x46, 0xF8, // BNE loop
         0x6A, 0xA8, 0x00, 0xFF, 0xFD, 0x10, // MOV.B R0L,@H'FFFD10:24
+        0xF1, 0xFF, // MOV.B #H'FF,R1H
+        0x31, 0xC5, // MOV.B R1H,@H'FFFFC5:8 (P4DDR: all outputs)
+        0x38, 0xC7, // MOV.B R0L,@H'FFFFC7:8 (P4DR: the sum)
         0x01, 0x80, // SLEEP
         0x40, 0xFC, // BRA done
       ];
@@ -749,6 +752,33 @@ void main() {
       expect(cpu.sleeping, isTrue);
       expect(cpu.rd8(8), 55);
       expect(cpu.mem.peek(0xFFFD10), 55);
+      expect(cpu.mem.peek(0xFFFFC5), 0xFF); // P4DDR: all outputs
+      expect(cpu.mem.peek(0xFFFFC7), 55); // P4DR: the sum
+    });
+  });
+
+  group('I/O ports', () {
+    test('reset initializes the port DDR/DR registers (mode 3/4 values)', () {
+      final cpu = H8Cpu();
+      cpu.reset();
+      int at(int a) => cpu.mem.peek(a);
+      expect(at(0xFFFFC5), 0x00); // P4DDR
+      expect(at(0xFFFFC8), 0xFF); // P5DDR (address output, fixed 1)
+      expect(at(0xFFFFC9), 0x80); // P6DDR
+      expect(at(0xFFFFCB), 0x80); // P6DR
+      expect(at(0xFFFFCD), 0xF0); // P8DDR (P84/CS0 output)
+      expect(at(0xFFFFCF), 0xE0); // P8DR
+      expect(at(0xFFFFD0), 0xC0); // P9DDR
+      expect(at(0xFFFFD5), 0x00); // PCDDR
+    });
+
+    test('port descriptors cover the documented pins', () {
+      final p7 = H8Cpu.ports.firstWhere((p) => p.name == '7');
+      expect(p7.inputOnly, isTrue);
+      final p5 = H8Cpu.ports.firstWhere((p) => p.name == '5');
+      expect(p5.pinMask, 0xF0); // P57-P54
+      final p8 = H8Cpu.ports.firstWhere((p) => p.name == '8');
+      expect(p8.pinMask, 0x1F); // P84-P80
     });
   });
 

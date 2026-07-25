@@ -175,12 +175,14 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// Which views are shown in the wide (side-by-side) layout.
   bool _viewMem = true;
   bool _viewDis = true;
+  bool _viewIo = false;
   bool _viewProfile = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
   /// switches between the tabbed and side-by-side arrangements.
   final GlobalKey _memKey = GlobalKey();
   final GlobalKey _disKey = GlobalKey();
+  final GlobalKey _ioKey = GlobalKey();
   final GlobalKey _profKey = GlobalKey();
 
   /// True only when [c] is attached to exactly one scrollable.
@@ -204,7 +206,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 3, vsync: this);
+    _tab = TabController(length: 4, vsync: this);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -334,8 +336,9 @@ class _SimulatorPageState extends State<SimulatorPage>
   }
 
   // --------------------------------------------------------------------
-  // A small demo program: sums 1..10 (= 55 / H'37) and stores the result
-  // at the start of the on-chip RAM (H'FFFD10), then sleeps.
+  // A small demo program: sums 1..10 (= 55 / H'37), stores the result at
+  // the start of the on-chip RAM (H'FFFD10), drives it out on port 4
+  // (visible in the IO tab), then sleeps.
   // --------------------------------------------------------------------
   void _loadDemo() {
     cpu.mem.clear();
@@ -355,6 +358,9 @@ class _SimulatorPageState extends State<SimulatorPage>
       0xA9, 0x0B, //                               CMP.B  #H'0B,R1L
       0x46, 0xF8, //                               BNE    loop
       0x6A, 0xA8, 0x00, 0xFF, 0xFD, 0x10, //       MOV.B  R0L,@H'FFFD10:24
+      0xF1, 0xFF, //                               MOV.B  #H'FF,R1H
+      0x31, 0xC5, //                               MOV.B  R1H,@H'FFFFC5:8  P4DDR
+      0x38, 0xC7, //                               MOV.B  R0L,@H'FFFFC7:8  P4DR
       0x01, 0x80, //                        done:  SLEEP
       0x40, 0xFC, //                               BRA    done
     ];
@@ -1034,6 +1040,7 @@ class _SimulatorPageState extends State<SimulatorPage>
           tabs: const [
             Tab(text: 'Memory'),
             Tab(text: 'Disassembly'),
+            Tab(text: 'IO'),
             Tab(text: 'Profile'),
           ],
         ),
@@ -1046,6 +1053,7 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _memKey, child: _KeepAlive(child: _memoryView())),
               KeyedSubtree(
                   key: _disKey, child: _KeepAlive(child: _disasmView())),
+              KeyedSubtree(key: _ioKey, child: _KeepAlive(child: _ioView())),
               KeyedSubtree(
                   key: _profKey, child: _KeepAlive(child: _profileView())),
             ],
@@ -1055,38 +1063,66 @@ class _SimulatorPageState extends State<SimulatorPage>
     );
   }
 
-  /// Wide layout: the checked views shown side by side.
+  /// Wide layout: the checked views shown side by side. Most panes share
+  /// the space by flex weight; the IO pane takes a fixed [_ioViewWidth],
+  /// which is exactly what its GPIO diagram needs — so the other views
+  /// keep all the remaining room instead of the window having to be huge
+  /// for the diagram to fit.
   Widget _multiView() {
     const wideFlex = 2;
-    final entries = <({Widget pane, int flex})>[
+    final entries = <({Widget pane, int flex, double? width})>[
       if (_viewMem)
         (
-          pane:
-              KeyedSubtree(key: _memKey, child: _KeepAlive(child: _memoryView())),
-          flex: wideFlex
+          pane: KeyedSubtree(
+              key: _memKey, child: _KeepAlive(child: _memoryView())),
+          flex: wideFlex,
+          width: null
         ),
       if (_viewDis)
         (
-          pane:
-              KeyedSubtree(key: _disKey, child: _KeepAlive(child: _disasmView())),
-          flex: wideFlex
+          pane: KeyedSubtree(
+              key: _disKey, child: _KeepAlive(child: _disasmView())),
+          flex: wideFlex,
+          width: null
+        ),
+      if (_viewIo)
+        (
+          pane: KeyedSubtree(key: _ioKey, child: _KeepAlive(child: _ioView())),
+          flex: 1,
+          width: _ioViewWidth
         ),
       if (_viewProfile)
         (
           pane: KeyedSubtree(
               key: _profKey, child: _KeepAlive(child: _profileView())),
-          flex: 1
+          flex: 1,
+          width: null
         ),
     ];
     if (entries.isEmpty) {
       return const Center(child: Text('Select a view above'));
     }
-    final children = <Widget>[];
-    for (var i = 0; i < entries.length; i++) {
-      if (i > 0) children.add(const VerticalDivider(width: 1, thickness: 1));
-      children.add(Expanded(flex: entries[i].flex, child: entries[i].pane));
-    }
-    return Row(children: children);
+    final hasFlexible = entries.any((e) => e.width == null);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Room taken by the dividers between panes.
+        final dividers = (entries.length - 1).toDouble();
+        // Never let a fixed pane push past the available width.
+        final maxFixed = (constraints.maxWidth - dividers).clamp(0.0, 1e9);
+        final children = <Widget>[];
+        for (var i = 0; i < entries.length; i++) {
+          if (i > 0) children.add(const VerticalDivider(width: 1, thickness: 1));
+          final e = entries[i];
+          children.add(e.width == null
+              ? Expanded(flex: e.flex, child: e.pane)
+              : SizedBox(width: e.width!.clamp(0.0, maxFixed), child: e.pane));
+        }
+        // With only fixed-width panes selected, soak up the leftover space
+        // so they stay left-aligned rather than stretching.
+        if (!hasFlexible) children.add(const Expanded(child: SizedBox()));
+        return Row(children: children);
+      },
+    );
   }
 
   // ---- Registers -------------------------------------------------------
@@ -1135,6 +1171,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         const SizedBox(width: 4),
         _viewToggle('DIS', _viewDis, (v) => _viewDis = v),
         const SizedBox(width: 4),
+        _viewToggle('IO', _viewIo, (v) => _viewIo = v),
+        const SizedBox(width: 4),
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
       ],
     );
@@ -1142,8 +1180,10 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   Widget _viewToggle(String label, bool on, void Function(bool) apply) {
     final enabled = _wide;
-    final selectedCount =
-        (_viewMem ? 1 : 0) + (_viewDis ? 1 : 0) + (_viewProfile ? 1 : 0);
+    final selectedCount = (_viewMem ? 1 : 0) +
+        (_viewDis ? 1 : 0) +
+        (_viewIo ? 1 : 0) +
+        (_viewProfile ? 1 : 0);
     return Tooltip(
       message: enabled
           ? 'Show the $label view'
@@ -1770,6 +1810,226 @@ class _SimulatorPageState extends State<SimulatorPage>
         cpu.instrBreaks.add(addr);
       }
     });
+  }
+
+  // ---- IO view -------------------------------------------------------------
+
+  /// The width the IO view is laid out at: the eight 34px bit boxes plus
+  /// the list padding, which is all the GPIO diagram needs. In the
+  /// side-by-side layout the pane is pinned here (see [_multiView]) so the
+  /// other views keep the rest of the window. If the pane is ever narrower
+  /// than this (a narrow window on the IO tab), the content scrolls
+  /// sideways instead of being squeezed.
+  static const double _ioViewWidth = 300.0;
+
+  Widget _ioView() {
+    return Column(
+      children: [
+        _ioHeader(),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final content = SizedBox(
+                key: const Key('ioPane'),
+                width: _ioViewWidth,
+                height: constraints.maxHeight,
+                child: _ioContent(),
+              );
+              if (constraints.maxWidth >= _ioViewWidth) {
+                // Keep the diagram at its natural width, left-aligned.
+                return Align(alignment: Alignment.topLeft, child: content);
+              }
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: content,
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _ioContent() {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+      children: [
+        const Text('GPIO',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 6),
+        // Wrap, not Row: the labels flow onto a second line rather than
+        // overflowing if the text metrics come out wider than expected.
+        Wrap(
+          spacing: 12,
+          runSpacing: 4,
+          children: [
+            _ioLegendSwatch(_gpioOutColor, 'output (value shown)'),
+            _ioLegendSwatch(_gpioInColor, 'input'),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'DDR selects direction; DR holds the output value.',
+          style: TextStyle(fontSize: 11, color: _inkA(0.5)),
+        ),
+        const SizedBox(height: 8),
+        for (final p in H8Cpu.ports) _gpioPort(p),
+      ],
+    );
+  }
+
+  Widget _ioHeader() {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: const Row(
+        children: [
+          Icon(Icons.settings_input_component, size: 18),
+          SizedBox(width: 6),
+          Text('I/O', style: TextStyle(fontWeight: FontWeight.bold)),
+          Spacer(),
+        ],
+      ),
+    );
+  }
+
+  static const Color _gpioOutColor = Color(0xFFC62828); // output pins: red
+  static const Color _gpioInColor = Color(0xFF2E7D32); // input pins: green
+
+  Widget _ioLegendSwatch(Color color, String label) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: _inkA(0.7))),
+        ),
+      ],
+    );
+  }
+
+  /// One GPIO port: a name/register line and a row of eight abutting bit
+  /// boxes (bit 7 on the left), each labelled above with its bit number.
+  /// Output bits (DDR = 1) are red with the DR value inside; input bits
+  /// are green; positions without a pin are dimmed.
+  Widget _gpioPort(H8Port p) {
+    final ddrAddr = p.ddrAddr;
+    final ddr = ddrAddr == null ? 0 : cpu.mem.peek(ddrAddr);
+    final dr = cpu.mem.peek(p.drAddr);
+    // Values inline, register addresses in the tooltip — at this width
+    // there is no room for both.
+    final regs = StringBuffer();
+    if (ddrAddr != null) regs.write("DDR H'${_hex2(ddr)}  ");
+    regs.write("DR H'${_hex2(dr)}");
+    final tip = StringBuffer('Port ${p.name}');
+    if (p.inputOnly) tip.write(' (input only, no DDR)');
+    if (ddrAddr != null) {
+      tip.write("\nDDR H'${_hex2(ddr)} at H'${_hex6(ddrAddr)}");
+    }
+    tip.write("\nDR H'${_hex2(dr)} at H'${_hex6(p.drAddr)}");
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Tooltip(
+            message: tip.toString(),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.baseline,
+              textBaseline: TextBaseline.alphabetic,
+              children: [
+                Text('Port ${p.name}',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 13)),
+                if (p.inputOnly)
+                  Text(' (in)',
+                      style: TextStyle(fontSize: 11, color: _inkA(0.5))),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    regs.toString(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontFamily: _font, fontSize: 11, color: _inkA(0.5)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 2),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var bit = 7; bit >= 0; bit--)
+                _gpioBitBox(
+                  bit: bit,
+                  hasPin: (p.pinMask >> bit) & 1 == 1,
+                  // Port 7 has no DDR: every pin is an input.
+                  isOutput: ddrAddr != null && (ddr >> bit) & 1 == 1,
+                  value: (dr >> bit) & 1,
+                  isFirst: bit == 7,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _gpioBitBox({
+    required int bit,
+    required bool hasPin,
+    required bool isOutput,
+    required int value,
+    required bool isFirst,
+  }) {
+    final Color? fill =
+        !hasPin ? null : (isOutput ? _gpioOutColor : _gpioInColor);
+    final border = Border(
+      top: BorderSide(color: _inkA(0.4)),
+      bottom: BorderSide(color: _inkA(0.4)),
+      right: BorderSide(color: _inkA(0.4)),
+      // Abutting boxes: only the leftmost box draws its own left edge.
+      left: isFirst ? BorderSide(color: _inkA(0.4)) : BorderSide.none,
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Bit number label above the box.
+        Text('$bit', style: TextStyle(fontSize: 10, color: _inkA(0.6))),
+        Container(
+          width: 34,
+          height: 30,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(color: fill, border: border),
+          // Output pins show their driven value in a contrasting colour;
+          // input pins are just green; pinless positions stay empty.
+          child: isOutput && hasPin
+              ? Text(
+                  '$value',
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontFamily: 'monospace',
+                  ),
+                )
+              : null,
+        ),
+      ],
+    );
   }
 
   // ---- Profiling -----------------------------------------------------------

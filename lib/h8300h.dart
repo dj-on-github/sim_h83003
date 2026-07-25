@@ -31,9 +31,81 @@ class H8Flag {
   static const int c = 0x01; // carry
 }
 
+/// Describes one of the H8/3003's I/O ports (hardware manual section 9,
+/// mode 3/4 register addresses). Each port has a data direction register
+/// (DDR, write-only on real hardware) and a data register (DR); port 7 is
+/// input-only and has no DDR. [pinMask] marks the bits that have pins
+/// (port 5's four pins are P57-P54, i.e. the high nibble).
+class H8Port {
+  const H8Port({
+    required this.name,
+    required this.pinMask,
+    required this.drAddr,
+    this.ddrAddr,
+    this.ddrReset = 0,
+    this.drReset = 0,
+  });
+
+  /// Port letter/number as shown in the manual ('4'..'9', 'A'..'C').
+  final String name;
+
+  /// Which of the 8 bits have pins.
+  final int pinMask;
+
+  /// Data register address (R/W).
+  final int drAddr;
+
+  /// Data direction register address, or null for the input-only port 7.
+  final int? ddrAddr;
+
+  /// Register values established by a reset (mode 3/4 column).
+  final int ddrReset;
+  final int drReset;
+
+  bool get inputOnly => ddrAddr == null;
+}
+
 class H8Cpu {
   /// Sparse 16-Mbyte memory (24-bit address space).
   final SparseMemory mem = SparseMemory();
+
+  /// The nine I/O ports of the H8/3003 (table 9-1; addresses are the
+  /// mode 3/4 locations in the on-chip register area).
+  static const List<H8Port> ports = [
+    H8Port(name: '4', pinMask: 0xFF, ddrAddr: 0xFFFFC5, drAddr: 0xFFFFC7),
+    // In modes 3/4 port 5 outputs A23-A20 and its DDR bits are fixed at 1.
+    H8Port(
+        name: '5',
+        pinMask: 0xF0,
+        ddrAddr: 0xFFFFC8,
+        drAddr: 0xFFFFCA,
+        ddrReset: 0xFF),
+    H8Port(
+        name: '6',
+        pinMask: 0x07,
+        ddrAddr: 0xFFFFC9,
+        drAddr: 0xFFFFCB,
+        ddrReset: 0x80,
+        drReset: 0x80),
+    H8Port(name: '7', pinMask: 0xFF, drAddr: 0xFFFFCE), // input only
+    H8Port(
+        name: '8',
+        pinMask: 0x1F,
+        ddrAddr: 0xFFFFCD,
+        drAddr: 0xFFFFCF,
+        ddrReset: 0xF0, // P84/CS0 defaults to output
+        drReset: 0xE0),
+    H8Port(
+        name: '9',
+        pinMask: 0x3F,
+        ddrAddr: 0xFFFFD0,
+        drAddr: 0xFFFFD2,
+        ddrReset: 0xC0,
+        drReset: 0xC0),
+    H8Port(name: 'A', pinMask: 0xFF, ddrAddr: 0xFFFFD1, drAddr: 0xFFFFD3),
+    H8Port(name: 'B', pinMask: 0xFF, ddrAddr: 0xFFFFD4, drAddr: 0xFFFFD6),
+    H8Port(name: 'C', pinMask: 0xFF, ddrAddr: 0xFFFFD5, drAddr: 0xFFFFD7),
+  ];
 
   /// General registers ER0-ER7. ER7 is the stack pointer.
   final Uint32List er = Uint32List(8);
@@ -284,6 +356,12 @@ class H8Cpu {
       er[i] = 0;
     }
     ccr = H8Flag.i;
+    // A reset initializes the on-chip I/O port registers (section 9).
+    for (final p in ports) {
+      final ddrAddr = p.ddrAddr;
+      if (ddrAddr != null) mem.poke(ddrAddr, p.ddrReset);
+      mem.poke(p.drAddr, p.drReset);
+    }
     pc = _peekL(0) & 0xFFFFFF;
     cycles = 0;
     halted = false;
