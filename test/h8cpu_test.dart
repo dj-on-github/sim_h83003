@@ -5,6 +5,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sim_h83003/h8300h.dart';
 import 'package:sim_h83003/hex_files.dart';
+import 'package:sim_h83003/sparse_memory.dart';
 
 /// Loads [bytes] at [addr], points the PC there, and returns the CPU.
 H8Cpu cpuWith(List<int> bytes, {int addr = 0x1000}) {
@@ -163,6 +164,34 @@ void main() {
       cpu.step();
       expect(cpu.mem.peek(0x007003), 0x04);
       expect(cpu.cycles, 16);
+    });
+
+    test('MOV.L @(d:24,ERs),ERd loads and stores', () {
+      // The load form: 01 00 78 s0 6B 2d dd dd dd dd
+      final load = cpuWith([0x01, 0x00, 0x78, 0x60, 0x6B, 0x25, //
+        0x00, 0x00, 0x10, 0x00]);
+      load.er[6] = 0x000100;
+      load.mem.poke(0x001100, 0xDE);
+      load.mem.poke(0x001101, 0xAD);
+      load.mem.poke(0x001102, 0xBE);
+      load.mem.poke(0x001103, 0xEF);
+      load.step();
+      expect(load.er[5], 0xDEADBEEF);
+      expect(load.cycles, 14);
+
+      // The store form sets bit 7 in *both* sub-opcode bytes: 78 E0 / 6B A5.
+      // Taken from the artista 180 firmware at H'206532, where it fills a
+      // table with a constant.
+      final store = cpuWith([0x01, 0x00, 0x78, 0xE0, 0x6B, 0xA5, //
+        0x00, 0x11, 0xA6, 0xE8]);
+      store.er[6] = 0x000010;
+      store.er[5] = 0x000E0000;
+      store.step();
+      expect(store.halted, isFalse, reason: 'this is a valid instruction');
+      expect(store.mem.peek(0x11A6F8), 0x00);
+      expect(store.mem.peek(0x11A6F9), 0x0E);
+      expect(store.mem.peek(0x11A6FA), 0x00);
+      expect(store.mem.peek(0x11A6FB), 0x00);
     });
 
     test('PUSH.L / POP.L via 01 00 6D', () {
@@ -529,11 +558,13 @@ void main() {
     });
 
     test('BCLR Rn, @aa:8 (7F form)', () {
-      final cpu = cpuWith([0x7F, 0x40, 0x62, 0x10]); // BCLR R1H,@H'FFFF40:8
-      cpu.mem.poke(0xFFFF40, 0xFF);
+      // H'FFFF10 is external space in the 8-bit absolute page, so it is
+      // plain memory rather than one of the modelled peripherals.
+      final cpu = cpuWith([0x7F, 0x10, 0x62, 0x10]); // BCLR R1H,@H'FFFF10:8
+      cpu.mem.poke(0xFFFF10, 0xFF);
       cpu.wr8(1, 2); // R1H = bit 2
       cpu.step();
-      expect(cpu.mem.peek(0xFFFF40), 0xFB);
+      expect(cpu.mem.peek(0xFFFF10), 0xFB);
     });
   });
 
@@ -682,7 +713,12 @@ void main() {
       expect(cpu.halted, isTrue);
       expect(cpu.sleeping, isTrue);
       expect(cpu.cycles, 2); // SLEEP consumes its states
-      expect(cpu.step(), 0); // stays halted
+      // The CPU stays asleep, but the clock keeps running so the on-chip
+      // peripherals can still reach the point of waking it.
+      final before = cpu.cycles;
+      cpu.step();
+      expect(cpu.halted, isTrue);
+      expect(cpu.cycles, greaterThan(before));
       cpu.nmi();
       expect(cpu.halted, isFalse);
       expect(cpu.pc, 0x002000);
@@ -801,6 +837,10 @@ void main() {
       check([0x6D, 0xF1], 'PUSH.W R1');
       check([0x01, 0x00, 0x6D, 0xF2], 'PUSH.L ER2');
       check([0x01, 0x00, 0x6D, 0x74], 'POP.L ER4');
+      check([0x01, 0x00, 0x78, 0x60, 0x6B, 0x25, 0x00, 0x00, 0x10, 0x00],
+          "MOV.L @(H'001000:24,ER6),ER5");
+      check([0x01, 0x00, 0x78, 0xE0, 0x6B, 0xA5, 0x00, 0x11, 0xA6, 0xE8],
+          "MOV.L ER5,@(H'11A6E8:24,ER6)");
       check([0x6A, 0x28, 0x00, 0x12, 0x34, 0x56], "MOV.B @H'123456:24,R0L");
       check([0x6E, 0x39, 0x00, 0x10], "MOV.B @(H'0010:16,ER3),R1L");
       check(
@@ -857,6 +897,47 @@ void main() {
       expect(cpu2.mem.peek(0x000101), 0x34);
       expect(cpu2.mem.peek(0xFFFD10), 0xAB);
       expect(result.sawEof, isTrue);
+    });
+
+    test('format detection tells records from a flat binary', () {
+      expect(detectProgramFormat(':10010000214601360121470136007EFE09D2\r\n'.codeUnits),
+          ProgramFormat.intelHex);
+      expect(detectProgramFormat('S2050123455A37\r\n'.codeUnits),
+          ProgramFormat.srecord);
+      expect(detectProgramFormat('  \r\n:00000001FF'.codeUnits),
+          ProgramFormat.intelHex);
+      // A dump: non-printable bytes.
+      expect(detectProgramFormat([0x00, 0x00, 0x04, 0x48, 0x7A, 0x07]),
+          ProgramFormat.raw);
+      // Printable but not a record format.
+      expect(detectProgramFormat('hello world'.codeUnits), ProgramFormat.raw);
+      expect(detectProgramFormat(const []), ProgramFormat.raw);
+    });
+
+    test('raw binaries load at the given base, skipping all-zero banks', () {
+      final cpu = H8Cpu();
+      // Two 64K banks: the first all zero, the second with data.
+      final image = List<int>.filled(SparseMemory.bankSize * 2, 0);
+      image[SparseMemory.bankSize] = 0xAB;
+      image[SparseMemory.bankSize + 1] = 0xCD;
+      final r = loadRawBinary(image, 0x040000, cpu.mem.poke);
+
+      expect(cpu.mem.peek(0x050000), 0xAB);
+      expect(cpu.mem.peek(0x050001), 0xCD);
+      expect(r.minAddress, 0x050000);
+      expect(r.maxAddress, 0x05FFFF);
+      // The all-zero bank was skipped rather than allocated.
+      expect(cpu.mem.isAllocated(0x040000), isFalse);
+      expect(cpu.mem.peek(0x040000), 0); // still reads as zero
+      expect(r.bytesLoaded, SparseMemory.bankSize);
+    });
+
+    test('a raw binary keeps H\'FF bytes rather than skipping them', () {
+      final cpu = H8Cpu();
+      final image = List<int>.filled(64, 0xFF);
+      loadRawBinary(image, 0x100000, cpu.mem.poke);
+      expect(cpu.mem.peek(0x100000), 0xFF);
+      expect(cpu.mem.isAllocated(0x100000), isTrue);
     });
 
     test('S-records load with 24-bit addresses and a start address', () {

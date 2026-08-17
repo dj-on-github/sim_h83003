@@ -35,9 +35,28 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
   interrupts; SLEEP halts the CPU until an interrupt wakes it.
 - **On-chip RAM** — `H'FFFD10`–`H'FFFF0F` (512 bytes, pre-allocated), per
   the mode 3/4 memory map. The 8-bit absolute addressing mode (`@aa:8`)
-  targets `H'FFFF00`–`H'FFFFFF` as on the real chip. On-chip peripheral
-  registers (`H'FFFF1C`–`H'FFFFFF`) are plain memory for now — GPIO and
-  serial interfaces can be layered on in a later step.
+  targets `H'FFFF00`–`H'FFFFFF` as on the real chip.
+- **DMA (DMAC)** — all four channels are simulated (manual section 8):
+  registers at `H'FFFF20`–`H'FFFF5F`, short address mode (I/O and repeat
+  modes, increment or decrement, byte or word) and full address mode
+  (memory to memory, auto-request burst or per-trigger, with independent
+  source and destination address control). Transfers fire on the programmed
+  activation source — an ITU compare match, or an SCI transmit-empty or
+  receive-full — and clear that source as the hardware does, so an
+  SCI channel driven by DMA really moves bytes. `DEND` is raised when the
+  count runs out and `DTIE` is set. Transfers happen between instructions
+  rather than by stealing exact bus cycles.
+- **Timers (ITU)** — all five channels are simulated (manual section 10):
+  registers at `H'FFFF60`–`H'FFFF9F`, counters clocked at φ, φ/2, φ/4 or φ/8
+  per `TCR`, compare match against `GRA`/`GRB` with the counter-clear modes,
+  overflow, and the three interrupts per channel. External clock inputs
+  (TCLKA–TCLKD) are not modelled, so a channel selecting one stays still.
+- **Serial (SCI)** — both channels are simulated (manual section 13):
+  registers at `H'FFFFB0`–`H'FFFFB5` and `H'FFFFB8`–`H'FFFFBD`, transmit
+  timing derived from `BRR` and the clock select, clear-only status flags,
+  and the four interrupts per channel. Register values are mirrored into
+  memory so the memory view and disassembler show what the CPU reads. The
+  remaining on-chip peripheral registers are still plain memory.
 
 ## Using it
 
@@ -47,6 +66,41 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
 - **Disassembly view** — tap a row to set/clear an instruction breakpoint.
   A JSON symbol table (`{"label": address}`) can be loaded to show labels;
   a `<name>_sym.json` next to a loaded hex file is picked up automatically.
+- **Screen view** — the machine's LCD: 320×240 pixels at 2 bits each, four
+  grey levels, four pixels per byte with the most significant bits leftmost,
+  80 bytes per scan line, 19200 (`H'4B00`) bytes in all. The panel is
+  positive-mode, as the real machine is: a stored 0 leaves the cell undriven
+  and shows as the light background, 3 is full black, so a blank buffer
+  renders as a blank screen. The Invert button renders it the other way up.
+  The frame buffer defaults to `H'040000` and can be pointed elsewhere from
+  the header, since the SED1351's start-address registers can move it. The
+  panel repaints every Run tick, independently of the throttled memory and
+  disassembly views.
+- **SCI view** — the two serial channels. Shows `SMR`, `BRR`, `SCR`, `TDR`,
+  `SSR` and `RDR` with their addresses and values, the `SCR` and `SSR` bits
+  as labelled flags, the framing and bit rate the registers currently
+  describe, and a hex dump of every byte the program has put on the wire.
+  The SCI is simulated rather than faked: `TDRE` and `TEND` follow a real
+  character time computed from `BRR` and the clock select, the status flags
+  are clear-only as the hardware makes them, and the channel raises
+  ERI/RXI/TXI/TEI when its interrupt enables are set — so a polled transmit
+  loop completes instead of spinning, and the bytes show up here.
+- **ITU view** — the 16-bit integrated timer unit. Shows the shared registers
+  (`TSTR`, `TSNC`, `TMDR`, `TFCR`, `TOER`, `TOCR`) with the per-channel start
+  bits, then a card for each of the five channels: whether it is running, its
+  clock source and counter-clear source, the live `TCNT` with its `GRA`/`GRB`
+  targets (and `BRA`/`BRB` on channels 3 and 4), a progress bar towards the
+  GRA compare match, the raw `TCR`/`TIOR`/`TIER`/`TSR`, and the status and
+  enable flags. The timers really count: `TCNT` advances at the prescaler
+  rate selected in `TCR`, compare matches set `IMFA`/`IMFB` and can clear the
+  counter, overflow sets `OVF`, and each channel raises its IMIA/IMIB/OVI
+  interrupts when `TIER` enables them.
+- **DMA view** — the four DMA controller channels. Each card shows the mode
+  (short or full address), whether it is enabled, and the live state: in full
+  address mode the source and destination addresses with a progress bar over
+  the transfer count; in short address mode each half's memory address, its
+  fixed I/O address and the direction, its activation source and mode, and
+  the DTE/DTIE flags. The header counts transfers performed.
 - **IO view** — a graphical picture of the GPIO ports (4–9, A–C, plus the
   input-only port 7): one row of abutting bit boxes per port, bit numbers
   above. Bits configured as outputs in the port's DDR are red with the
@@ -56,10 +110,27 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
   manual's mode 3/4 values.
 - **Profile view** — switch the profiler on (top bar), Run, and see the
   hottest data addresses and instructions.
-- **Files** — loads **Intel HEX** (with type 02/04 extended addressing) and
-  **Motorola S-records** (S1/S2/S3, with S7/S8/S9 entry points) — the
-  formats H8 toolchains emit. Saves allocated memory as Intel HEX. On
-  desktop, a file named on the command line is loaded at startup.
+- **Responsiveness while running** — Run executes in short batches inside a
+  16 ms frame timer with a time budget, so the window stays interactive and
+  Pause takes effect immediately. The disassembly is only re-swept when the
+  contents of memory actually change (an edit, a file load, the demo), not on
+  every repaint: sweeping a loaded firmware image is a ~400 ms job over
+  roughly two million instructions, and doing that each frame is what makes
+  an emulator feel hung. If a program writes code at run time, the
+  Disassembly pane's **Re-scan** button forces a fresh sweep.
+- **Files** — loads **Intel HEX** (with type 02/04 extended addressing),
+  **Motorola S-records** (S1/S2/S3, with S7/S8/S9 entry points) and **flat
+  binaries** such as raw memory dumps. The format is detected from the file's
+  contents, so there is nothing to select. A binary carries no address of its
+  own, so the app asks where to put it — a file exactly the size of the
+  address space is recognised as a full dump and offered at 0. All-zero 64K
+  blocks are skipped rather than allocated, which keeps a 16-Mbyte dump from
+  reserving every bank. Saves allocated memory as Intel HEX. On desktop, a
+  file named on the command line is loaded at startup (binaries at 0):
+
+  ```bash
+  flutter run -d macos --args dump.bin
+  ```
 - **Registers** — tap any register or CCR flag to edit it.
 
 ## The built-in demo
@@ -94,6 +165,15 @@ flutter test          # CPU core, disassembler and hex-file unit tests
 flutter run -d macos  # or linux, windows, chrome, an Android/iOS device
 ```
 
+On macOS the app sandbox is deliberately switched off in both
+`macos/Runner/DebugProfile.entitlements` and `Release.entitlements`, with
+the user-selected file entitlements granted — the same arrangement as
+sim_6502. The file picker needs those entitlements to open at all, and two
+other features need access beyond the single file the user picks: loading a
+hex file named on the command line, and auto-loading the `<name>_sym.json`
+symbol table sitting beside a loaded hex file. This rules out Mac App Store
+distribution, which the app is not aimed at.
+
 ## Code layout
 
 | File | Contents |
@@ -102,7 +182,11 @@ flutter run -d macos  # or linux, windows, chrome, an Android/iOS device
 | `lib/h8disasm.dart` | The disassembler (Renesas syntax; agrees with the core on lengths) |
 | `lib/sparse_memory.dart` | The banked 16-Mbyte sparse memory and sparse profiling counters |
 | `lib/hex_files.dart` | Intel HEX / S-record parsing and Intel HEX generation |
-| `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/profile views, controls) |
+| `lib/lcd.dart` | Frame buffer decoding: 320×240, 2 bits per pixel, MSB first |
+| `lib/sci.dart` | The serial channels: registers, character timing, interrupts |
+| `lib/itu.dart` | The 16-bit timer unit: five channels, prescalers, compare match |
+| `lib/dmac.dart` | The DMA controller: short and full address modes, activation sources |
+| `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/screen/IO/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
 | `tool/make_icons.py` | Regenerates the app icon and every platform variant |
 

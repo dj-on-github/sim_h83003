@@ -53,6 +53,95 @@ HexResult parseHexFile(String text, void Function(int addr, int value) write) {
   return _parseIntelHex(text, write);
 }
 
+/// What a program file turned out to be.
+enum ProgramFormat {
+  intelHex,
+  srecord,
+
+  /// A flat binary — a memory dump, or a ROM image. Carries no addresses of
+  /// its own, so the caller has to say where it belongs.
+  raw,
+}
+
+/// Works out how to read a program file from its first bytes.
+///
+/// Intel HEX and S-records are printable ASCII beginning with ':' or 'S';
+/// anything with bytes outside that set, or with a different first
+/// character, is treated as a flat binary.
+ProgramFormat detectProgramFormat(List<int> bytes) {
+  var i = 0;
+  // Skip leading whitespace.
+  while (i < bytes.length &&
+      (bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0D ||
+          bytes[i] == 0x0A)) {
+    i++;
+  }
+  if (i >= bytes.length) return ProgramFormat.raw;
+
+  // A record file is entirely printable; a dump almost never is. Checking a
+  // slice is enough and keeps this cheap for a 16-Mbyte image.
+  final limit = (i + 512).clamp(0, bytes.length);
+  for (var j = i; j < limit; j++) {
+    final b = bytes[j];
+    final printable =
+        (b >= 0x20 && b < 0x7F) || b == 0x09 || b == 0x0D || b == 0x0A;
+    if (!printable) return ProgramFormat.raw;
+  }
+
+  if (bytes[i] == 0x3A) return ProgramFormat.intelHex; // ':'
+  if (bytes[i] == 0x53 || bytes[i] == 0x73) {
+    // 'S' or 's', followed by a record-type digit.
+    if (i + 1 < bytes.length &&
+        bytes[i + 1] >= 0x30 &&
+        bytes[i + 1] <= 0x39) {
+      return ProgramFormat.srecord;
+    }
+  }
+  return ProgramFormat.raw;
+}
+
+/// Loads a flat binary at [base], calling [write] for each byte.
+///
+/// 64K blocks that are entirely zero are skipped: unwritten memory already
+/// reads as zero, and skipping them keeps a full 16-Mbyte address-space dump
+/// from allocating every bank. Blocks of H'FF are loaded normally, since
+/// those are a real value the firmware can see.
+HexResult loadRawBinary(
+  List<int> bytes,
+  int base,
+  void Function(int addr, int value) write,
+) {
+  const block = SparseMemory.bankSize;
+  int? minA, maxA;
+  var count = 0;
+  for (var start = 0; start < bytes.length; start += block) {
+    final end = (start + block) < bytes.length ? start + block : bytes.length;
+    var allZero = true;
+    for (var i = start; i < end; i++) {
+      if (bytes[i] != 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) continue;
+    for (var i = start; i < end; i++) {
+      final addr = (base + i) & SparseMemory.addrMask;
+      write(addr, bytes[i]);
+      minA = (minA == null || addr < minA) ? addr : minA;
+      maxA = (maxA == null || addr > maxA) ? addr : maxA;
+      count++;
+    }
+  }
+  return HexResult(
+    bytesLoaded: count,
+    minAddress: minA,
+    maxAddress: maxA,
+    startAddress: null,
+    sawEof: true,
+    errors: const [],
+  );
+}
+
 HexResult _parseIntelHex(
     String text, void Function(int addr, int value) write) {
   var upperBase = 0; // contributed by type 02/04 records

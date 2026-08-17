@@ -715,7 +715,9 @@ H8Disasm _disasmMovLong(int Function(int) peek, int addr) {
           ? (text: 'MOV.L $erd,$at', length: 6)
           : (text: 'MOV.L $at,$erd', length: 6);
     case 0x78:
-      if (store || (b3 & 0x0F) != 0) return _ill(wordAt(0));
+      // The longword d:24 form sets bit 7 here for a store; the direction is
+      // taken from the sub-opcode below.
+      if ((b3 & 0x0F) != 0) return _ill(wordAt(0));
       final w2 = wordAt(4);
       if ((w2 >> 8) != 0x6B || (w2 & 0x78) != 0x20) return _ill(wordAt(0));
       final store2 = (w2 & 0x80) != 0;

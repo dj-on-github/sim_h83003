@@ -16,7 +16,10 @@
 
 import 'dart:typed_data';
 
+import 'dmac.dart';
 import 'h8disasm.dart';
+import 'itu.dart';
+import 'sci.dart';
 import 'sparse_memory.dart';
 
 /// CCR flag bit masks (I UI H U N Z V C).
@@ -66,8 +69,66 @@ class H8Port {
 }
 
 class H8Cpu {
+  H8Cpu() {
+    // Register values are mirrored into memory so the memory view and the
+    // disassembler show what the CPU would read.
+    for (final s in sci) {
+      s.mirror = mem.poke;
+      s.syncToMemory();
+    }
+    itu.mirror = mem.poke;
+    itu.syncToMemory();
+    _wireDmac();
+  }
+
+  /// Connects the DMA controller to the bus and to the peripherals whose
+  /// interrupts activate it.
+  void _wireDmac() {
+    dmac.mirror = mem.poke;
+    dmac.readByte = readB;
+    dmac.writeByte = writeB;
+    dmac.ituMatchA = (ch) => (itu.channels[ch].tsr & ItuStatus.imfa) != 0;
+    dmac.clearItuMatchA = (ch) {
+      itu.channels[ch].tsr &= ~ItuStatus.imfa;
+    };
+    dmac.sciReady = (ioAddr) {
+      for (final s in sci) {
+        if (ioAddr == s.tdrAddr) return (s.ssr & SciStatus.tdre) != 0;
+        if (ioAddr == s.rdrAddr) return (s.ssr & SciStatus.rdrf) != 0;
+      }
+      return false;
+    };
+    dmac.sciAcknowledge = (ioAddr) {
+      // The DMAC writing TDR clears TDRE; reading RDR clears RDRF.
+      for (final s in sci) {
+        if (ioAddr == s.tdrAddr) s.ssr &= ~SciStatus.tdre;
+        if (ioAddr == s.rdrAddr) s.ssr &= ~SciStatus.rdrf;
+      }
+    };
+    dmac.syncToMemory();
+  }
+
   /// Sparse 16-Mbyte memory (24-bit address space).
   final SparseMemory mem = SparseMemory();
+
+  /// The two on-chip serial channels (manual section 13). Their registers
+  /// live at H'FFFFB0-H'FFFFB5 and H'FFFFB8-H'FFFFBD, and their exception
+  /// vectors are ERI/RXI/TXI/TEI at 52-55 and 56-59.
+  final List<SciChannel> sci = [
+    SciChannel(name: 'SCI0', base: 0xFFFFB0, vectorBase: 52),
+    SciChannel(name: 'SCI1', base: 0xFFFFB8, vectorBase: 56),
+  ];
+
+  SciChannel get sci0 => sci[0];
+  SciChannel get sci1 => sci[1];
+
+  /// The 16-bit integrated timer unit (manual section 10), five channels at
+  /// H'FFFF60-H'FFFF9F.
+  final Itu itu = Itu();
+
+  /// The DMA controller (manual section 8), four channels at
+  /// H'FFFF20-H'FFFF5F.
+  final Dmac dmac = Dmac();
 
   /// The nine I/O ports of the H8/3003 (table 9-1; addresses are the
   /// mode 3/4 locations in the on-chip register area).
@@ -198,6 +259,14 @@ class H8Cpu {
     addr &= 0xFFFFFF;
     if (profiling) dataAccessCount.bump(addr);
     if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) breakHit = true;
+    // On-chip peripherals answer for their own registers.
+    if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
+      for (final s in sci) {
+        if (s.owns(addr)) return s.read(addr);
+      }
+    }
+    if (itu.owns(addr)) return itu.read(addr);
+    if (dmac.owns(addr)) return dmac.read(addr);
     return mem.peek(addr);
   }
 
@@ -205,6 +274,22 @@ class H8Cpu {
     addr &= 0xFFFFFF;
     if (profiling) dataAccessCount.bump(addr);
     if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) breakHit = true;
+    if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
+      for (final s in sci) {
+        if (s.owns(addr)) {
+          s.write(addr, value);
+          return;
+        }
+      }
+    }
+    if (itu.owns(addr)) {
+      itu.write(addr, value);
+      return;
+    }
+    if (dmac.owns(addr)) {
+      dmac.write(addr, value);
+      return;
+    }
     mem.poke(addr, value);
   }
 
@@ -356,6 +441,11 @@ class H8Cpu {
       er[i] = 0;
     }
     ccr = H8Flag.i;
+    for (final s in sci) {
+      s.reset();
+    }
+    itu.reset();
+    dmac.reset();
     // A reset initializes the on-chip I/O port registers (section 9).
     for (final p in ports) {
       final ddrAddr = p.ddrAddr;
@@ -368,6 +458,22 @@ class H8Cpu {
     sleeping = false;
     haltReason = '';
     breakHit = false;
+  }
+
+  /// Side-effect-free read that consults the on-chip peripherals, for the
+  /// UI. The peripherals hold the authoritative value; memory only carries a
+  /// mirror updated when a register is written, so a live counter has to be
+  /// read from the model itself.
+  int peekBus(int addr) {
+    addr &= 0xFFFFFF;
+    if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
+      for (final s in sci) {
+        if (s.owns(addr)) return s.read(addr);
+      }
+    }
+    if (itu.owns(addr)) return itu.read(addr);
+    if (dmac.owns(addr)) return dmac.read(addr);
+    return mem.peek(addr);
   }
 
   /// Side-effect-free longword read (no profiling, no data breakpoints).
@@ -399,6 +505,23 @@ class H8Cpu {
     }
     if (halted) return; // stopped on an illegal instruction: only reset helps
     _exception(7);
+  }
+
+  /// Raises the interrupt with the given exception [vector] — the general
+  /// form behind [nmi] and [irq], for on-chip peripheral interrupts (ITU,
+  /// SCI, DMAC, A/D: vectors 20-60). Maskable interrupts are ignored while
+  /// the I bit is set. A sleeping CPU wakes; one halted on an illegal
+  /// instruction does not. Returns true if the interrupt was taken.
+  bool interrupt(int vector, {bool maskable = true}) {
+    if (maskable && (ccr & H8Flag.i) != 0) return false;
+    if (sleeping) {
+      halted = false;
+      sleeping = false;
+      haltReason = '';
+    }
+    if (halted) return false;
+    _exception(vector);
+    return true;
   }
 
   /// External interrupt IRQn (vector 12 + n), n = 0-7. Masked by the I bit.
@@ -525,8 +648,31 @@ class H8Cpu {
   // (0 when halted).
   // ---------------------------------------------------------------------
 
+  /// States charged per [step] while the CPU is in sleep mode. The processor
+  /// is stopped but the clock and the on-chip peripherals are not, so time
+  /// has to keep passing — otherwise a timer could never raise the interrupt
+  /// that wakes it.
+  static const int sleepStates = 2;
+
   int step() {
-    if (halted) return 0;
+    if (halted && sleeping) cycles += sleepStates;
+    // Peripherals run between instructions: they advance with the clock and
+    // may raise an interrupt, which is also what wakes a sleeping CPU. Each
+    // is skipped while idle, so an unused peripheral costs almost nothing
+    // per instruction.
+    for (final s in sci) {
+      if (s.active) s.tick(cycles);
+      final v = s.pendingVector();
+      if (v != null && interrupt(v)) return 16;
+    }
+    if (itu.anyRunning) itu.tick(cycles);
+    // The DMAC moves data before the CPU sees the peripheral interrupt: an
+    // enabled channel takes the request instead of the processor.
+    final dendVector = dmac.service();
+    if (dendVector != null && interrupt(dendVector)) return 16;
+    final ituVector = itu.pendingVector();
+    if (ituVector != null && interrupt(ituVector)) return 16;
+    if (halted) return sleeping ? sleepStates : 0;
     if (profiling) instrExecCount.bump(pc);
     final instrStart = pc;
     final w0 = _fetchW();
@@ -1398,8 +1544,12 @@ class H8Cpu {
           _setNZV0(v, 32);
         }
         return 10;
-      case 0x78: // MOV.L @(d:24, ERs), ERd | store
-        if (store || (b3 & 0x0F) != 0) {
+      case 0x78: // MOV.L @(d:24, ERs), ERd  and the store direction
+        // Unlike the byte and word forms, the longword d:24 encoding also
+        // sets bit 7 of this byte for a store (H'E0 rather than H'60). The
+        // direction that matters is the one in the second sub-opcode below,
+        // so accept either here.
+        if ((b3 & 0x0F) != 0) {
           _illegal(instrStart, w1);
           return 0;
         }

@@ -9,11 +9,17 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
+import 'dmac.dart';
 import 'h8300h.dart';
 import 'hex_files.dart';
+import 'itu.dart';
+import 'lcd.dart';
+import 'sci.dart';
 import 'sparse_memory.dart';
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
 import 'file_save_stub.dart' if (dart.library.io) 'file_save_io.dart';
@@ -139,13 +145,37 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// Cached linear-sweep disassembly of the *allocated* memory regions,
   /// rebuilt only when the memory contents change (tracked by [_memRev]).
   List<_DisasmEntry> _disasm = const [];
-  int _memRev = 0; // bumped whenever memory may have changed
-  int _disasmRev = -1; // _memRev the cache was built for
+  /// Bumped to repaint the views. This happens on every Run tick, so it
+  /// must stay cheap — nothing expensive may key off it.
+  int _memRev = 0;
+
+  /// Bumped only when the *contents* of memory change in a way that could
+  /// alter the code: an edit, a file load, a reset. The disassembly sweep is
+  /// keyed off this rather than [_memRev], because sweeping a loaded firmware
+  /// image takes hundreds of milliseconds and rebuilding it every repaint
+  /// makes the app unresponsive.
+  int _codeRev = 0;
+
+  int _disasmRev = -1; // _codeRev the cache was built for
 
   /// Optional address -> label map loaded from an assembler symbol-table
   /// JSON. When present, the disassembly view shows labels at their
   /// addresses and substitutes symbolic names for operand addresses.
   Map<int, String> _symbols = const {};
+
+  /// Base address of the LCD pixel buffer. The Bernina artista 180 keeps its
+  /// frame buffer here; editable from the Screen tab because the SED1351's
+  /// start-address registers can move it.
+  int _screenBase = 0x040000;
+
+  /// The panel is positive-mode by default (0 = light background, 3 = black),
+  /// which matches the real machine; this flips it the other way up.
+  bool _screenInvert = false;
+
+  /// Drives the (cheap) screen repaint independently of the heavier memory
+  /// and disassembly views. Bumped every Run tick so the display animates
+  /// smoothly even while those views are throttled to 300ms.
+  final ValueNotifier<int> _screenRev = ValueNotifier<int>(0);
 
   /// Periodic ticker used by Run mode.
   Timer? _runTimer;
@@ -175,6 +205,10 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// Which views are shown in the wide (side-by-side) layout.
   bool _viewMem = true;
   bool _viewDis = true;
+  bool _viewScr = false;
+  bool _viewSci = false;
+  bool _viewItu = false;
+  bool _viewDma = false;
   bool _viewIo = false;
   bool _viewProfile = false;
 
@@ -182,6 +216,10 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// switches between the tabbed and side-by-side arrangements.
   final GlobalKey _memKey = GlobalKey();
   final GlobalKey _disKey = GlobalKey();
+  final GlobalKey _scrKey = GlobalKey();
+  final GlobalKey _sciKey = GlobalKey();
+  final GlobalKey _ituKey = GlobalKey();
+  final GlobalKey _dmaKey = GlobalKey();
   final GlobalKey _ioKey = GlobalKey();
   final GlobalKey _profKey = GlobalKey();
 
@@ -206,7 +244,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 4, vsync: this);
+    _tab = TabController(length: 8, vsync: this);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -214,13 +252,16 @@ class _SimulatorPageState extends State<SimulatorPage>
         .addPostFrameCallback((_) => _scrollToAddress(_memBase));
   }
 
-  /// If a hex file was named on the command line, load it over the demo.
+  /// If a program file was named on the command line, load it over the demo.
+  /// Intel HEX, S-records and flat binaries are all accepted; a binary has no
+  /// address of its own, so it is loaded at 0 — which is what a full
+  /// address-space dump wants.
   void _applyStartupHex() {
     final startup = widget.startup;
     if (startup == null) return;
 
-    final text = startup.contents;
-    if (text == null) {
+    final data = startup.bytes;
+    if (data == null) {
       if (startup.path != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) => _showSnack(
             'Could not read ${startup.path}: ${startup.error ?? "unreadable"}.'));
@@ -228,13 +269,17 @@ class _SimulatorPageState extends State<SimulatorPage>
       return;
     }
 
-    final result = parseHexFile(text, cpu.mem.poke);
+    final result = detectProgramFormat(data) == ProgramFormat.raw
+        ? loadRawBinary(data, 0, cpu.mem.poke)
+        : parseHexFile(String.fromCharCodes(data), cpu.mem.poke);
     if (result.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _showSnack(
-          'Could not load ${startup.path} as Intel HEX or S-records.'));
+          'Could not load ${startup.path} as Intel HEX, S-records or a '
+          'binary image.'));
       return;
     }
     _memRev++;
+    _codeRev++;
     if (result.startAddress != null) cpu.pc = result.startAddress!;
     _memBase =
         ((result.startAddress ?? result.minAddress ?? _memBase) & 0xFFFFF8);
@@ -251,6 +296,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     _memScroll.removeListener(_onMemScroll);
     _memScroll.dispose();
     _disasmScroll.dispose();
+    _screenRev.dispose();
     super.dispose();
   }
 
@@ -291,7 +337,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// allocated regions of the sparse memory are swept; a gap row marks
   /// each skipped unallocated stretch.
   void _rebuildDisasmIfNeeded() {
-    if (_disasmRev == _memRev && _disasm.isNotEmpty) return;
+    if (_disasmRev == _codeRev && _disasm.isNotEmpty) return;
     final list = <_DisasmEntry>[];
     var lastEnd = 0;
     for (final (start, end) in cpu.mem.regions()) {
@@ -315,7 +361,7 @@ class _SimulatorPageState extends State<SimulatorPage>
       ));
     }
     _disasm = list;
-    _disasmRev = _memRev;
+    _disasmRev = _codeRev;
   }
 
   /// Binary-searches the (address-sorted) disassembly for the entry whose
@@ -375,6 +421,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     cpu.reset();
     _memBase = 0x000100;
     _memRev++;
+    _codeRev++;
   }
 
   // --------------------------------------------------------------------
@@ -385,6 +432,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     setState(() {
       cpu.step();
       _memRev++;
+      _screenRev.value++;
       _followPc();
     });
   }
@@ -424,7 +472,10 @@ class _SimulatorPageState extends State<SimulatorPage>
           }
           if (wall.elapsedMicroseconds - tickStartUs >= budgetUs) break;
           // Run a small batch between clock reads to amortise their cost.
-          for (var i = 0; i < 128; i++) {
+          // The batch is short so that a slow instruction — one that drives
+          // a peripheral, say — cannot overrun the frame budget and make the
+          // window unresponsive.
+          for (var i = 0; i < 64; i++) {
             if (!firstStep &&
                 cpu.instrBreaks.isNotEmpty &&
                 cpu.instrBreaks.contains(cpu.pc)) {
@@ -435,7 +486,9 @@ class _SimulatorPageState extends State<SimulatorPage>
             firstStep = false;
             cpu.breakHit = false;
             cpu.step();
-            if (cpu.halted) {
+            // A sleeping CPU is still waiting for an interrupt, so keep
+            // running; only an illegal-instruction halt ends the run.
+            if (cpu.halted && !cpu.sleeping) {
               stopped = true;
               break;
             }
@@ -444,9 +497,17 @@ class _SimulatorPageState extends State<SimulatorPage>
               stopped = true;
               break;
             }
+            // Bail out mid-batch if this frame's time is already spent.
+            if ((i & 15) == 15 &&
+                wall.elapsedMicroseconds - tickStartUs >= budgetUs) {
+              break;
+            }
           }
         }
-        final stopping = cpu.halted || paused;
+        final stopping = (cpu.halted && !cpu.sleeping) || paused;
+        // Repaint the screen every tick so it animates smoothly. This drives
+        // only the Screen pane, not the heavy memory/disassembly views.
+        _screenRev.value++;
         final nowMs = wall.elapsedMilliseconds;
         if (stopping || nowMs - lastPaintMs >= 300) {
           final secs = wall.elapsedMicroseconds / 1e6;
@@ -547,7 +608,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   }
 
   Future<void> _editByte(int addr) async {
-    final controller = _selectedController(_hex2(cpu.mem.peek(addr)));
+    final controller = _selectedController(_hex2(cpu.peekBus(addr)));
     var brk = cpu.dataBreaks.contains(addr);
     final result = await showDialog<int>(
       context: context,
@@ -605,6 +666,7 @@ class _SimulatorPageState extends State<SimulatorPage>
           cpu.dataBreaks.remove(addr);
         }
         _memRev++;
+        _codeRev++;
       });
     }
   }
@@ -711,6 +773,7 @@ class _SimulatorPageState extends State<SimulatorPage>
           if (v != null) cpu.mem.poke(addr++, v);
         }
         _memRev++;
+        _codeRev++;
       });
       _scrollToAddress(start & SparseMemory.addrMask);
     }
@@ -741,9 +804,17 @@ class _SimulatorPageState extends State<SimulatorPage>
       return;
     }
 
-    // Intel HEX and S-records are plain ASCII text.
-    final text = String.fromCharCodes(data);
-    final result = parseHexFile(text, cpu.mem.poke);
+    final format = detectProgramFormat(data);
+    final HexResult result;
+    if (format == ProgramFormat.raw) {
+      // A flat binary carries no addresses, so ask where it goes.
+      final base = await _askRawLoadAddress(file.name, data.length);
+      if (base == null) return; // cancelled
+      result = loadRawBinary(data, base, cpu.mem.poke);
+    } else {
+      // Intel HEX and S-records are plain ASCII text.
+      result = parseHexFile(String.fromCharCodes(data), cpu.mem.poke);
+    }
 
     if (result.isEmpty) {
       final why = result.errors.isNotEmpty
@@ -755,6 +826,7 @@ class _SimulatorPageState extends State<SimulatorPage>
 
     setState(() {
       _memRev++;
+      _codeRev++;
       if (result.startAddress != null) cpu.pc = result.startAddress!;
     });
 
@@ -777,6 +849,68 @@ class _SimulatorPageState extends State<SimulatorPage>
     // If the assembler wrote a "<name>_sym.json" beside the file, load it
     // so the disassembly shows labels without picking the file by hand.
     await _autoLoadSymbols(file.path);
+  }
+
+  /// Asks where a flat binary should be loaded. A file exactly the size of
+  /// the address space is a full dump and defaults to H'000000; anything
+  /// else defaults to the address the memory view is showing.
+  Future<int?> _askRawLoadAddress(String name, int length) async {
+    final wholeSpace = length == SparseMemory.size;
+    final suggested = wholeSpace ? 0 : _memBase;
+    final controller = _selectedController(_hex6(suggested));
+    return showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Load binary'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '"$name" is a flat binary of $length bytes '
+              "(H'${length.toRadixString(16).toUpperCase()}), so it carries "
+              'no load address of its own.',
+              style: const TextStyle(fontSize: 12),
+            ),
+            if (wholeSpace) ...[
+              const SizedBox(height: 8),
+              Text(
+                'That is exactly the size of the 16-Mbyte address space, so '
+                'it looks like a full dump — load it at 0.',
+                style: TextStyle(fontSize: 11, color: _inkA(0.6)),
+              ),
+            ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [
+                LengthLimitingTextInputFormatter(6),
+                FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+              ],
+              decoration: const InputDecoration(
+                labelText: 'Load address',
+                prefixText: "H'",
+              ),
+              onSubmitted: (_) =>
+                  Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+            child: const Text('Load'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Saves the allocated memory regions as an Intel HEX file.
@@ -1040,6 +1174,10 @@ class _SimulatorPageState extends State<SimulatorPage>
           tabs: const [
             Tab(text: 'Memory'),
             Tab(text: 'Disassembly'),
+            Tab(text: 'Screen'),
+            Tab(text: 'SCI'),
+            Tab(text: 'ITU'),
+            Tab(text: 'DMA'),
             Tab(text: 'IO'),
             Tab(text: 'Profile'),
           ],
@@ -1053,6 +1191,11 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _memKey, child: _KeepAlive(child: _memoryView())),
               KeyedSubtree(
                   key: _disKey, child: _KeepAlive(child: _disasmView())),
+              KeyedSubtree(
+                  key: _scrKey, child: _KeepAlive(child: _screenView())),
+              KeyedSubtree(key: _sciKey, child: _KeepAlive(child: _sciView())),
+              KeyedSubtree(key: _ituKey, child: _KeepAlive(child: _ituView())),
+              KeyedSubtree(key: _dmaKey, child: _KeepAlive(child: _dmaView())),
               KeyedSubtree(key: _ioKey, child: _KeepAlive(child: _ioView())),
               KeyedSubtree(
                   key: _profKey, child: _KeepAlive(child: _profileView())),
@@ -1083,6 +1226,34 @@ class _SimulatorPageState extends State<SimulatorPage>
           pane: KeyedSubtree(
               key: _disKey, child: _KeepAlive(child: _disasmView())),
           flex: wideFlex,
+          width: null
+        ),
+      if (_viewScr)
+        (
+          pane: KeyedSubtree(
+              key: _scrKey, child: _KeepAlive(child: _screenView())),
+          flex: wideFlex,
+          width: null
+        ),
+      if (_viewSci)
+        (
+          pane:
+              KeyedSubtree(key: _sciKey, child: _KeepAlive(child: _sciView())),
+          flex: 1,
+          width: null
+        ),
+      if (_viewItu)
+        (
+          pane:
+              KeyedSubtree(key: _ituKey, child: _KeepAlive(child: _ituView())),
+          flex: 1,
+          width: null
+        ),
+      if (_viewDma)
+        (
+          pane:
+              KeyedSubtree(key: _dmaKey, child: _KeepAlive(child: _dmaView())),
+          flex: 1,
           width: null
         ),
       if (_viewIo)
@@ -1171,6 +1342,14 @@ class _SimulatorPageState extends State<SimulatorPage>
         const SizedBox(width: 4),
         _viewToggle('DIS', _viewDis, (v) => _viewDis = v),
         const SizedBox(width: 4),
+        _viewToggle('SCR', _viewScr, (v) => _viewScr = v),
+        const SizedBox(width: 4),
+        _viewToggle('SCI', _viewSci, (v) => _viewSci = v),
+        const SizedBox(width: 4),
+        _viewToggle('ITU', _viewItu, (v) => _viewItu = v),
+        const SizedBox(width: 4),
+        _viewToggle('DMA', _viewDma, (v) => _viewDma = v),
+        const SizedBox(width: 4),
         _viewToggle('IO', _viewIo, (v) => _viewIo = v),
         const SizedBox(width: 4),
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
@@ -1182,6 +1361,10 @@ class _SimulatorPageState extends State<SimulatorPage>
     final enabled = _wide;
     final selectedCount = (_viewMem ? 1 : 0) +
         (_viewDis ? 1 : 0) +
+        (_viewScr ? 1 : 0) +
+        (_viewSci ? 1 : 0) +
+        (_viewItu ? 1 : 0) +
+        (_viewDma ? 1 : 0) +
         (_viewIo ? 1 : 0) +
         (_viewProfile ? 1 : 0);
     return Tooltip(
@@ -1501,7 +1684,7 @@ class _SimulatorPageState extends State<SimulatorPage>
           SizedBox(
             width: _asciiCharW,
             child: Text(
-              allocated ? _asciiGlyph(cpu.mem.peek(rowAddr + i)) : '·',
+              allocated ? _asciiGlyph(cpu.peekBus(rowAddr + i)) : '·',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontFamily: _font,
@@ -1539,7 +1722,7 @@ class _SimulatorPageState extends State<SimulatorPage>
                 )
               : null,
           child: Text(
-            _hex2(cpu.mem.peek(addr)),
+            _hex2(cpu.peekBus(addr)),
             style: TextStyle(
               fontFamily: _font,
               fontSize: 13,
@@ -1812,6 +1995,858 @@ class _SimulatorPageState extends State<SimulatorPage>
     });
   }
 
+  // ---- Screen view ---------------------------------------------------------
+
+  Widget _screenView() {
+    return Column(
+      children: [
+        _screenHeader(),
+        Expanded(
+          child: Container(
+            color: const Color(0xFF101214),
+            padding: const EdgeInsets.all(12),
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: _LcdPane.width / _LcdPane.height,
+                child: _LcdPane(
+                  cpu: cpu,
+                  base: _screenBase,
+                  invert: _screenInvert,
+                  memRev: _memRev,
+                  tick: _screenRev,
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (!cpu.mem.isAllocated(_screenBase))
+          Container(
+            width: double.infinity,
+            color: Theme.of(context).colorScheme.surfaceContainerHigh,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Text(
+              "Nothing has been written at H'${_hex6(_screenBase)} yet — "
+              'the frame buffer is unallocated, so the panel reads as all '
+              'zeroes.',
+              style: TextStyle(fontSize: 11, color: _inkA(0.6)),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _screenHeader() {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.tv, size: 18),
+          const SizedBox(width: 6),
+          const Text('Screen', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(width: 8),
+          Text('${_LcdPane.width}×${_LcdPane.height}, 2bpp',
+              style: TextStyle(fontSize: 11, color: _inkA(0.55))),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton.icon(
+                      onPressed: () =>
+                          setState(() => _screenInvert = !_screenInvert),
+                      icon: Icon(
+                          _screenInvert
+                              ? Icons.invert_colors
+                              : Icons.invert_colors_off,
+                          size: 16),
+                      label: const Text('Invert'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _editScreenBase,
+                      icon: const Icon(Icons.my_location, size: 16),
+                      label: Text("Base  H'${_hex6(_screenBase)}"),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _editScreenBase() async {
+    final controller = _selectedController(_hex6(_screenBase));
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Frame buffer address'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [
+                LengthLimitingTextInputFormatter(6),
+                FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+              ],
+              decoration: const InputDecoration(
+                labelText: 'Hex address',
+                prefixText: "H'",
+              ),
+              onSubmitted: (_) =>
+                  Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '${_LcdPane.width}×${_LcdPane.height} pixels, 2 bits each, '
+              '${_LcdPane.stride} bytes per line — '
+              '${_LcdPane.bytes} (H\'${_LcdPane.bytes.toRadixString(16).toUpperCase()}) bytes in all.',
+              style: TextStyle(fontSize: 11, color: _inkA(0.6)),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(ctx, int.tryParse(controller.text, radix: 16)),
+            child: const Text('Set'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      setState(() => _screenBase = result & SparseMemory.addrMask);
+    }
+  }
+
+  // ---- SCI view ------------------------------------------------------------
+
+  /// Which channel's detail the SCI tab is showing.
+  int _sciChannel = 0;
+
+  /// System clock assumed when converting the bit rate to baud. The divisor
+  /// is exact; the crystal is not, so this is a display aid only.
+  static const double _assumedPhi = 11059200; // gives 19200 at BRR = 17
+
+  Widget _sciView() {
+    final ch = cpu.sci[_sciChannel];
+    return Column(
+      children: [
+        _sciHeader(),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            children: [
+              _sciSummary(ch),
+              const SizedBox(height: 10),
+              _sciRegisters(ch),
+              const SizedBox(height: 12),
+              _sciFlagRow('SCR', ch.scr, const [
+                ('TIE', SciControl.tie),
+                ('RIE', SciControl.rie),
+                ('TE', SciControl.te),
+                ('RE', SciControl.re),
+                ('MPIE', SciControl.mpie),
+                ('TEIE', SciControl.teie),
+                ('CKE1', SciControl.cke1),
+                ('CKE0', SciControl.cke0),
+              ]),
+              const SizedBox(height: 6),
+              _sciFlagRow('SSR', ch.ssr, const [
+                ('TDRE', SciStatus.tdre),
+                ('RDRF', SciStatus.rdrf),
+                ('ORER', SciStatus.orer),
+                ('FER', SciStatus.fer),
+                ('PER', SciStatus.per),
+                ('TEND', SciStatus.tend),
+                ('MPB', SciStatus.mpb),
+                ('MPBT', SciStatus.mpbt),
+              ]),
+              const SizedBox(height: 14),
+              _sciTransmitted(ch),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sciHeader() {
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.cable, size: 18),
+          const SizedBox(width: 6),
+          const Text('Serial', style: TextStyle(fontWeight: FontWeight.bold)),
+          const Spacer(),
+          SegmentedButton<int>(
+            segments: [
+              for (var i = 0; i < cpu.sci.length; i++)
+                ButtonSegment(value: i, label: Text(cpu.sci[i].name)),
+            ],
+            selected: {_sciChannel},
+            showSelectedIcon: false,
+            style: ButtonStyle(
+              visualDensity: VisualDensity.compact,
+              textStyle: WidgetStatePropertyAll(TextStyle(fontSize: 12)),
+            ),
+            onSelectionChanged: (s) => setState(() => _sciChannel = s.first),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The framing and bit rate the registers currently describe.
+  Widget _sciSummary(SciChannel ch) {
+    final enabled = <String>[
+      if ((ch.scr & SciControl.te) != 0) 'TX',
+      if ((ch.scr & SciControl.re) != 0) 'RX',
+    ];
+    final baud = ch.baudAt(_assumedPhi);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(ch.framing,
+                  style: TextStyle(
+                      fontFamily: _font,
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      color: _accent)),
+              const SizedBox(width: 12),
+              Text(
+                enabled.isEmpty ? 'disabled' : enabled.join(' + '),
+                style: TextStyle(
+                    fontSize: 12,
+                    color: enabled.isEmpty ? _inkA(0.45) : _accent),
+              ),
+              const Spacer(),
+              if (ch.transmitting)
+                Text('sending…',
+                    style: TextStyle(fontSize: 11, color: _accent)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${ch.statesPerBit} states/bit, ${ch.bitsPerChar} bits per '
+            'character — ${baud.toStringAsFixed(0)} baud at '
+            '${(_assumedPhi / 1e6).toStringAsFixed(4)} MHz',
+            style: TextStyle(fontSize: 11, color: _inkA(0.6)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sciRegisters(SciChannel ch) {
+    Widget row(String name, int addr, int value, String note) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 52,
+                child: Text(name,
+                    style: const TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.bold)),
+              ),
+              SizedBox(
+                width: 78,
+                child: Text("H'${_hex6(addr)}",
+                    style: TextStyle(
+                        fontFamily: _font, fontSize: 12, color: _inkA(0.5))),
+              ),
+              SizedBox(
+                width: 46,
+                child: Text("H'${_hex2(value)}",
+                    style: TextStyle(
+                        fontFamily: _font, fontSize: 13, color: _accent)),
+              ),
+              Expanded(
+                child: Text(note,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              ),
+            ],
+          ),
+        );
+
+    return Column(
+      children: [
+        row('SMR', ch.smrAddr, ch.smr, 'mode: ${ch.framing}'),
+        row('BRR', ch.brrAddr, ch.brr, 'bit rate divisor'),
+        row('SCR', ch.scrAddr, ch.scr, 'control / interrupt enables'),
+        row('TDR', ch.tdrAddr, ch.tdr, 'transmit data'),
+        row('SSR', ch.ssrAddr, ch.ssr, 'status'),
+        row('RDR', ch.rdrAddr, ch.rdr, 'receive data'),
+      ],
+    );
+  }
+
+  Widget _sciFlagRow(String label, int value, List<(String, int)> bits) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 44,
+          child: Text(label,
+              style:
+                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+        ),
+        Expanded(
+          child: Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: [
+              for (final b in bits) _sciFlagChip(b.$1, (value & b.$2) != 0),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sciFlagChip(String name, bool on) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: on
+            ? _accentFixed
+            : Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: Colors.black26),
+      ),
+      child: Text(
+        name,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+          color: on ? Colors.white : _inkA(0.45),
+        ),
+      ),
+    );
+  }
+
+  /// The bytes the firmware has put on the wire, as a hex dump.
+  Widget _sciTransmitted(SciChannel ch) {
+    final log = ch.txLog;
+    const perRow = 16;
+    final rows = (log.length + perRow - 1) ~/ perRow;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text('Transmitted',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+            const SizedBox(width: 8),
+            Text(
+              ch.txCount == log.length
+                  ? '${ch.txCount} bytes'
+                  : '${ch.txCount} bytes (showing the last ${log.length})',
+              style: TextStyle(fontSize: 11, color: _inkA(0.55)),
+            ),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: log.isEmpty
+                  ? null
+                  : () => setState(() {
+                        ch.txLog.clear();
+                        ch.txCount = 0;
+                      }),
+              icon: const Icon(Icons.clear_all, size: 16),
+              label: const Text('Clear'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Container(
+          height: 220,
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: log.isEmpty
+              ? Center(
+                  child: Text(
+                    'Nothing sent yet.\nBytes appear here as the program '
+                    'writes them to TDR.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, color: _inkA(0.5)),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.all(8),
+                  itemCount: rows,
+                  itemExtent: 20,
+                  itemBuilder: (_, r) => _sciDumpRow(log, r * perRow, perRow),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sciDumpRow(List<int> log, int start, int perRow) {
+    final end = (start + perRow) > log.length ? log.length : start + perRow;
+    final slice = log.sublist(start, end);
+    final hex = slice.map(_hex2).join(' ');
+    final ascii = slice
+        .map((b) => (b >= 0x20 && b < 0x7F) ? String.fromCharCode(b) : '·')
+        .join();
+    return Row(
+      children: [
+        SizedBox(
+          width: 56,
+          child: Text(_hex4(start),
+              style: TextStyle(
+                  fontFamily: _font, fontSize: 12, color: _inkA(0.45))),
+        ),
+        SizedBox(
+          width: 372,
+          child: Text(hex,
+              style:
+                  TextStyle(fontFamily: _font, fontSize: 12, color: _ink)),
+        ),
+        Text(ascii,
+            style: TextStyle(
+                fontFamily: _font, fontSize: 12, color: _inkA(0.55))),
+      ],
+    );
+  }
+
+  static String _hex4(int v) =>
+      (v & 0xFFFF).toRadixString(16).toUpperCase().padLeft(4, '0');
+
+  // ---- ITU view ------------------------------------------------------------
+
+  Widget _ituView() {
+    final itu = cpu.itu;
+    return Column(
+      children: [
+        _ituHeader(),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            children: [
+              _ituSharedRegisters(itu),
+              const SizedBox(height: 12),
+              for (final ch in itu.channels) ...[
+                _ituChannelCard(ch),
+                const SizedBox(height: 8),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _ituHeader() {
+    final running = cpu.itu.channels.where((c) => c.running).length;
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.timer_outlined, size: 18),
+          const SizedBox(width: 6),
+          const Text('Timers (ITU)',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(width: 10),
+          Text(
+            running == 0
+                ? 'all stopped'
+                : '$running of ${cpu.itu.channels.length} running',
+            style: TextStyle(fontSize: 11, color: _inkA(0.55)),
+          ),
+          const Spacer(),
+        ],
+      ),
+    );
+  }
+
+  /// TSTR/TSNC/TMDR/TFCR/TOER/TOCR, which apply across the channels.
+  Widget _ituSharedRegisters(Itu itu) {
+    Widget reg(String name, int addr, int value) => Padding(
+          padding: const EdgeInsets.only(right: 14, bottom: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('$name ',
+                  style: const TextStyle(
+                      fontSize: 11, fontWeight: FontWeight.bold)),
+              Text("H'${_hex2(value)}",
+                  style: TextStyle(
+                      fontFamily: _font, fontSize: 12, color: _accent)),
+            ],
+          ),
+        );
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Shared',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+          const SizedBox(height: 6),
+          Wrap(
+            children: [
+              reg('TSTR', 0xFFFF60, itu.tstr),
+              reg('TSNC', 0xFFFF61, itu.tsnc),
+              reg('TMDR', 0xFFFF62, itu.tmdr),
+              reg('TFCR', 0xFFFF63, itu.tfcr),
+              reg('TOER', 0xFFFF90, itu.toer),
+              reg('TOCR', 0xFFFF91, itu.tocr),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Text('start bits ',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              for (var i = cpu.itu.channels.length - 1; i >= 0; i--)
+                Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: _sciFlagChip('STR$i', cpu.itu.channels[i].running),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// One channel: counter, general registers, clock, and its flags.
+  Widget _ituChannelCard(ItuChannel ch) {
+    final pending = ch.pendingVector() != null;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(
+          color: ch.running ? _accentFixed.withValues(alpha: 0.6) : Colors.black26,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(ch.name,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 13)),
+              const SizedBox(width: 8),
+              Text(ch.running ? 'running' : 'stopped',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: ch.running ? _accent : _inkA(0.45))),
+              const SizedBox(width: 10),
+              Text('${ch.clockSource} · ${ch.clearSource}',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.55))),
+              const Spacer(),
+              if (pending)
+                Text('interrupt pending',
+                    style: TextStyle(fontSize: 11, color: _accent)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          // The counter, big enough to read at a glance, with its targets.
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text('TCNT ',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              Text("H'${_hex4(ch.tcnt)}",
+                  style: TextStyle(
+                      fontFamily: _font,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: _accent)),
+              const SizedBox(width: 14),
+              Text("GRA H'${_hex4(ch.gra)}   GRB H'${_hex4(ch.grb)}"
+                  "${ch.hasBuffers ? "   BRA H'${_hex4(ch.bra)}   BRB H'${_hex4(ch.brb)}" : ''}",
+                  style: TextStyle(
+                      fontFamily: _font, fontSize: 12, color: _inkA(0.75))),
+            ],
+          ),
+          const SizedBox(height: 4),
+          // Progress towards the GRA compare match, when there is one.
+          if (ch.gra > 0)
+            LinearProgressIndicator(
+              value: (ch.tcnt / (ch.gra == 0 ? 0xFFFF : ch.gra)).clamp(0.0, 1.0),
+              minHeight: 3,
+              backgroundColor: _inkA(0.12),
+            ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  "TCR H'${_hex2(ch.tcr)}  TIOR H'${_hex2(ch.tior)}  "
+                  "TIER H'${_hex2(ch.tier)}  TSR H'${_hex2(ch.tsr)}",
+                  style: TextStyle(
+                      fontFamily: _font, fontSize: 11, color: _inkA(0.6)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Text('flags ', style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              _sciFlagChip('IMFA', (ch.tsr & ItuStatus.imfa) != 0),
+              const SizedBox(width: 4),
+              _sciFlagChip('IMFB', (ch.tsr & ItuStatus.imfb) != 0),
+              const SizedBox(width: 4),
+              _sciFlagChip('OVF', (ch.tsr & ItuStatus.ovf) != 0),
+              const SizedBox(width: 14),
+              Text('enables ',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              _sciFlagChip('IMIEA', (ch.tier & ItuInterrupt.imiea) != 0),
+              const SizedBox(width: 4),
+              _sciFlagChip('IMIEB', (ch.tier & ItuInterrupt.imieb) != 0),
+              const SizedBox(width: 4),
+              _sciFlagChip('OVIE', (ch.tier & ItuInterrupt.ovie) != 0),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- DMA view ------------------------------------------------------------
+
+  Widget _dmaView() {
+    return Column(
+      children: [
+        _dmaHeader(),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            children: [
+              for (final ch in cpu.dmac.channels) ...[
+                _dmaChannelCard(ch),
+                const SizedBox(height: 8),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _dmaHeader() {
+    final active = cpu.dmac.channels
+        .where((c) => c.fullAddress
+            ? c.fullEnabled
+            : (c.a.enabled || c.b.enabled))
+        .length;
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          const Icon(Icons.swap_horiz, size: 18),
+          const SizedBox(width: 6),
+          const Text('DMA', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(width: 10),
+          Text(
+            active == 0 ? 'no channel enabled' : '$active enabled',
+            style: TextStyle(fontSize: 11, color: _inkA(0.55)),
+          ),
+          const Spacer(),
+          Text('${cpu.dmac.transferCount} transfers',
+              style: TextStyle(fontSize: 11, color: _inkA(0.55))),
+        ],
+      ),
+    );
+  }
+
+  Widget _dmaChannelCard(DmacChannel ch) {
+    final full = ch.fullAddress;
+    final on = full ? ch.fullEnabled : (ch.a.enabled || ch.b.enabled);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(
+            color: on ? _accentFixed.withValues(alpha: 0.6) : Colors.black26),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('Channel ${ch.index}',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 13)),
+              const SizedBox(width: 8),
+              Text(ch.modeName,
+                  style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              const SizedBox(width: 10),
+              Text(on ? 'enabled' : 'disabled',
+                  style: TextStyle(
+                      fontSize: 11, color: on ? _accent : _inkA(0.45))),
+              const Spacer(),
+              Text("H'${_hex6(ch.base)}",
+                  style: TextStyle(
+                      fontFamily: _font, fontSize: 11, color: _inkA(0.4))),
+            ],
+          ),
+          const SizedBox(height: 6),
+          if (full) _dmaFullBody(ch) else _dmaShortBody(ch),
+        ],
+      ),
+    );
+  }
+
+  /// Full address mode: MARA is the source, MARB the destination.
+  Widget _dmaFullBody(DmacChannel ch) {
+    final total = ch.a.etcrReload == 0 ? 1 : ch.a.etcrReload;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text("source H'${_hex6(ch.a.mar)}",
+                style: TextStyle(
+                    fontFamily: _font, fontSize: 13, color: _accent)),
+            Icon(Icons.arrow_right_alt, size: 18, color: _inkA(0.6)),
+            Text("dest H'${_hex6(ch.b.mar)}",
+                style: TextStyle(
+                    fontFamily: _font, fontSize: 13, color: _accent)),
+            const SizedBox(width: 14),
+            Text('${ch.a.etcr} left of $total',
+                style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+          ],
+        ),
+        const SizedBox(height: 4),
+        LinearProgressIndicator(
+          value: (1 - ch.a.etcr / total).clamp(0.0, 1.0),
+          minHeight: 3,
+          backgroundColor: _inkA(0.12),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          "DTCRA H'${_hex2(ch.a.dtcr)}   DTCRB H'${_hex2(ch.b.dtcr)}   "
+          '${ch.a.wordSize ? 'word' : 'byte'} transfers',
+          style: TextStyle(fontFamily: _font, fontSize: 11, color: _inkA(0.6)),
+        ),
+        const SizedBox(height: 6),
+        Row(children: [
+          _sciFlagChip('DTE', ch.a.enabled),
+          const SizedBox(width: 4),
+          _sciFlagChip('DTME', (ch.b.dtcr & DmacControlB.dtme) != 0),
+          const SizedBox(width: 4),
+          _sciFlagChip('SAIDE', (ch.a.dtcr & DmacControlA.saide) != 0),
+          const SizedBox(width: 4),
+          _sciFlagChip('DAIDE', (ch.b.dtcr & DmacControlB.daide) != 0),
+          const SizedBox(width: 4),
+          _sciFlagChip('DTIE', (ch.a.dtcr & DmacControl.dtie) != 0),
+        ]),
+      ],
+    );
+  }
+
+  /// Short address mode: the two halves run independently.
+  Widget _dmaShortBody(DmacChannel ch) {
+    return Column(
+      children: [
+        _dmaHalfRow(ch.a),
+        const SizedBox(height: 6),
+        _dmaHalfRow(ch.b),
+      ],
+    );
+  }
+
+  Widget _dmaHalfRow(DmacHalf h) {
+    final total = h.etcrReload == 0 ? 1 : h.etcrReload;
+    final receiving = h.source == DmacSource.sciReceive;
+    return Opacity(
+      opacity: h.enabled ? 1.0 : 0.55,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              SizedBox(
+                width: 30,
+                child: Text(h.label,
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 12)),
+              ),
+              // Direction follows the activation source: a receive channel
+              // reads the device, everything else writes it.
+              Text(
+                receiving
+                    ? "H'${_hex6(h.ioAddress)} → H'${_hex6(h.mar)}"
+                    : "H'${_hex6(h.mar)} → H'${_hex6(h.ioAddress)}",
+                style: TextStyle(
+                    fontFamily: _font, fontSize: 12, color: _accent),
+              ),
+              const SizedBox(width: 10),
+              Text('${h.etcr} left of $total',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.6))),
+              const Spacer(),
+              Text('${h.sourceName} · ${h.modeName}',
+                  style: TextStyle(fontSize: 11, color: _inkA(0.55))),
+            ],
+          ),
+          const SizedBox(height: 3),
+          Row(
+            children: [
+              const SizedBox(width: 30),
+              Text(
+                "DTCR H'${_hex2(h.dtcr)}  IOAR H'${_hex2(h.ioar)}  "
+                '${h.wordSize ? 'word' : 'byte'}, '
+                '${(h.dtcr & DmacControl.dtid) != 0 ? 'decrement' : 'increment'}',
+                style: TextStyle(
+                    fontFamily: _font, fontSize: 11, color: _inkA(0.55)),
+              ),
+              const SizedBox(width: 8),
+              _sciFlagChip('DTE', h.enabled),
+              const SizedBox(width: 4),
+              _sciFlagChip('DTIE', (h.dtcr & DmacControl.dtie) != 0),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   // ---- IO view -------------------------------------------------------------
 
   /// The width the IO view is laid out at: the eight 34px bit boxes plus
@@ -1925,8 +2960,8 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// are green; positions without a pin are dimmed.
   Widget _gpioPort(H8Port p) {
     final ddrAddr = p.ddrAddr;
-    final ddr = ddrAddr == null ? 0 : cpu.mem.peek(ddrAddr);
-    final dr = cpu.mem.peek(p.drAddr);
+    final ddr = ddrAddr == null ? 0 : cpu.peekBus(ddrAddr);
+    final dr = cpu.peekBus(p.drAddr);
     // Values inline, register addresses in the tooltip — at this width
     // there is no room for both.
     final regs = StringBuffer();
@@ -2102,7 +3137,7 @@ class _SimulatorPageState extends State<SimulatorPage>
       children: [
         Expanded(
           child: section(
-              'Data accesses', data, (a) => "= H'${_hex2(cpu.mem.peek(a))}"),
+              'Data accesses', data, (a) => "= H'${_hex2(cpu.peekBus(a))}"),
         ),
         const Divider(height: 1, thickness: 1),
         Expanded(
@@ -2161,12 +3196,14 @@ class _SimulatorPageState extends State<SimulatorPage>
             _ctrlButton(
               icon: Icons.skip_next,
               label: 'Step',
-              onPressed: (_running || cpu.halted) ? null : _step,
+              onPressed:
+                  (_running || (cpu.halted && !cpu.sleeping)) ? null : _step,
             ),
             _ctrlButton(
               icon: Icons.play_arrow,
               label: 'Run',
-              onPressed: (_running || cpu.halted) ? null : _run,
+              onPressed:
+                  (_running || (cpu.halted && !cpu.sleeping)) ? null : _run,
               primary: true,
             ),
             _ctrlButton(
@@ -2225,6 +3262,144 @@ class _SimulatorPageState extends State<SimulatorPage>
       (v & 0xFFFFFF).toRadixString(16).toUpperCase().padLeft(6, '0');
   static String _hex8(int v) =>
       (v & 0xFFFFFFFF).toRadixString(16).toUpperCase().padLeft(8, '0');
+}
+
+/// The LCD panel: 320x240 pixels at 2 bits each, read straight out of the
+/// simulated memory.
+///
+/// Each byte holds four pixels, most significant bits first, so bits 7-6 are
+/// the leftmost pixel of the group. The two-bit value selects one of four
+/// grey levels, 0 = black through 3 = white (invert swaps the ends).
+///
+/// The bitmap is converted to a [ui.Image] once per revision rather than
+/// painted pixel by pixel — 76800 individual rectangles per frame would not
+/// keep up with Run mode.
+class _LcdPane extends StatefulWidget {
+  const _LcdPane({
+    required this.cpu,
+    required this.base,
+    required this.invert,
+    required this.memRev,
+    required this.tick,
+  });
+
+  final H8Cpu cpu;
+  final int base;
+  final bool invert;
+
+  /// Bumped when memory may have changed (edits, loads, stepping).
+  final int memRev;
+
+  /// Bumped every Run tick, so the panel animates while the heavier views
+  /// stay throttled.
+  final ValueListenable<int> tick;
+
+  static const int width = LcdFormat.width;
+  static const int height = LcdFormat.height;
+  static const int stride = LcdFormat.stride;
+  static const int bytes = LcdFormat.bytes;
+
+  @override
+  State<_LcdPane> createState() => _LcdPaneState();
+}
+
+class _LcdPaneState extends State<_LcdPane> {
+  ui.Image? _image;
+
+  /// True while an image conversion is in flight; further requests are
+  /// coalesced rather than queued.
+  bool _converting = false;
+  bool _dirty = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.tick.addListener(_request);
+    _request();
+  }
+
+  @override
+  void didUpdateWidget(_LcdPane old) {
+    super.didUpdateWidget(old);
+    if (old.tick != widget.tick) {
+      old.tick.removeListener(_request);
+      widget.tick.addListener(_request);
+    }
+    if (old.memRev != widget.memRev ||
+        old.base != widget.base ||
+        old.invert != widget.invert) {
+      _request();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.tick.removeListener(_request);
+    _image?.dispose();
+    super.dispose();
+  }
+
+  void _request() {
+    if (_converting) {
+      _dirty = true; // fold into the conversion already running
+      return;
+    }
+    _converting = true;
+    _convert();
+  }
+
+  void _convert() {
+    const w = _LcdPane.width, h = _LcdPane.height;
+    final rgba = lcdToRgba(widget.cpu.mem.peek, widget.base,
+        invert: widget.invert);
+    ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, (img) {
+      if (!mounted) {
+        img.dispose();
+        return;
+      }
+      setState(() {
+        _image?.dispose();
+        _image = img;
+      });
+      _converting = false;
+      if (_dirty) {
+        _dirty = false;
+        _request();
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _LcdPainter(_image),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _LcdPainter extends CustomPainter {
+  _LcdPainter(this.image);
+
+  final ui.Image? image;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    canvas.drawRect(rect, Paint()..color = const Color(0xFF000000));
+    final img = image;
+    if (img == null) return;
+    canvas.drawImageRect(
+      img,
+      Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+      rect,
+      // Nearest-neighbour: keep the pixels crisp when scaled up.
+      Paint()..filterQuality = FilterQuality.none,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_LcdPainter old) => old.image != image;
 }
 
 /// Keeps its child mounted (and therefore its scroll position intact)
