@@ -36,6 +36,12 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
 - **On-chip RAM** — `H'FFFD10`–`H'FFFF0F` (512 bytes, pre-allocated), per
   the mode 3/4 memory map. The 8-bit absolute addressing mode (`@aa:8`)
   targets `H'FFFF00`–`H'FFFFFF` as on the real chip.
+- **A/D converter** — simulated (manual section 14): registers at
+  `H'FFFFE0`–`H'FFFFE9`, eight inputs AN0–AN7 multiplexed into the four
+  result registers (AN0/AN4 to ADDRA, AN1/AN5 to ADDRB, and so on), 10-bit
+  results left-justified, single and scan modes, the 266/134-state
+  conversion time selected by `CKS`, and the ADI interrupt. Each input's
+  voltage is settable, which is how the touch panel is driven.
 - **DMA (DMAC)** — all four channels are simulated (manual section 8):
   registers at `H'FFFF20`–`H'FFFF5F`, short address mode (I/O and repeat
   modes, increment or decrement, byte or word) and full address mode
@@ -76,6 +82,16 @@ Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
   the header, since the SED1351's start-address registers can move it. The
   panel repaints every Run tick, independently of the throttled memory and
   disassembly views.
+
+  **Clicking the panel presses the touch screen.** The artista 180 reads a
+  4-wire resistive panel through the A/D converter — the X axis on AN4 and
+  the Y axis on AN6, using the top eight bits of each conversion — so a
+  click feeds those two channels and the firmware sees a finger. Dragging
+  moves the touch; releasing drives both channels to zero, which is what the
+  firmware reads as no touch (it ignores anything below `H'4C`). The strip
+  under the panel shows the readings being injected, and **Calibrate** sets
+  the endpoints of the linear pixel-to-reading map — the panel's real
+  calibration is not known, so those are adjustable rather than guessed at.
 - **SCI view** — the two serial channels. Shows `SMR`, `BRR`, `SCR`, `TDR`,
   `SSR` and `RDR` with their addresses and values, the `SCR` and `SSR` bits
   as labelled flags, the framing and bit rate the registers currently
@@ -186,6 +202,7 @@ distribution, which the app is not aimed at.
 | `lib/sci.dart` | The serial channels: registers, character timing, interrupts |
 | `lib/itu.dart` | The 16-bit timer unit: five channels, prescalers, compare match |
 | `lib/dmac.dart` | The DMA controller: short and full address modes, activation sources |
+| `lib/adc.dart` | The A/D converter: eight inputs, conversion timing, ADI |
 | `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/screen/IO/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
 | `tool/make_icons.py` | Regenerates the app icon and every platform variant |

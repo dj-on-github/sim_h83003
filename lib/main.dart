@@ -1742,9 +1742,10 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   // ---- Disassembly view ----------------------------------------------------
 
-  /// Opens a JSON symbol table and maps its addresses to labels. Accepts a
-  /// `{ "label": address }` object (address as an int or a hex string), or
-  /// a list of `"name = H'hhhhhh"`-style listing lines.
+  /// Opens a symbol table and maps its addresses to labels. Accepts a JSON
+  /// `{ "label": address }` object (address as an int or a hex string), a
+  /// JSON list of `"name = H'hhhhhh"`-style listing lines, or a plain-text
+  /// `.sym` file of those lines with `;`, `#` or `//` comments.
   Future<void> _loadSymbols() async {
     try {
       final picked =
@@ -1766,66 +1767,40 @@ class _SimulatorPageState extends State<SimulatorPage>
     }
   }
 
-  /// Parses a symbol-table JSON from [bytes] and installs it, returning
-  /// the number of symbols loaded.
+  /// Parses a symbol table from [bytes] and installs it, returning the
+  /// number of symbols loaded.
   int _applySymbolBytes(List<int> bytes) {
-    final map = <int, String>{};
+    final String text;
     try {
-      final decoded = json.decode(utf8.decode(bytes));
-      if (decoded is Map) {
-        decoded.forEach((k, v) {
-          final addr = _asAddress(v);
-          if (addr != null) map[addr] = k.toString();
-        });
-      } else if (decoded is List) {
-        final re = RegExp(
-            r"^\s*([A-Za-z_.$][\w.$]*)\s*=\s*(?:H'|\$|0x)?([0-9A-Fa-f]+)");
-        for (final item in decoded) {
-          final m = re.firstMatch(item.toString());
-          if (m != null) {
-            map[int.parse(m.group(2)!, radix: 16) & SparseMemory.addrMask] =
-                m.group(1)!;
-          }
-        }
-      }
+      text = utf8.decode(bytes);
     } catch (_) {
       return 0;
     }
+    final map = parseSymbolTable(text);
     if (map.isEmpty) return 0;
     setState(() => _symbols = map);
     return map.length;
   }
 
   /// After loading a hex file at [hexPath], look for a sibling symbol
-  /// table `<name>_sym.json` and load it automatically.
+  /// table — `<name>_sym.json` or `<name>.sym` — and load it automatically.
   Future<void> _autoLoadSymbols(String? hexPath) async {
     if (hexPath == null) return;
     final dot = hexPath.lastIndexOf('.');
     if (dot <= 0) return;
-    final symPath = '${hexPath.substring(0, dot)}_sym.json';
-    final bytes = await readBytesFromPath(symPath);
-    if (bytes == null) return; // no sibling symbol file
-    final n = _applySymbolBytes(bytes);
-    if (n > 0) _showSnack('Auto-loaded $n symbols from ${_baseName(symPath)}.');
+    final stem = hexPath.substring(0, dot);
+    for (final symPath in ['${stem}_sym.json', '$stem.sym']) {
+      final bytes = await readBytesFromPath(symPath);
+      if (bytes == null) continue; // no sibling symbol file
+      final n = _applySymbolBytes(bytes);
+      if (n > 0) {
+        _showSnack('Auto-loaded $n symbols from ${_baseName(symPath)}.');
+        return;
+      }
+    }
   }
 
   String _baseName(String path) => path.split(RegExp(r'[\\/]')).last;
-
-  /// Coerces a symbol-table value to a 24-bit address.
-  int? _asAddress(dynamic v) {
-    if (v is int) return v & SparseMemory.addrMask;
-    if (v is String) {
-      var s = v.trim();
-      if (s.startsWith("H'")) s = s.substring(2);
-      if (s.startsWith('\$')) s = s.substring(1);
-      if (s.startsWith('0x') || s.startsWith('0X')) s = s.substring(2);
-      final hex = int.tryParse(s, radix: 16);
-      if (hex != null) return hex & SparseMemory.addrMask;
-      final dec = int.tryParse(s);
-      if (dec != null) return dec & SparseMemory.addrMask;
-    }
-    return null;
-  }
 
   /// Replaces `H'xxxxxx` operand addresses in a disassembly line with
   /// their symbol names (leaving `#H'xx` immediates alone).
@@ -1997,6 +1972,55 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   // ---- Screen view ---------------------------------------------------------
 
+  // ---- Touch panel ---------------------------------------------------------
+  //
+  // The artista 180 reads a 4-wire resistive panel through the CPU's A/D
+  // converter: the X axis on AN4 and the Y axis on AN6, taking the top eight
+  // bits of each conversion. Clicking the simulated screen feeds those two
+  // channels, so the firmware sees a finger press.
+  //
+  // The panel's calibration is not known, so the pixel-to-reading mapping is
+  // linear between adjustable endpoints. The firmware treats a reading below
+  // H'4C as no touch, so the defaults sit above that and releasing drives
+  // both channels to zero.
+
+  static const int touchChannelX = 4;
+  static const int touchChannelY = 6;
+
+  /// Reading that corresponds to the left/top edge and the right/bottom edge.
+  int _touchXMin = 0x4C, _touchXMax = 0xF0;
+  int _touchYMin = 0x4C, _touchYMax = 0xF0;
+
+  /// Where the pointer is, in panel pixels, while pressed.
+  Offset? _touchPoint;
+
+  int _touchRawX = 0, _touchRawY = 0;
+
+  /// Converts a point on the panel into the two channel readings and applies
+  /// them. A null point lifts the finger.
+  void _applyTouch(Offset? panelPoint) {
+    setState(() {
+      _touchPoint = panelPoint;
+      if (panelPoint == null) {
+        _touchRawX = 0;
+        _touchRawY = 0;
+      } else {
+        final fx = (panelPoint.dx / (_LcdPane.width - 1)).clamp(0.0, 1.0);
+        final fy = (panelPoint.dy / (_LcdPane.height - 1)).clamp(0.0, 1.0);
+        _touchRawX = (_touchXMin + fx * (_touchXMax - _touchXMin)).round();
+        _touchRawY = (_touchYMin + fy * (_touchYMax - _touchYMin)).round();
+      }
+      cpu.adc.setInput8(touchChannelX, _touchRawX);
+      cpu.adc.setInput8(touchChannelY, _touchRawY);
+    });
+  }
+
+  /// Maps a pointer position inside the pane onto panel pixels.
+  Offset _toPanel(Offset local, Size paneSize) => Offset(
+        local.dx / paneSize.width * _LcdPane.width,
+        local.dy / paneSize.height * _LcdPane.height,
+      );
+
   Widget _screenView() {
     return Column(
       children: [
@@ -2008,17 +2032,64 @@ class _SimulatorPageState extends State<SimulatorPage>
             child: Center(
               child: AspectRatio(
                 aspectRatio: _LcdPane.width / _LcdPane.height,
-                child: _LcdPane(
-                  cpu: cpu,
-                  base: _screenBase,
-                  invert: _screenInvert,
-                  memRev: _memRev,
-                  tick: _screenRev,
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final paneSize =
+                        Size(constraints.maxWidth, constraints.maxHeight);
+                    return GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (d) =>
+                          _applyTouch(_toPanel(d.localPosition, paneSize)),
+                      onTapUp: (_) => _applyTouch(null),
+                      onTapCancel: () => _applyTouch(null),
+                      onPanDown: (d) =>
+                          _applyTouch(_toPanel(d.localPosition, paneSize)),
+                      onPanUpdate: (d) =>
+                          _applyTouch(_toPanel(d.localPosition, paneSize)),
+                      onPanEnd: (_) => _applyTouch(null),
+                      onPanCancel: () => _applyTouch(null),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          _LcdPane(
+                            cpu: cpu,
+                            base: _screenBase,
+                            invert: _screenInvert,
+                            memRev: _memRev,
+                            tick: _screenRev,
+                          ),
+                          if (_touchPoint != null)
+                            Positioned(
+                              left: _touchPoint!.dx /
+                                      _LcdPane.width *
+                                      paneSize.width -
+                                  9,
+                              top: _touchPoint!.dy /
+                                      _LcdPane.height *
+                                      paneSize.height -
+                                  9,
+                              child: IgnorePointer(
+                                child: Container(
+                                  width: 18,
+                                  height: 18,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                        color: _accentFixed, width: 2),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
                 ),
               ),
             ),
           ),
         ),
+        _touchStrip(),
         if (!cpu.mem.isAllocated(_screenBase))
           Container(
             width: double.infinity,
@@ -2033,6 +2104,112 @@ class _SimulatorPageState extends State<SimulatorPage>
           ),
       ],
     );
+  }
+
+  /// The touch readout under the panel: what the click is feeding the A/D,
+  /// and a way to adjust the mapping while calibrating.
+  Widget _touchStrip() {
+    final touching = _touchPoint != null;
+    return Container(
+      width: double.infinity,
+      color: Theme.of(context).colorScheme.surfaceContainerHigh,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      child: Row(
+        children: [
+          Icon(touching ? Icons.touch_app : Icons.touch_app_outlined,
+              size: 16, color: touching ? _accentFixed : _inkA(0.4)),
+          const SizedBox(width: 6),
+          Text(
+            touching
+                ? 'touch  (${_touchPoint!.dx.round()}, '
+                    '${_touchPoint!.dy.round()})'
+                : 'click the panel to press',
+            style: TextStyle(
+                fontSize: 11,
+                color: touching ? _ink : _inkA(0.55)),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            "AN4 H'${_hex2(_touchRawX)}   AN6 H'${_hex2(_touchRawY)}",
+            style: TextStyle(
+                fontFamily: _font,
+                fontSize: 11,
+                color: touching ? _accent : _inkA(0.45)),
+          ),
+          const Spacer(),
+          TextButton.icon(
+            onPressed: _editTouchCalibration,
+            icon: const Icon(Icons.tune, size: 15),
+            label: const Text('Calibrate'),
+            style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The panel's real calibration is unknown, so the endpoints of the linear
+  /// pixel-to-reading map are adjustable.
+  Future<void> _editTouchCalibration() async {
+    final xMin = _selectedController(_hex2(_touchXMin));
+    final xMax = _selectedController(_hex2(_touchXMax));
+    final yMin = _selectedController(_hex2(_touchYMin));
+    final yMax = _selectedController(_hex2(_touchYMax));
+
+    Widget field(String label, TextEditingController c) => SizedBox(
+          width: 96,
+          child: TextField(
+            controller: c,
+            textCapitalization: TextCapitalization.characters,
+            inputFormatters: [
+              LengthLimitingTextInputFormatter(2),
+              FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+            ],
+            decoration: InputDecoration(labelText: label, prefixText: "H'"),
+          ),
+        );
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Touch calibration'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'A click is converted to two A/D readings: the X position on '
+              'AN$touchChannelX and the Y position on AN$touchChannelY, '
+              'linearly between these endpoints. The firmware ignores '
+              "readings below H'4C, so keep the minimums above that for a "
+              'press to register.',
+              style: TextStyle(fontSize: 11, color: _inkA(0.65)),
+            ),
+            const SizedBox(height: 14),
+            Row(children: [field('X at left', xMin), const SizedBox(width: 10),
+              field('X at right', xMax)]),
+            const SizedBox(height: 10),
+            Row(children: [field('Y at top', yMin), const SizedBox(width: 10),
+              field('Y at bottom', yMax)]),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Apply')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() {
+      _touchXMin = int.tryParse(xMin.text, radix: 16) ?? _touchXMin;
+      _touchXMax = int.tryParse(xMax.text, radix: 16) ?? _touchXMax;
+      _touchYMin = int.tryParse(yMin.text, radix: 16) ?? _touchYMin;
+      _touchYMax = int.tryParse(yMax.text, radix: 16) ?? _touchYMax;
+    });
   }
 
   Widget _screenHeader() {
@@ -3423,4 +3600,70 @@ class _KeepAliveState extends State<_KeepAlive>
     super.build(context); // required by AutomaticKeepAliveClientMixin
     return widget.child;
   }
+}
+
+/// One `name = H'hhhhhh` assignment, as written in a `.sym` file or in the
+/// symbol listing an assembler emits.
+final RegExp _symbolLine =
+    RegExp(r"^\s*([A-Za-z_.$][\w.$]*)\s*=\s*(?:H'|\$|0x|0X)?([0-9A-Fa-f]+)");
+
+/// Coerces a symbol-table value to a 24-bit address. Accepts an int, or a
+/// string in H', $, 0x or bare-hex form, or decimal.
+int? symbolAddress(dynamic v) {
+  if (v is int) return v & SparseMemory.addrMask;
+  if (v is String) {
+    var s = v.trim();
+    if (s.startsWith("H'")) s = s.substring(2);
+    if (s.startsWith('\$')) s = s.substring(1);
+    if (s.startsWith('0x') || s.startsWith('0X')) s = s.substring(2);
+    final hex = int.tryParse(s, radix: 16);
+    if (hex != null) return hex & SparseMemory.addrMask;
+    final dec = int.tryParse(s);
+    if (dec != null) return dec & SparseMemory.addrMask;
+  }
+  return null;
+}
+
+/// Reads a symbol table in any of the forms the simulator accepts: a JSON
+/// `{ "label": address }` object, a JSON list of listing lines, or a
+/// plain-text `.sym` file of `NAME = H'ADDRESS` lines with `;`, `#` or `//`
+/// comments. Returns address-to-label, empty if nothing parsed.
+Map<int, String> parseSymbolTable(String text) {
+  final map = <int, String>{};
+  void addLine(String line) {
+    final m = _symbolLine.firstMatch(line);
+    if (m != null) {
+      map[int.parse(m.group(2)!, radix: 16) & SparseMemory.addrMask] =
+          m.group(1)!;
+    }
+  }
+
+  try {
+    final decoded = json.decode(text);
+    if (decoded is Map) {
+      decoded.forEach((k, v) {
+        final addr = symbolAddress(v);
+        if (addr != null) map[addr] = k.toString();
+      });
+    } else if (decoded is List) {
+      for (final item in decoded) {
+        addLine(item.toString());
+      }
+    }
+    return map;
+  } on FormatException {
+    // Not JSON: a plain-text symbol file, one assignment per line.
+  } catch (_) {
+    return {};
+  }
+  map.clear();
+  for (var line in text.split('\n')) {
+    for (final marker in const [';', '#', '//']) {
+      final i = line.indexOf(marker);
+      if (i >= 0) line = line.substring(0, i);
+    }
+    if (line.trim().isEmpty) continue;
+    addLine(line);
+  }
+  return map;
 }

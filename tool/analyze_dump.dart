@@ -24,6 +24,7 @@
 //     --report r            regs | external | funcs | handlers | all
 //     --dis HEX [count]     disassembly listing
 //     --symbols FILE.json   write a symbol table for the simulator
+//     --sym FILE.sym        write a plain-text symbol table (NAME = H'ADDR)
 //     --annotate FILE.txt   write an annotated disassembly of known code
 
 import 'dart:convert';
@@ -38,9 +39,88 @@ String hex6(int v) => v.toRadixString(16).toUpperCase().padLeft(6, '0');
 String hex2(int v) => v.toRadixString(16).toUpperCase().padLeft(2, '0');
 String hex8(int v) => v.toRadixString(16).toUpperCase().padLeft(8, '0');
 
-/// Names for routines identified by hand during analysis. Addresses are for
-/// the Bernina artista 180 dump; they are ignored if the image differs.
-const Map<int, String> curatedNames = {
+/// Names identified by hand during analysis, keyed by the image's reset
+/// vector. The artista 180 dumps are different firmware versions whose code
+/// does not sit at the same addresses, so a name is only applied to the
+/// image it was verified in.
+Map<int, String> curatedFor(int resetVector) {
+  switch (resetVector) {
+    case 0x000448:
+      return curatedV448;
+    case 0x000400:
+      return curatedV400;
+    default:
+      return const {};
+  }
+}
+
+/// Verified in the dump whose reset vector is H'000400
+/// (MemoryDump-SewingMachine-2026-08-16_16-14-24.bin). These are points
+/// confirmed while reading the code, not necessarily function entries.
+const Map<int, String> curatedV400 = {
+  0x000400: 'boot_reset',
+  0x20071E: 'fp_normalise_loop',
+  0x20083E: 'adc_start_conversion',
+  0x20084A: 'adc_get_result',
+  0x200860: 'adc_convert_polled',
+  0x2008B2: 'adc_result_jumptable',
+  0x200914: 'adc_start_channel',
+  0x200934: 'adc_channel_jumptable',
+  0x200954: 'adc_start_ch0_ch4',
+  0x200960: 'adc_start_ch1_ch5',
+  0x20096C: 'adc_start_ch2_ch6',
+  0x200978: 'adc_start_ch3_ch7',
+  0x2091FE: 'touch_sample_axes',
+  0x209C44: 'adc_scan_step',
+  0x20651C: 'fill_table_11A6E8',
+};
+
+/// RAM locations whose use was established by watching the code run.
+Map<int, String> curatedDataFor(int resetVector) =>
+    resetVector == 0x000400 ? dataV400 : const {};
+
+/// Variables in the H'000400 image, found by instrumented execution rather
+/// than by reading the code, so each has a short note in the emitted file.
+const Map<int, String> dataV400 = {
+  0x0203D4: 'sci0_rx_payload',
+  0x020886: 'sci0_frame_len',
+  0x02089E: 'sci0_rx_state',
+  0x040000: 'lcd_frame_buffer',
+  0x11A251: 'adc_results',
+  0x11A6E8: 'table_11A6E8',
+  0x11A814: 'touch_debounce',
+  0x11A818: 'adc_current_channel',
+  0x11A819: 'adc_next_channel',
+  0x2155B4: 'sci0_command_table',
+  0x216662: 'sci0_check_byte',
+  0xFFFEF0: 'touch_x_raw',
+  0xFFFEF1: 'touch_y_raw',
+  0xFFFEF7: 'touch_axis_drive',
+};
+
+/// Notes emitted beside the symbols above.
+const Map<int, String> symbolNotes = {
+  0x0203D4: 'payload bytes of the frame being received',
+  0x020886: 'expected length of the current frame',
+  0x02089E: 'receive state machine',
+  0x040000: 'LCD frame buffer, 320x240 at 2bpp, MSB first (H\'4B00 bytes)',
+  0x11A251: 'latest A/D conversion results',
+  0x11A6E8: 'table filled by fill_table_11A6E8',
+  0x11A814: 'touch debounce counter, reloaded with H\'C8',
+  0x11A818: 'channel being converted',
+  0x11A819: 'channel to convert next',
+  0x2155B4: '15-entry SCI0 command dispatch table',
+  0x216662: 'frame check byte',
+  0xFFFEF0: 'X axis sample, from AN4; pressed when >= H\'4C',
+  0xFFFEF1: 'Y axis sample, from AN6',
+  0xFFFEF7: 'which axis the panel is currently driving',
+  0x20071E: 'the loop the machine spends most of its time in',
+  0x2091FE: 'drives each axis in turn and samples it',
+};
+
+/// Verified in the dump whose reset vector is H'000448
+/// (Bernina180-FullMemoryDump.bin).
+const Map<int, String> curatedV448 = {
   0x000150: 'isr_dispatch_nmi',
   0x00015C: 'isr_dispatch_common',
   0x00046E: 'delay_loop',
@@ -534,9 +614,13 @@ void main(List<String> args) {
     symbols[a] = n == null ? 'isr_vec$v' : 'isr_$n';
   });
   // Hand-identified routines win over the generated names.
-  curatedNames.forEach((a, n) {
+  final resetVector = an.long(0) & 0xFFFFFF;
+  final curated = curatedFor(resetVector);
+  curated.forEach((a, n) {
     if (an.inImage(a)) symbols[a] = n;
   });
+  final curatedData = curatedDataFor(resetVector);
+  curatedData.forEach((a, n) => symbols[a] = n);
   // Everything else discovered as a call target.
   for (final f in an.funcs) {
     symbols.putIfAbsent(f, () => 'sub_${hex6(f)}');
@@ -560,6 +644,127 @@ void main(List<String> args) {
     File(symFile).writeAsStringSync(
         const JsonEncoder.withIndent('  ').convert(map));
     print('wrote ${map.length} symbols to $symFile\n');
+  }
+
+  // ---- plain-text symbol file -------------------------------------------
+  // `NAME = H'ADDRESS`, one per line, with `;` comments — readable on its own
+  // and accepted by the simulator's symbol loader.
+  final symTextFile = opt('--sym');
+  if (symTextFile != null) {
+    final used = <String>{};
+    String unique(String name, int addr) {
+      if (used.add(name)) return name;
+      final alt = '${name}_${hex6(addr)}';
+      used.add(alt);
+      return alt;
+    }
+
+    final sb = StringBuffer();
+    void section(String title, [String? note]) {
+      sb.writeln();
+      sb.writeln('; ${'=' * 68}');
+      sb.writeln('; $title');
+      if (note != null) {
+        for (final line in note.split('\n')) {
+          sb.writeln('; $line');
+        }
+      }
+      sb.writeln('; ${'=' * 68}');
+    }
+
+    void emit(int addr, String name, [String? note]) {
+      final line = "${unique(name, addr).padRight(24)} = H'${hex6(addr)}";
+      sb.writeln(note == null ? line : '${line.padRight(40)}; $note');
+    }
+
+    sb.writeln('; Symbol table for ${path.split(Platform.pathSeparator).last}');
+    sb.writeln('; Generated by tool/analyze_dump.dart.');
+    sb.writeln(';');
+    sb.writeln('; The on-chip register and vector names come from the H8/3003');
+    sb.writeln('; hardware manual and apply to any image. Everything below');
+    sb.writeln("; them was found in this image, whose reset vector is");
+    sb.writeln("; H'${hex6(resetVector)} — the artista 180 firmware versions do not");
+    sb.writeln('; share addresses, so those names do not transfer to another');
+    sb.writeln('; dump.');
+
+    section('On-chip registers (H8/3003 manual appendix B.1)');
+    final regLows = h8Registers.keys.toList()..sort();
+    String? lastModule;
+    for (final lo in regLows) {
+      final module = h8Module(lo);
+      if (module != lastModule) {
+        sb.writeln('; -- $module');
+        lastModule = module;
+      }
+      emit(0xFFFF00 | lo, h8Registers[lo]!);
+    }
+
+    section('Exception vector table',
+        'Each slot holds a 32-bit handler address. VEC_* names the slot;\n'
+        'tramp_* and isr_* name the code it reaches.');
+    for (var v = 0; v < 64; v++) {
+      final name = h8Vectors[v];
+      emit(v * 4, 'VEC_${name ?? 'vec$v'}',
+          name == null ? 'vector $v (reserved)' : null);
+    }
+
+    // An address gets one name: where a hand-identified routine is also a
+    // vector handler, the hand-identified name is the one emitted.
+    final done = <int>{};
+    section('Vector handlers in this image');
+    final hv = hwVectors.keys.toList()..sort();
+    for (final v in hv) {
+      final a = hwVectors[v]!;
+      final n = h8Vectors[v];
+      emit(a, curated[a] ?? (n == null ? 'tramp_vec$v' : 'tramp_$n'),
+          'from vector $v${n == null ? '' : ' ($n)'}');
+      done.add(a);
+    }
+    if (appTable.isNotEmpty) {
+      sb.writeln('; -- application handler table at '
+          "H'${hex6(int.parse(appTableArg!, radix: 16))}");
+      final av = appTable.keys.toList()..sort();
+      for (final v in av) {
+        final a = appTable[v]!;
+        final n = h8Vectors[v];
+        emit(a, curated[a] ?? (n == null ? 'isr_vec$v' : 'isr_$n'),
+            'application handler for vector $v');
+        done.add(a);
+      }
+    }
+
+    final code = curated.keys.where((a) => !done.contains(a)).toList()..sort();
+    if (code.isNotEmpty) {
+      section('Identified code');
+      for (final a in code) {
+        emit(a, curated[a]!, symbolNotes[a]);
+        done.add(a);
+      }
+    }
+
+    final data = curatedData.keys.where((a) => !done.contains(a)).toList()
+      ..sort();
+    if (data.isNotEmpty) {
+      section('Identified data');
+      for (final a in data) {
+        emit(a, curatedData[a]!, symbolNotes[a]);
+        done.add(a);
+      }
+    }
+
+    final subs = an.funcs.where((f) => !done.contains(f)).toList()..sort();
+    if (subs.isNotEmpty) {
+      section('Call targets found by the static walk',
+          '${subs.length} subroutines reached from the vectors, the handler'
+              '\ntable and the recovered jump tables. These are addresses '
+              'that\nwere called — not routines anyone has read.');
+      for (final f in subs) {
+        emit(f, 'sub_${hex6(f)}');
+      }
+    }
+
+    File(symTextFile).writeAsStringSync(sb.toString());
+    print('wrote ${used.length} symbols to $symTextFile\n');
   }
 
   // ---- annotated disassembly --------------------------------------------

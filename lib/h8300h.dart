@@ -16,6 +16,7 @@
 
 import 'dart:typed_data';
 
+import 'adc.dart';
 import 'dmac.dart';
 import 'h8disasm.dart';
 import 'itu.dart';
@@ -78,6 +79,8 @@ class H8Cpu {
     }
     itu.mirror = mem.poke;
     itu.syncToMemory();
+    adc.mirror = mem.poke;
+    adc.syncToMemory();
     _wireDmac();
   }
 
@@ -129,6 +132,10 @@ class H8Cpu {
   /// The DMA controller (manual section 8), four channels at
   /// H'FFFF20-H'FFFF5F.
   final Dmac dmac = Dmac();
+
+  /// The A/D converter (manual section 14), eight inputs at
+  /// H'FFFFE0-H'FFFFE9.
+  final AdConverter adc = AdConverter();
 
   /// The nine I/O ports of the H8/3003 (table 9-1; addresses are the
   /// mode 3/4 locations in the on-chip register area).
@@ -267,6 +274,7 @@ class H8Cpu {
     }
     if (itu.owns(addr)) return itu.read(addr);
     if (dmac.owns(addr)) return dmac.read(addr);
+    if (adc.owns(addr)) return adc.read(addr);
     return mem.peek(addr);
   }
 
@@ -288,6 +296,10 @@ class H8Cpu {
     }
     if (dmac.owns(addr)) {
       dmac.write(addr, value);
+      return;
+    }
+    if (adc.owns(addr)) {
+      adc.write(addr, value);
       return;
     }
     mem.poke(addr, value);
@@ -446,6 +458,7 @@ class H8Cpu {
     }
     itu.reset();
     dmac.reset();
+    adc.reset();
     // A reset initializes the on-chip I/O port registers (section 9).
     for (final p in ports) {
       final ddrAddr = p.ddrAddr;
@@ -473,6 +486,7 @@ class H8Cpu {
     }
     if (itu.owns(addr)) return itu.read(addr);
     if (dmac.owns(addr)) return dmac.read(addr);
+    if (adc.owns(addr)) return adc.read(addr);
     return mem.peek(addr);
   }
 
@@ -666,12 +680,15 @@ class H8Cpu {
       if (v != null && interrupt(v)) return 16;
     }
     if (itu.anyRunning) itu.tick(cycles);
+    if (adc.running) adc.tick(cycles);
     // The DMAC moves data before the CPU sees the peripheral interrupt: an
     // enabled channel takes the request instead of the processor.
     final dendVector = dmac.service();
     if (dendVector != null && interrupt(dendVector)) return 16;
     final ituVector = itu.pendingVector();
     if (ituVector != null && interrupt(ituVector)) return 16;
+    final adiVector = adc.pendingVector();
+    if (adiVector != null && interrupt(adiVector)) return 16;
     if (halted) return sleeping ? sleepStates : 0;
     if (profiling) instrExecCount.bump(pc);
     final instrStart = pc;
