@@ -9,6 +9,10 @@ Pause / Step / Run controls with breakpoints.
 Reference: *Hitachi H8/3003 Hardware Manual* (REN_e602055_h83003), section 2
 (CPU) and appendix A (instruction set).
 
+The purpose is to try and reverse engineer the Bernina Artista 180 sewing
+machine which uses the H8/3003 CPU. It is to the point where it can run
+the Artista 180 firmware dumped directly from an Artista 180.
+
 ## The simulated machine
 
 - **CPU** — the full H8/300H instruction set in advanced mode (the only mode
