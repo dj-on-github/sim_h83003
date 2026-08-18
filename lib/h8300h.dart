@@ -175,6 +175,68 @@ class H8Cpu {
     H8Port(name: 'C', pinMask: 0xFF, ddrAddr: 0xFFFFD5, drAddr: 0xFFFFD7),
   ];
 
+  /// Ports indexed by data register address, for the bus decode.
+  static final Map<int, H8Port> portByDr = {
+    for (final p in ports) p.drAddr: p,
+  };
+
+  // ---- external pin levels ---------------------------------------------
+  // A port's data register on its own cannot represent an input: reading it
+  // just hands back whatever was last written, so nothing outside the CPU
+  // can ever be seen. These two maps add the missing layer — the level the
+  // outside world is holding a pin at, and which pins it is holding.
+  //
+  // Only bits that are BOTH driven here and configured as inputs by the DDR
+  // are substituted; everything else reads back the data register exactly as
+  // before. Firmware that writes a port and reads it back is therefore
+  // unaffected until a pin is deliberately driven.
+
+  /// Level the outside world holds each pin at, by data register address.
+  final Map<int, int> pinLevel = {};
+
+  /// Which pins the outside world is driving, by data register address.
+  final Map<int, int> pinDriven = {};
+
+  /// Value the CPU sees when it reads [p]'s data register.
+  int portRead(H8Port p) {
+    final dr = mem.peek(p.drAddr);
+    final driven = (pinDriven[p.drAddr] ?? 0) & p.pinMask;
+    if (driven == 0) return dr;
+    // Port 7 has no DDR and is input-only, so every pin counts as an input.
+    final ddr = p.ddrAddr == null ? 0 : mem.peek(p.ddrAddr!);
+    final substituted = driven & ~ddr;
+    if (substituted == 0) return dr;
+    return (dr & ~substituted) | ((pinLevel[p.drAddr] ?? 0) & substituted);
+  }
+
+  /// Holds one pin high or low from outside the chip.
+  void setPin(int drAddr, int bit, bool high) {
+    final mask = 1 << (bit & 7);
+    pinDriven[drAddr] = (pinDriven[drAddr] ?? 0) | mask;
+    final level = pinLevel[drAddr] ?? 0;
+    pinLevel[drAddr] = high ? (level | mask) : (level & ~mask);
+  }
+
+  /// Lets a pin float again, so it reads back the data register as before.
+  void releasePin(int drAddr, int bit) {
+    final mask = 1 << (bit & 7);
+    pinDriven[drAddr] = (pinDriven[drAddr] ?? 0) & ~mask;
+    pinLevel[drAddr] = (pinLevel[drAddr] ?? 0) & ~mask;
+  }
+
+  bool pinIsDriven(int drAddr, int bit) =>
+      ((pinDriven[drAddr] ?? 0) >> (bit & 7)) & 1 == 1;
+
+  bool pinIsHigh(int drAddr, int bit) =>
+      ((pinLevel[drAddr] ?? 0) >> (bit & 7)) & 1 == 1;
+
+  /// Releases every pin. Not called by [reset]: a switch keeps its position
+  /// when the CPU is reset.
+  void releaseAllPins() {
+    pinDriven.clear();
+    pinLevel.clear();
+  }
+
   /// General registers ER0-ER7. ER7 is the stack pointer.
   final Uint32List er = Uint32List(8);
 
@@ -275,6 +337,8 @@ class H8Cpu {
     if (itu.owns(addr)) return itu.read(addr);
     if (dmac.owns(addr)) return dmac.read(addr);
     if (adc.owns(addr)) return adc.read(addr);
+    final port = portByDr[addr];
+    if (port != null) return portRead(port);
     return mem.peek(addr);
   }
 
@@ -487,6 +551,8 @@ class H8Cpu {
     if (itu.owns(addr)) return itu.read(addr);
     if (dmac.owns(addr)) return dmac.read(addr);
     if (adc.owns(addr)) return adc.read(addr);
+    final port = portByDr[addr];
+    if (port != null) return portRead(port);
     return mem.peek(addr);
   }
 

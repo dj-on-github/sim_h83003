@@ -67,8 +67,8 @@ not a symbol line at all
     expect(map[0x000000], 'VEC_RESET');
     expect(map[0x000400], 'boot_reset');
     expect(map[0x040000], 'lcd_frame_buffer');
-    expect(map[0xFFFEF0], 'touch_x_raw');
-    expect(map[0xFFFEF1], 'touch_y_raw');
+    expect(map[0xFFFEF0], 'an4_sample');
+    expect(map[0xFFFEF1], 'an6_sample');
     // Every name is unique: two symbols must not collapse onto one label.
     expect(map.values.toSet().length, map.length);
   });

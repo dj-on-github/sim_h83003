@@ -135,6 +135,12 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// Top address shown in the memory window (drives the header label).
   int _memBase = 0x000100;
 
+  /// Path of the last program loaded, used to prefill "Open by path".
+  String? _lastProgramPath;
+
+  /// Likewise for the last symbol table.
+  String? _lastSymbolPath;
+
   /// Scroll controllers for the two heavy views.
   final ScrollController _memScroll = ScrollController();
   final ScrollController _disasmScroll = ScrollController();
@@ -162,6 +168,13 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// JSON. When present, the disassembly view shows labels at their
   /// addresses and substitutes symbolic names for operand addresses.
   Map<int, String> _symbols = const {};
+
+  /// Name-to-address, rebuilt whenever [_symbols] is replaced, so the Trace
+  /// view can resolve an entry typed as a symbol name.
+  Map<String, int> _symbolsByName = const {};
+
+  /// Locations shown in the Trace view.
+  final List<TraceEntry> _traces = [];
 
   /// Base address of the LCD pixel buffer. The Bernina artista 180 keeps its
   /// frame buffer here; editable from the Screen tab because the SED1351's
@@ -210,6 +223,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   bool _viewItu = false;
   bool _viewDma = false;
   bool _viewIo = false;
+  bool _viewTrace = false;
   bool _viewProfile = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
@@ -221,6 +235,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _ituKey = GlobalKey();
   final GlobalKey _dmaKey = GlobalKey();
   final GlobalKey _ioKey = GlobalKey();
+  final GlobalKey _traceKey = GlobalKey();
   final GlobalKey _profKey = GlobalKey();
 
   /// True only when [c] is attached to exactly one scrollable.
@@ -244,7 +259,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 8, vsync: this);
+    _tab = TabController(length: 9, vsync: this);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -779,8 +794,8 @@ class _SimulatorPageState extends State<SimulatorPage>
     }
   }
 
-  /// Picks a hex/S-record file (local storage or a cloud provider, via the
-  /// OS document picker) and loads it.
+  /// Picks a program file (local storage or a cloud provider, via the OS
+  /// document picker) and loads it.
   Future<void> _loadHexFile() async {
     _pause();
     FilePickerResult? picked;
@@ -803,13 +818,87 @@ class _SimulatorPageState extends State<SimulatorPage>
       _showSnack('Could not read "${file.name}".');
       return;
     }
+    await _loadProgramBytes(file.name, data, file.path);
+  }
 
+  /// Loads a program from a path the user typed, without going through the
+  /// document picker. The picker is an OS component and can misbehave (a
+  /// panel that will not let anything be selected, a provider that hides
+  /// files); this route needs nothing but a readable path, and it is also
+  /// the quickest way to reopen a dump you have open in a terminal.
+  Future<void> _loadHexFileByPath() async {
+    _pause();
+    final path = await _askProgramPath();
+    if (path == null || path.trim().isEmpty) return;
+    final clean = path.trim();
+    final bytes = await readBytesFromPath(clean);
+    if (!mounted) return;
+    if (bytes == null) {
+      _showSnack('Could not read "$clean".');
+      return;
+    }
+    await _loadProgramBytes(_baseName(clean), bytes, clean);
+  }
+
+  /// Asks for a filesystem path. Defaults to the last one loaded.
+  Future<String?> _askProgramPath({
+    String title = 'Open by path',
+    String hint = '/Users/you/dumps/memory.bin',
+    String help = 'Full path to an Intel HEX, S-record or raw binary file. '
+        'The format is detected from the contents.',
+    String? initial,
+  }) {
+    final controller = _selectedController(initial ?? _lastProgramPath ?? '');
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 520,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                help,
+                style: TextStyle(fontSize: 11, color: _inkA(0.6)),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: 'Path',
+                  hintText: hint,
+                ),
+                onSubmitted: (v) => Navigator.pop(ctx, v),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('Open'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Everything after the bytes are in hand, shared by both open routes.
+  Future<void> _loadProgramBytes(
+      String name, List<int> data, String? path) async {
     final format = detectProgramFormat(data);
     final HexResult result;
     if (format == ProgramFormat.raw) {
       // A flat binary carries no addresses, so ask where it goes.
-      final base = await _askRawLoadAddress(file.name, data.length);
-      if (base == null) return; // cancelled
+      final base = await _askRawLoadAddress(name, data.length);
+      if (base == null || !mounted) return; // cancelled
       result = loadRawBinary(data, base, cpu.mem.poke);
     } else {
       // Intel HEX and S-records are plain ASCII text.
@@ -820,9 +909,10 @@ class _SimulatorPageState extends State<SimulatorPage>
       final why = result.errors.isNotEmpty
           ? result.errors.first
           : 'no data records found';
-      _showSnack('Nothing loaded from "${file.name}" ($why).');
+      _showSnack('Nothing loaded from "$name" ($why).');
       return;
     }
+    _lastProgramPath = path ?? _lastProgramPath;
 
     setState(() {
       _memRev++;
@@ -848,7 +938,7 @@ class _SimulatorPageState extends State<SimulatorPage>
 
     // If the assembler wrote a "<name>_sym.json" beside the file, load it
     // so the disassembly shows labels without picking the file by hand.
-    await _autoLoadSymbols(file.path);
+    await _autoLoadSymbols(path);
   }
 
   /// Asks where a flat binary should be loaded. A file exactly the size of
@@ -1121,10 +1211,14 @@ class _SimulatorPageState extends State<SimulatorPage>
             onPressed: _loadHex,
             icon: const Icon(Icons.file_upload_outlined),
           ),
-          IconButton(
-            tooltip: 'Open Intel HEX / S-record file',
-            onPressed: _loadHexFile,
+          PopupMenuButton<int>(
+            tooltip: 'Open a program file (Intel HEX, S-record or raw binary)',
             icon: const Icon(Icons.folder_open_outlined),
+            onSelected: (v) => v == 0 ? _loadHexFile() : _loadHexFileByPath(),
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 0, child: Text('Open file…')),
+              PopupMenuItem(value: 1, child: Text('Open by path…')),
+            ],
           ),
           IconButton(
             tooltip: 'Save allocated memory to .hex file (Intel HEX)',
@@ -1179,6 +1273,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             Tab(text: 'ITU'),
             Tab(text: 'DMA'),
             Tab(text: 'IO'),
+            Tab(text: 'Trace'),
             Tab(text: 'Profile'),
           ],
         ),
@@ -1197,6 +1292,8 @@ class _SimulatorPageState extends State<SimulatorPage>
               KeyedSubtree(key: _ituKey, child: _KeepAlive(child: _ituView())),
               KeyedSubtree(key: _dmaKey, child: _KeepAlive(child: _dmaView())),
               KeyedSubtree(key: _ioKey, child: _KeepAlive(child: _ioView())),
+              KeyedSubtree(
+                  key: _traceKey, child: _KeepAlive(child: _traceView())),
               KeyedSubtree(
                   key: _profKey, child: _KeepAlive(child: _profileView())),
             ],
@@ -1261,6 +1358,13 @@ class _SimulatorPageState extends State<SimulatorPage>
           pane: KeyedSubtree(key: _ioKey, child: _KeepAlive(child: _ioView())),
           flex: 1,
           width: _ioViewWidth
+        ),
+      if (_viewTrace)
+        (
+          pane: KeyedSubtree(
+              key: _traceKey, child: _KeepAlive(child: _traceView())),
+          flex: 1,
+          width: null
         ),
       if (_viewProfile)
         (
@@ -1352,6 +1456,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         const SizedBox(width: 4),
         _viewToggle('IO', _viewIo, (v) => _viewIo = v),
         const SizedBox(width: 4),
+        _viewToggle('TRACE', _viewTrace, (v) => _viewTrace = v),
+        const SizedBox(width: 4),
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
       ],
     );
@@ -1366,6 +1472,7 @@ class _SimulatorPageState extends State<SimulatorPage>
         (_viewItu ? 1 : 0) +
         (_viewDma ? 1 : 0) +
         (_viewIo ? 1 : 0) +
+        (_viewTrace ? 1 : 0) +
         (_viewProfile ? 1 : 0);
     return Tooltip(
       message: enabled
@@ -1747,6 +1854,8 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// JSON list of `"name = H'hhhhhh"`-style listing lines, or a plain-text
   /// `.sym` file of those lines with `;`, `#` or `//` comments.
   Future<void> _loadSymbols() async {
+    // Don't leave the emulator running flat out behind a modal file panel.
+    _pause();
     try {
       final picked =
           await FilePicker.pickFiles(type: FileType.any, withData: true);
@@ -1756,15 +1865,43 @@ class _SimulatorPageState extends State<SimulatorPage>
         _showSnack('Could not read that file.');
         return;
       }
-      final n = _applySymbolBytes(bytes);
-      if (n == 0) {
-        _showSnack('No symbols found in that file.');
-        return;
-      }
-      _showSnack('Loaded $n symbols.');
+      _applyLoadedSymbols(bytes);
     } catch (e) {
       _showSnack('Symbol load failed: $e');
     }
+  }
+
+  /// Loads a symbol table from a path the user typed, bypassing the document
+  /// picker entirely — the same escape hatch the program loader has.
+  Future<void> _loadSymbolsByPath() async {
+    _pause();
+    final path = await _askProgramPath(
+      title: 'Open symbols by path',
+      hint: '/Users/you/dumps/memory.sym',
+      help: 'Full path to a symbol table: a plain-text .sym of '
+          "NAME = H'ADDRESS lines, or the JSON form.",
+      initial: _lastSymbolPath,
+    );
+    if (path == null || path.trim().isEmpty) return;
+    final clean = path.trim();
+    final bytes = await readBytesFromPath(clean);
+    if (!mounted) return;
+    if (bytes == null) {
+      _showSnack('Could not read "$clean".');
+      return;
+    }
+    if (_applyLoadedSymbols(bytes)) _lastSymbolPath = clean;
+  }
+
+  /// Installs a symbol table and reports the outcome. True when it took.
+  bool _applyLoadedSymbols(List<int> bytes) {
+    final n = _applySymbolBytes(bytes);
+    if (n == 0) {
+      _showSnack('No symbols found in that file.');
+      return false;
+    }
+    _showSnack('Loaded $n symbols.');
+    return true;
   }
 
   /// Parses a symbol table from [bytes] and installs it, returning the
@@ -1778,7 +1915,12 @@ class _SimulatorPageState extends State<SimulatorPage>
     }
     final map = parseSymbolTable(text);
     if (map.isEmpty) return 0;
-    setState(() => _symbols = map);
+    setState(() {
+      _symbols = map;
+      _symbolsByName = {
+        for (final e in map.entries) e.value: e.key,
+      };
+    });
     return map.length;
   }
 
@@ -1850,12 +1992,28 @@ class _SimulatorPageState extends State<SimulatorPage>
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    TextButton.icon(
-                      onPressed: _loadSymbols,
-                      icon: const Icon(Icons.label_outline, size: 16),
-                      label: Text(_symbols.isEmpty
-                          ? 'Symbols'
-                          : 'Symbols (${_symbols.length})'),
+                    PopupMenuButton<int>(
+                      tooltip: 'Load a symbol table',
+                      onSelected: (v) =>
+                          v == 0 ? _loadSymbols() : _loadSymbolsByPath(),
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 0, child: Text('Open file…')),
+                        PopupMenuItem(value: 1, child: Text('Open by path…')),
+                      ],
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 8),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.label_outline, size: 16),
+                            const SizedBox(width: 6),
+                            Text(_symbols.isEmpty
+                                ? 'Symbols'
+                                : 'Symbols (${_symbols.length})'),
+                          ],
+                        ),
+                      ),
                     ),
                     TextButton.icon(
                       onPressed: _gotoAddress,
@@ -3076,12 +3234,15 @@ class _SimulatorPageState extends State<SimulatorPage>
           runSpacing: 4,
           children: [
             _ioLegendSwatch(_gpioOutColor, 'output (value shown)'),
-            _ioLegendSwatch(_gpioInColor, 'input'),
+            _ioLegendSwatch(_gpioInColor, 'input, floating'),
+            _ioLegendSwatch(_gpioDrivenColor, 'input, held'),
           ],
         ),
         const SizedBox(height: 4),
         Text(
-          'DDR selects direction; DR holds the output value.',
+          'DDR selects direction; DR holds the output value. Click an input '
+          'to cycle it: floating, held low, held high. A held pin is what '
+          'the CPU reads, so this is how a button or switch is pressed.',
           style: TextStyle(fontSize: 11, color: _inkA(0.5)),
         ),
         const SizedBox(height: 8),
@@ -3107,6 +3268,9 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   static const Color _gpioOutColor = Color(0xFFC62828); // output pins: red
   static const Color _gpioInColor = Color(0xFF2E7D32); // input pins: green
+  // An input the user is holding, so it reads as a level rather than as
+  // whatever the data register happens to contain.
+  static const Color _gpioDrivenColor = Color(0xFF1565C0);
 
   Widget _ioLegendSwatch(Color color, String label) {
     return Row(
@@ -3185,14 +3349,21 @@ class _SimulatorPageState extends State<SimulatorPage>
             mainAxisSize: MainAxisSize.min,
             children: [
               for (var bit = 7; bit >= 0; bit--)
-                _gpioBitBox(
-                  bit: bit,
-                  hasPin: (p.pinMask >> bit) & 1 == 1,
+                () {
+                  final hasPin = (p.pinMask >> bit) & 1 == 1;
                   // Port 7 has no DDR: every pin is an input.
-                  isOutput: ddrAddr != null && (ddr >> bit) & 1 == 1,
-                  value: (dr >> bit) & 1,
-                  isFirst: bit == 7,
-                ),
+                  final isOutput = ddrAddr != null && (ddr >> bit) & 1 == 1;
+                  final driven = cpu.pinIsDriven(p.drAddr, bit);
+                  return _gpioBitBox(
+                    bit: bit,
+                    hasPin: hasPin,
+                    isOutput: isOutput,
+                    value: (dr >> bit) & 1,
+                    isFirst: bit == 7,
+                    driven: driven && !isOutput,
+                    onTap: hasPin && !isOutput ? () => _cyclePin(p, bit) : null,
+                  );
+                }(),
             ],
           ),
         ],
@@ -3206,9 +3377,14 @@ class _SimulatorPageState extends State<SimulatorPage>
     required bool isOutput,
     required int value,
     required bool isFirst,
+    bool driven = false,
+    VoidCallback? onTap,
   }) {
-    final Color? fill =
-        !hasPin ? null : (isOutput ? _gpioOutColor : _gpioInColor);
+    final Color? fill = !hasPin
+        ? null
+        : (isOutput
+            ? _gpioOutColor
+            : (driven ? _gpioDrivenColor : _gpioInColor));
     final border = Border(
       top: BorderSide(color: _inkA(0.4)),
       bottom: BorderSide(color: _inkA(0.4)),
@@ -3216,7 +3392,7 @@ class _SimulatorPageState extends State<SimulatorPage>
       // Abutting boxes: only the leftmost box draws its own left edge.
       left: isFirst ? BorderSide(color: _inkA(0.4)) : BorderSide.none,
     );
-    return Column(
+    final box = Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         // Bit number label above the box.
@@ -3226,9 +3402,10 @@ class _SimulatorPageState extends State<SimulatorPage>
           height: 30,
           alignment: Alignment.center,
           decoration: BoxDecoration(color: fill, border: border),
-          // Output pins show their driven value in a contrasting colour;
-          // input pins are just green; pinless positions stay empty.
-          child: isOutput && hasPin
+          // Output pins show their driven value in a contrasting colour, as
+          // do input pins the user is holding; a floating input is just
+          // green, and pinless positions stay empty.
+          child: hasPin && (isOutput || driven)
               ? Text(
                   '$value',
                   style: const TextStyle(
@@ -3242,6 +3419,176 @@ class _SimulatorPageState extends State<SimulatorPage>
         ),
       ],
     );
+    if (onTap == null) return box;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(onTap: onTap, child: box),
+    );
+  }
+
+  /// Cycles one input pin: floating -> held low -> held high -> floating.
+  /// Three states rather than two, because "floating" is the only one that
+  /// reproduces the old behaviour of reading back the data register, and
+  /// firmware that writes a port and reads it back depends on it.
+  void _cyclePin(H8Port p, int bit) {
+    setState(() {
+      if (!cpu.pinIsDriven(p.drAddr, bit)) {
+        cpu.setPin(p.drAddr, bit, false);
+      } else if (!cpu.pinIsHigh(p.drAddr, bit)) {
+        cpu.setPin(p.drAddr, bit, true);
+      } else {
+        cpu.releasePin(p.drAddr, bit);
+      }
+      _memRev++;
+    });
+  }
+
+  // ---- Trace view ----------------------------------------------------------
+
+  /// Resolves an entry's target: a loaded symbol name first, then a hex
+  /// number. Symbol names win, so a location keeps its meaning if a symbol
+  /// happens to look like hex (ADD, FACE, and so on).
+  int? _resolveTrace(String target) {
+    final t = target.trim();
+    if (t.isEmpty) return null;
+    final bySymbol = _symbolsByName[t];
+    if (bySymbol != null) return bySymbol;
+    return symbolAddress(t);
+  }
+
+  Widget _traceView() {
+    return TraceView(
+      cpu: cpu,
+      entries: _traces,
+      resolve: _resolveTrace,
+      font: _font,
+      onAdd: () => _editTrace(),
+      onEdit: (i) => _editTrace(index: i),
+      onDelete: (i) => setState(() => _traces.removeAt(i)),
+    );
+  }
+
+  /// Adds a trace, or edits the one at [index].
+  Future<void> _editTrace({int? index}) async {
+    final existing = index == null ? null : _traces[index];
+    final controller = _selectedController(existing?.target ?? '');
+    var bits = existing?.bits ?? 8;
+    var bigEndian = existing?.bigEndian ?? true;
+
+    final saved = await showDialog<TraceEntry>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          // Byte order is meaningless for a single byte, so the control is
+          // shown disabled rather than hidden — the layout stays put as the
+          // width changes.
+          final endianEnabled = bits != 8;
+          final resolved = _resolveTrace(controller.text);
+          return AlertDialog(
+            title: Text(index == null ? 'Add trace' : 'Edit trace'),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: controller,
+                    autofocus: true,
+                    decoration: InputDecoration(
+                      labelText: 'Address or symbol',
+                      hintText: "FFFEF0  or  touch_x_raw",
+                      helperText: resolved == null
+                          ? 'Not a loaded symbol or a hex address'
+                          : "Resolves to H'${_hex6(resolved)}",
+                      helperStyle: TextStyle(
+                        color: resolved == null
+                            ? Theme.of(ctx).colorScheme.error
+                            : null,
+                      ),
+                    ),
+                    onChanged: (_) => setLocal(() {}),
+                  ),
+                  const SizedBox(height: 16),
+                  Text('Width',
+                      style: TextStyle(fontSize: 12, color: _inkA(0.6))),
+                  RadioGroup<int>(
+                    groupValue: bits,
+                    onChanged: (v) => setLocal(() => bits = v ?? 8),
+                    child: Row(
+                      children: [
+                        for (final w in [8, 16, 32])
+                          Expanded(
+                            child: RadioListTile<int>(
+                              value: w,
+                              title: Text('$w'),
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Opacity(
+                    opacity: endianEnabled ? 1 : 0.4,
+                    child: Row(
+                      children: [
+                        Text('Byte order',
+                            style: TextStyle(fontSize: 12, color: _inkA(0.6))),
+                        const SizedBox(width: 12),
+                        Switch(
+                          value: bigEndian,
+                          onChanged: endianEnabled
+                              ? (v) => setLocal(() => bigEndian = v)
+                              : null,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(bigEndian ? 'big endian' : 'little endian',
+                            style: const TextStyle(fontSize: 13)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: controller.text.trim().isEmpty
+                    ? null
+                    : () => Navigator.pop(
+                          ctx,
+                          TraceEntry(
+                            target: controller.text.trim(),
+                            bits: bits,
+                            bigEndian: bigEndian,
+                          ),
+                        ),
+                child: Text(index == null ? 'Add' : 'Save'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (saved == null || !mounted) return;
+    setState(() {
+      if (index == null) {
+        _traces.add(saved);
+      } else {
+        // Edit in place: the list widget keys its sampled state off the
+        // entry object, so mutating keeps the row's history.
+        _traces[index]
+          ..target = saved.target
+          ..bits = saved.bits
+          ..bigEndian = saved.bigEndian;
+      }
+    });
   }
 
   // ---- Profiling -----------------------------------------------------------
@@ -3666,4 +4013,270 @@ Map<int, String> parseSymbolTable(String text) {
     addLine(line);
   }
   return map;
+}
+
+// ---- Trace view ------------------------------------------------------------
+
+/// One watched location: where to look, how wide, and which way round.
+class TraceEntry {
+  TraceEntry({
+    required this.target,
+    this.bits = 8,
+    this.bigEndian = true,
+  });
+
+  /// What the user typed: a symbol name, or an address in hex.
+  String target;
+
+  /// 8, 16 or 32.
+  int bits;
+
+  /// Byte order for the 16- and 32-bit widths. Ignored at 8 bits; the
+  /// H8/300H itself is big-endian, so that is the default.
+  bool bigEndian;
+
+  int get bytes => bits ~/ 8;
+}
+
+/// The Trace tab: a live list of watched locations.
+///
+/// It samples on its own timer rather than repainting with the rest of the
+/// UI, so a value that changes while the CPU is paused (a single Step) is
+/// caught just the same as one that changes mid-run, and the flash that
+/// marks a change is timed independently of the simulator's frame rate.
+class TraceView extends StatefulWidget {
+  const TraceView({
+    super.key,
+    required this.cpu,
+    required this.entries,
+    required this.resolve,
+    required this.onAdd,
+    required this.onEdit,
+    required this.onDelete,
+    required this.font,
+  });
+
+  final H8Cpu cpu;
+  final List<TraceEntry> entries;
+
+  /// Turns an entry's target text into an address, or null if it names
+  /// neither a loaded symbol nor a hex number.
+  final int? Function(String target) resolve;
+
+  final VoidCallback onAdd;
+  final void Function(int index) onEdit;
+  final void Function(int index) onDelete;
+  final String font;
+
+  @override
+  State<TraceView> createState() => _TraceViewState();
+}
+
+class _TraceViewState extends State<TraceView> {
+  /// Sampling period. Fast enough to look live, slow enough to be free.
+  static const Duration period = Duration(milliseconds: 60);
+
+  /// How many samples a changed value stays highlighted for — about 420 ms.
+  /// Counted in ticks rather than wall-clock time so the highlight is driven
+  /// by the same clock as the sampling.
+  static const int flashTicks = 7;
+
+  Timer? _timer;
+
+  /// Last sampled value per entry, and how many ticks of highlight remain.
+  final Map<TraceEntry, int?> _values = {};
+  final Map<TraceEntry, int> _flash = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(period, (_) => _sample());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  /// Reads one entry, or null when its target does not resolve.
+  int? _read(TraceEntry e) {
+    final addr = widget.resolve(e.target);
+    if (addr == null) return null;
+    var v = 0;
+    for (var i = 0; i < e.bytes; i++) {
+      final b = widget.cpu.peekBus((addr + i) & SparseMemory.addrMask);
+      if (e.bigEndian || e.bits == 8) {
+        v = (v << 8) | b;
+      } else {
+        v |= b << (8 * i);
+      }
+    }
+    return v;
+  }
+
+  void _sample() {
+    if (!mounted) return;
+    var repaint = false;
+    for (final e in widget.entries) {
+      final v = _read(e);
+      if (!_values.containsKey(e)) {
+        _values[e] = v; // first sight is not a change
+        repaint = true;
+        continue;
+      }
+      if (_values[e] != v) {
+        _values[e] = v;
+        _flash[e] = flashTicks;
+        repaint = true;
+      } else {
+        final left = _flash[e] ?? 0;
+        if (left > 0) {
+          _flash[e] = left - 1;
+          repaint = true; // repaint again when the highlight ends
+        }
+      }
+    }
+    // Drop state for entries that have been deleted.
+    if (_values.length > widget.entries.length) {
+      _values.removeWhere((k, _) => !widget.entries.contains(k));
+      _flash.removeWhere((k, _) => !widget.entries.contains(k));
+    }
+    if (repaint) setState(() {});
+  }
+
+  bool _flashing(TraceEntry e) => (_flash[e] ?? 0) > 0;
+
+  String _hexValue(TraceEntry e) {
+    final v = _values[e];
+    if (v == null) return '--';
+    return v.toRadixString(16).toUpperCase().padLeft(e.bytes * 2, '0');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final ink = DefaultTextStyle.of(context).style.color ?? scheme.onSurface;
+    return Column(
+      children: [
+        Container(
+          color: scheme.surfaceContainer,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            children: [
+              const Icon(Icons.visibility_outlined, size: 18),
+              const SizedBox(width: 6),
+              const Text('Trace',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: widget.onAdd,
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('Add trace'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: widget.entries.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'No locations traced.\n\n'
+                      'Add one by address (H\'FFFEF0) or by the name of a '
+                      'loaded symbol (touch_x_raw). The value updates live '
+                      'and flashes when it changes.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                          fontSize: 12, color: ink.withValues(alpha: 0.6)),
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  itemCount: widget.entries.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, i) =>
+                      _row(widget.entries[i], i, ink, scheme),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _row(TraceEntry e, int i, Color ink, ColorScheme scheme) {
+    final addr = widget.resolve(e.target);
+    final unresolved = addr == null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: 'Delete',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.delete_outline, size: 18),
+            onPressed: () => widget.onDelete(i),
+          ),
+          IconButton(
+            tooltip: 'Edit',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.edit_outlined, size: 18),
+            onPressed: () => widget.onEdit(i),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  e.target,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: widget.font,
+                    fontSize: 13,
+                    color: unresolved ? scheme.error : ink,
+                  ),
+                ),
+                Text(
+                  unresolved
+                      ? 'unknown symbol or address'
+                      : "H'${addr.toRadixString(16).toUpperCase().padLeft(6, '0')}"
+                          '  ${e.bits}-bit'
+                          '${e.bits == 8 ? '' : (e.bigEndian ? '  BE' : '  LE')}',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: ink.withValues(alpha: 0.55),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          // The value, flashing red for a moment each time it changes.
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: _flashing(e)
+                  ? const Color(0xFFC62828)
+                  : scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              "H'${_hexValue(e)}",
+              style: TextStyle(
+                fontFamily: widget.font,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: _flashing(e) ? Colors.white : ink,
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+        ],
+      ),
+    );
+  }
 }

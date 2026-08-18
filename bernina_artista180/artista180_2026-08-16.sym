@@ -373,8 +373,15 @@ adc_start_ch1_ch5        = H'200960
 adc_start_ch2_ch6        = H'20096C
 adc_start_ch3_ch7        = H'200978
 fill_table_11A6E8        = H'20651C
-touch_sample_axes        = H'2091FE     ; drives each axis in turn and samples it
-adc_scan_step            = H'209C44
+adc_prime_an4_an6        = H'2091F0     ; runs once, from analog_input_init; not on the polling path
+an4_release_event        = H'209262
+an6_release_event        = H'209286
+an4_press_handler        = H'2092AA
+an6_press_handler        = H'209326
+adc_sample_an4           = H'209C44     ; live path: converts AN4, stores it, counts samples >= H'4C
+adc_sample_an6           = H'209C96     ; live path: converts adc_current_channel, window H'4C-H'96
+input_scan               = H'209E48     ; polls the port bits and H'080000 into input_flags
+analog_input_init        = H'20A030     ; sets the P4 drive bits, then primes AN4/AN6 once
 
 ; ====================================================================
 ; Identified data
@@ -383,20 +390,28 @@ sci0_rx_payload          = H'0203D4     ; payload bytes of the frame being recei
 sci0_frame_len           = H'020886     ; expected length of the current frame
 sci0_rx_state            = H'02089E     ; receive state machine
 lcd_frame_buffer         = H'040000     ; LCD frame buffer, 320x240 at 2bpp, MSB first (H'4B00 bytes)
-adc_results              = H'11A251     ; latest A/D conversion results
+digital_inputs           = H'080000     ; external byte of digital inputs, polled by input_scan
+mode_114DC6              = H'114DC6     ; bit 7 gates the AN6 window test
+latch_114DD7             = H'114DD7     ; per-handler once-only latch
+adc_results              = H'11A251     ; latest A/D conversion results, indexed by channel
 table_11A6E8             = H'11A6E8     ; table filled by fill_table_11A6E8
-touch_debounce           = H'11A814     ; touch debounce counter, reloaded with H'C8
+an4_over_count           = H'11A814     ; consecutive AN4 samples at or above H'4C, capped at H'C8
+an4_under_count          = H'11A815     ; consecutive samples below H'4C; at 8, an4_release_event runs
+an6_in_window_count      = H'11A816     ; consecutive AN6 samples inside H'4C-H'96, capped at H'C8
+an6_out_count            = H'11A817
 adc_current_channel      = H'11A818     ; channel being converted
 adc_next_channel         = H'11A819     ; channel to convert next
 sci0_command_table       = H'2155B4     ; 15-entry SCI0 command dispatch table
 sci0_check_byte          = H'216662     ; frame check byte
-touch_x_raw              = H'FFFEF0     ; X axis sample, from AN4; pressed when >= H'4C
-touch_y_raw              = H'FFFEF1     ; Y axis sample, from AN6
-touch_axis_drive         = H'FFFEF7     ; which axis the panel is currently driving
+mode_FFFEC0              = H'FFFEC0     ; must be 1 for an4_press_handler to act; 0 in normal running
+input_flags              = H'FFFEC1     ; digital inputs packed by input_scan; bit 5 gates an4_press
+an4_sample               = H'FFFEF0     ; latest AN4 sample; written but never read anywhere in the image
+an6_sample               = H'FFFEF1     ; latest AN6 sample; read only by the window test at H'209CE6
+an4_an6_drive_flags      = H'FFFEF7     ; bits 1 and 2, set and cleared around the AN4 and AN6 samples
 
 ; ====================================================================
 ; Call targets found by the static walk
-; 1371 subroutines reached from the vectors, the handler
+; 1363 subroutines reached from the vectors, the handler
 ; table and the recovered jump tables. These are addresses that
 ; were called — not routines anyone has read.
 ; ====================================================================
@@ -756,11 +771,6 @@ sub_2090EC               = H'2090EC
 sub_2090F4               = H'2090F4
 sub_2090FC               = H'2090FC
 sub_209104               = H'209104
-sub_2091F0               = H'2091F0
-sub_209262               = H'209262
-sub_209286               = H'209286
-sub_2092AA               = H'2092AA
-sub_209326               = H'209326
 sub_209398               = H'209398
 sub_209424               = H'209424
 sub_209444               = H'209444
@@ -774,11 +784,8 @@ sub_209AF0               = H'209AF0
 sub_209B0C               = H'209B0C
 sub_209B56               = H'209B56
 sub_209C3A               = H'209C3A
-sub_209C96               = H'209C96
 sub_209D1A               = H'209D1A
-sub_209E48               = H'209E48
 sub_209FC0               = H'209FC0
-sub_20A030               = H'20A030
 sub_20A092               = H'20A092
 sub_20A10C               = H'20A10C
 sub_20A19A               = H'20A19A

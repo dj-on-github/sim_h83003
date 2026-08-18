@@ -376,6 +376,24 @@ void main(List<String> args) {
       '${m.halted ? "  (halted: ${m.haltReason})" : ""}');
   print("final PC = H'${hex6(m.pc)}, ${m.cycles} states\n");
 
+  // ---- --pc: did these specific addresses ever execute? -----------------
+  final probes = (opt('--pc') ?? '')
+      .split(RegExp(r'[\s,]+'))
+      .where((s) => s.isNotEmpty)
+      .map((s) => int.parse(s, radix: 16))
+      .toList();
+  if (probes.isNotEmpty) {
+    print('=== probe addresses ===');
+    for (final a in probes) {
+      final n = m.pcHits[a] ?? 0;
+      final d = disassembleH8(m.mem.peek, a);
+      print("  H'${hex6(a)}  ${n == 0 ? 'never reached' : '${n}x'}"
+          .padRight(34) +
+          d.text);
+    }
+    print('');
+  }
+
   // ---- where did it spend its time? -------------------------------------
   final hot = m.pcHits.entries.toList()
     ..sort((a, b) => b.value.compareTo(a.value));
