@@ -445,11 +445,29 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   void _step() {
     setState(() {
+      cpu.clearBreakHit();
       cpu.step();
       _memRev++;
       _screenRev.value++;
       _followPc();
     });
+    if (cpu.breakAddr != null) _reportDataBreak();
+  }
+
+  /// Says which address stopped the run and which instruction touched it.
+  ///
+  /// A data breakpoint stops *after* the access completes, so the PC is
+  /// already past the instruction responsible — and in code that reads a
+  /// register and immediately writes a neighbouring one, the instruction
+  /// left under the cursor belongs to an address that was never watched.
+  void _reportDataBreak() {
+    final addr = cpu.breakAddr;
+    if (addr == null) return;
+    final at = cpu.breakPc;
+    final name = _symbols[addr];
+    final where = at == null ? '' : " by H'${_hex6(at)}";
+    _showSnack("Data breakpoint: H'${_hex6(addr)}"
+        '${name == null ? '' : ' ($name)'}$where');
   }
 
   /// Effective clock speed of the current/last Run.
@@ -499,7 +517,7 @@ class _SimulatorPageState extends State<SimulatorPage>
               break;
             }
             firstStep = false;
-            cpu.breakHit = false;
+            cpu.clearBreakHit();
             cpu.step();
             // A sleeping CPU is still waiting for an interrupt, so keep
             // running; only an illegal-instruction halt ends the run.
@@ -533,6 +551,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             _followPc();
             if (stopping) _pause();
           });
+          if (paused && cpu.breakAddr != null) _reportDataBreak();
         }
       });
     });
@@ -673,8 +692,17 @@ class _SimulatorPageState extends State<SimulatorPage>
     );
     if (result != null) {
       setState(() {
-        cpu.mem.poke(addr, result);
-        cpu.breakHit = false; // don't let the UI edit arm a stale break
+        // An on-chip register belongs to its peripheral model, so write it
+        // through the bus rather than poking the memory mirror: poking would
+        // change nothing the CPU or the views can see. Plain memory is poked
+        // directly, so that an address a peripheral does not own still takes
+        // whatever byte the user typed.
+        if (_ownedByPeripheral(addr)) {
+          cpu.writeB(addr, result);
+        } else {
+          cpu.mem.poke(addr, result);
+        }
+        cpu.clearBreakHit(); // don't let the UI edit arm a stale break
         if (brk) {
           cpu.dataBreaks.add(addr);
         } else {
@@ -683,7 +711,20 @@ class _SimulatorPageState extends State<SimulatorPage>
         _memRev++;
         _codeRev++;
       });
+      // Registers that are read-only in hardware silently ignore the write.
+      // Say so rather than leaving the old value sitting there unexplained.
+      final now = cpu.peekBus(addr);
+      if (now != result) {
+        _showSnack("H'${_hex6(addr)} did not take that value — it still "
+            "reads H'${_hex2(now)}. Read-only or reserved bits.");
+      }
     }
+  }
+
+  /// True when an on-chip peripheral model owns [addr], rather than memory.
+  bool _ownedByPeripheral(int addr) {
+    if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) return true; // SCI0/SCI1
+    return cpu.itu.owns(addr) || cpu.dmac.owns(addr) || cpu.adc.owns(addr);
   }
 
   Future<void> _gotoAddress() async {
@@ -2142,12 +2183,38 @@ class _SimulatorPageState extends State<SimulatorPage>
   // H'4C as no touch, so the defaults sit above that and releasing drives
   // both channels to zero.
 
-  static const int touchChannelX = 4;
-  static const int touchChannelY = 6;
+  // Channel assignment, from traces taken on the machine itself: the Y
+  // position arrives in result register A and the X position in register B.
+  // Driving X into B rather than C is what made the screen start responding.
+  // Register C swings between zero and full scale and looks like a finger
+  // detect, so it can be driven too, but that is a guess and it is off by
+  // default.
+  //
+  // Each result register is fed by two pins — ADDRA by AN0 or AN4, ADDRB by
+  // AN1 or AN5 — and this firmware scans all eight, so a register carries
+  // whichever of its pair converted most recently. Driving only one of a
+  // pair therefore makes the register alternate between the injected value
+  // and whatever the other pin reads; [_touchDrivePairs] drives both.
+  int _touchChannelX = 5; // AN5 -> ADDRB
+  int _touchChannelY = 4; // AN4 -> ADDRA
+  int _touchChannelDetect = 6; // AN6 -> ADDRC
+  bool _touchDetectEnabled = false;
+  // On by default: with only one pin of a pair driven the result register
+  // alternates between the injected value and zero, and the firmware never
+  // sees a steady reading. Driving both is what makes a click register — the
+  // screen redraws on a press with it on, and does nothing with it off.
+  bool _touchDrivePairs = true;
+  int _touchDetectOn = 0xFF;
 
   /// Reading that corresponds to the left/top edge and the right/bottom edge.
-  int _touchXMin = 0x4C, _touchXMax = 0xF0;
-  int _touchYMin = 0x4C, _touchYMax = 0xF0;
+  ///
+  /// Both axes run from zero, so a click maps straight onto the panel with
+  /// no offset. The firmware's H'4C floor on the Y reading is not a
+  /// no-touch threshold to be avoided but a deliberate dead band: a press
+  /// above roughly the top third of the screen reads below it and is
+  /// ignored, which is what the machine does.
+  int _touchXMin = 0x00, _touchXMax = 0xF0;
+  int _touchYMin = 0x00, _touchYMax = 0xF0;
 
   /// Where the pointer is, in panel pixels, while pressed.
   Offset? _touchPoint;
@@ -2168,9 +2235,21 @@ class _SimulatorPageState extends State<SimulatorPage>
         _touchRawX = (_touchXMin + fx * (_touchXMax - _touchXMin)).round();
         _touchRawY = (_touchYMin + fy * (_touchYMax - _touchYMin)).round();
       }
-      cpu.adc.setInput8(touchChannelX, _touchRawX);
-      cpu.adc.setInput8(touchChannelY, _touchRawY);
+      _driveTouchChannel(_touchChannelX, _touchRawX);
+      _driveTouchChannel(_touchChannelY, _touchRawY);
+      if (_touchDetectEnabled) {
+        _driveTouchChannel(
+            _touchChannelDetect, panelPoint == null ? 0 : _touchDetectOn);
+      }
     });
+  }
+
+  /// Sets one analog input, and its partner on the same result register when
+  /// [_touchDrivePairs] is on, so the register does not alternate between the
+  /// injected value and the other pin of the pair.
+  void _driveTouchChannel(int channel, int value) {
+    cpu.adc.setInput8(channel, value);
+    if (_touchDrivePairs) cpu.adc.setInput8(channel ^ 4, value);
   }
 
   /// Maps a pointer position inside the pane onto panel pixels.
@@ -2288,7 +2367,9 @@ class _SimulatorPageState extends State<SimulatorPage>
           ),
           const SizedBox(width: 12),
           Text(
-            "AN4 H'${_hex2(_touchRawX)}   AN6 H'${_hex2(_touchRawY)}",
+            "X AN$_touchChannelX H'${_hex2(_touchRawX)}"
+            "   Y AN$_touchChannelY H'${_hex2(_touchRawY)}"
+            "${_touchDetectEnabled ? '   det AN$_touchChannelDetect' : ''}",
             style: TextStyle(
                 fontFamily: _font,
                 fontSize: 11,
@@ -2313,6 +2394,12 @@ class _SimulatorPageState extends State<SimulatorPage>
     final xMax = _selectedController(_hex2(_touchXMax));
     final yMin = _selectedController(_hex2(_touchYMin));
     final yMax = _selectedController(_hex2(_touchYMax));
+    final detOn = _selectedController(_hex2(_touchDetectOn));
+    var chX = _touchChannelX;
+    var chY = _touchChannelY;
+    var chDet = _touchChannelDetect;
+    var detEnabled = _touchDetectEnabled;
+    var drivePairs = _touchDrivePairs;
 
     Widget field(String label, TextEditingController c) => SizedBox(
           width: 96,
@@ -2327,47 +2414,137 @@ class _SimulatorPageState extends State<SimulatorPage>
           ),
         );
 
+    // Which result register a channel lands in, which is the thing the
+    // machine's own traces were taken against.
+    String reg(int ch) => 'ADDR${'ABCD'[ch & 3]}';
+
+    Widget channelPicker(String label, int value, void Function(int) set) =>
+        Row(
+          children: [
+            SizedBox(
+                width: 68,
+                child: Text(label, style: const TextStyle(fontSize: 12))),
+            DropdownButton<int>(
+              value: value,
+              isDense: true,
+              onChanged: (v) => v == null ? null : set(v),
+              items: [
+                for (var ch = 0; ch < 8; ch++)
+                  DropdownMenuItem(
+                      value: ch, child: Text('AN$ch  -> ${reg(ch)}')),
+              ],
+            ),
+          ],
+        );
+
     final ok = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Touch calibration'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'A click is converted to two A/D readings: the X position on '
-              'AN$touchChannelX and the Y position on AN$touchChannelY, '
-              'linearly between these endpoints. The firmware ignores '
-              "readings below H'4C, so keep the minimums above that for a "
-              'press to register.',
-              style: TextStyle(fontSize: 11, color: _inkA(0.65)),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Touch calibration'),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'A click is converted to A/D readings, linearly between '
+                    'these endpoints. Traces from the machine put the Y '
+                    'position in ADDRA and the X position in ADDRB, both '
+                    "running from zero. The firmware's H'4C floor on Y is a "
+                    'dead band, not a threshold to clear: a press near the '
+                    'top of the screen reads below it and is ignored, as on '
+                    'the machine.',
+                    style: TextStyle(fontSize: 11, color: _inkA(0.65)),
+                  ),
+                  const SizedBox(height: 14),
+                  channelPicker('X input', chX, (v) => setLocal(() => chX = v)),
+                  channelPicker('Y input', chY, (v) => setLocal(() => chY = v)),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    field('X at left', xMin),
+                    const SizedBox(width: 10),
+                    field('X at right', xMax)
+                  ]),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    field('Y at top', yMin),
+                    const SizedBox(width: 10),
+                    field('Y at bottom', yMax)
+                  ]),
+                  const Divider(height: 24),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    value: drivePairs,
+                    onChanged: (v) =>
+                        setLocal(() => drivePairs = v ?? false),
+                    title: const Text('Drive both inputs of each pair',
+                        style: TextStyle(fontSize: 13)),
+                    subtitle: Text(
+                      'ADDRA is fed by AN0 or AN4 and ADDRB by AN1 or AN5, '
+                      'and this firmware scans all eight — so driving one of '
+                      'a pair leaves the register alternating with the other '
+                      'pin.',
+                      style: TextStyle(fontSize: 10, color: _inkA(0.6)),
+                    ),
+                  ),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    value: detEnabled,
+                    onChanged: (v) => setLocal(() => detEnabled = v ?? false),
+                    title: const Text('Also drive a finger-detect input',
+                        style: TextStyle(fontSize: 13)),
+                    subtitle: Text(
+                      'ADDRC swings between zero and full scale on the real '
+                      'machine, which may be a contact detect. This is a '
+                      'guess, so it is off unless you turn it on.',
+                      style: TextStyle(fontSize: 10, color: _inkA(0.6)),
+                    ),
+                  ),
+                  if (detEnabled) ...[
+                    channelPicker('Detect', chDet,
+                        (v) => setLocal(() => chDet = v)),
+                    const SizedBox(height: 6),
+                    field('Value when touched', detOn),
+                  ],
+                ],
+              ),
             ),
-            const SizedBox(height: 14),
-            Row(children: [field('X at left', xMin), const SizedBox(width: 10),
-              field('X at right', xMax)]),
-            const SizedBox(height: 10),
-            Row(children: [field('Y at top', yMin), const SizedBox(width: 10),
-              field('Y at bottom', yMax)]),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Apply')),
           ],
         ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Apply')),
-        ],
       ),
     );
     if (ok != true) return;
     setState(() {
+      // Let go of any input the old settings were holding, so a channel that
+      // is no longer used does not keep its last value for ever.
+      for (var ch = 0; ch < 8; ch++) {
+        cpu.adc.setInput8(ch, 0);
+      }
+      _touchChannelX = chX;
+      _touchChannelY = chY;
+      _touchChannelDetect = chDet;
+      _touchDetectEnabled = detEnabled;
+      _touchDrivePairs = drivePairs;
+      _touchDetectOn = int.tryParse(detOn.text, radix: 16) ?? _touchDetectOn;
       _touchXMin = int.tryParse(xMin.text, radix: 16) ?? _touchXMin;
       _touchXMax = int.tryParse(xMax.text, radix: 16) ?? _touchXMax;
       _touchYMin = int.tryParse(yMin.text, radix: 16) ?? _touchYMin;
       _touchYMax = int.tryParse(yMax.text, radix: 16) ?? _touchYMax;
     });
+    _applyTouch(_touchPoint);
   }
 
   Widget _screenHeader() {

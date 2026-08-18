@@ -42,10 +42,17 @@ class ProbeCpu extends H8Cpu {
       if (!wasRunning && (value & AdcStatus.adst) != 0) {
         final ch = value & AdcStatus.channel;
         startsByChannel[ch] = (startsByChannel[ch] ?? 0) + 1;
+        lastChannelFor[AdConverter.registerFor(ch)] = ch;
       }
     }
     super.writeB(addr, value);
   }
+
+  /// Channel whose conversion last targeted each result register, and the
+  /// channels seen on each result-register read. This is what says whether
+  /// ADDRB is being fed from AN1 or from AN5.
+  final Map<int, int> lastChannelFor = {};
+  final Map<int, Map<int, int>> readChannels = {};
 
   /// An extra address to trace: which instruction reads it, and what it got.
   int traceAddr = -1;
@@ -58,6 +65,12 @@ class ProbeCpu extends H8Cpu {
     if (logging && addr >= 0xFFFFE0 && addr <= 0xFFFFE7 && (addr & 1) == 0) {
       resultReads[addr] = (resultReads[addr] ?? 0) + 1;
       (resultValues[addr] ??= {}).add(v);
+      final reg = (addr - 0xFFFFE0) >> 1;
+      final ch = lastChannelFor[reg];
+      if (ch != null) {
+        final m = readChannels[addr] ??= {};
+        m[ch] = (m[ch] ?? 0) + 1;
+      }
     }
     if (logging && addr == traceAddr) {
       traceReaders[pc] = (traceReaders[pc] ?? 0) + 1;
@@ -166,6 +179,14 @@ void main(List<String> args) {
     print('  conversions started, by channel: '
         '${ch.isEmpty ? "none" : ch.map((c) => 'AN$c='
             '${cpu.startsByChannel[c]}').join('  ')}');
+    final rc = cpu.readChannels.keys.toList()..sort();
+    for (final a in rc) {
+      final m = cpu.readChannels[a]!;
+      final ks = m.keys.toList()..sort();
+      const names = {0: 'A', 1: 'B', 2: 'C', 3: 'D'};
+      print('  ADDR${names[(a - 0xFFFFE0) >> 1]}H read after a conversion on '
+          '${ks.map((c) => 'AN$c (${m[c]}x)').join(', ')}');
+    }
     final rr = cpu.resultReads.keys.toList()..sort();
     for (final a in rr) {
       final vals = cpu.resultValues[a]!.toList()..sort();
@@ -206,9 +227,18 @@ void main(List<String> args) {
   run(hold);
   report('untouched');
 
-  print("pressing at X=H'${hex2(x)} Y=H'${hex2(y)} on AN4/AN6...");
-  cpu.adc.setInput8(4, x);
-  cpu.adc.setInput8(6, y);
+  // Channel assignment from the machine's own traces: Y in ADDRA (AN4), X in
+  // ADDRB (AN5). --pairs also drives AN0/AN1 so the registers do not
+  // alternate with the other half of the mux.
+  final pairs = args.contains('--pairs');
+  print("pressing: X=H'${hex2(x)} on AN5 (ADDRB), "
+      "Y=H'${hex2(y)} on AN4 (ADDRA)${pairs ? ', pairs driven' : ''}...");
+  cpu.adc.setInput8(5, x);
+  cpu.adc.setInput8(4, y);
+  if (pairs) {
+    cpu.adc.setInput8(1, x);
+    cpu.adc.setInput8(0, y);
+  }
   cpu.startsByChannel.clear();
   cpu.resultReads.clear();
   cpu.resultValues.clear();
@@ -290,9 +320,13 @@ void main(List<String> args) {
 
   final x2 = int.parse(opt('--x2') ?? '70', radix: 16);
   final y2 = int.parse(opt('--y2') ?? '70', radix: 16);
-  print("pressing at X=H'${hex2(x2)} Y=H'${hex2(y2)}...");
-  cpu.adc.setInput8(4, x2);
-  cpu.adc.setInput8(6, y2);
+  print("pressing: X=H'${hex2(x2)} Y=H'${hex2(y2)}...");
+  cpu.adc.setInput8(5, x2);
+  cpu.adc.setInput8(4, y2);
+  if (pairs) {
+    cpu.adc.setInput8(1, x2);
+    cpu.adc.setInput8(0, y2);
+  }
   cpu.startsByChannel.clear();
   cpu.resultReads.clear();
   cpu.resultValues.clear();

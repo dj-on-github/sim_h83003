@@ -268,6 +268,16 @@ class H8Cpu {
   final Set<int> dataBreaks = <int>{};
   bool breakHit = false;
 
+  /// When [breakHit] is set: which address was touched, and the address of
+  /// the instruction that touched it. A data breakpoint stops *after* the
+  /// access completes, so the PC has already moved past that instruction —
+  /// without these the user is left looking at the wrong one.
+  int? breakAddr;
+  int? breakPc;
+
+  /// Address of the instruction currently executing, for [breakPc].
+  int _instrPc = 0;
+
   // ---------------------------------------------------------------------
   // Profiling. Instruction fetches are *not* counted as data accesses (so
   // the data profile shows real operand traffic); each executed
@@ -324,10 +334,21 @@ class H8Cpu {
   // H8/300H ignores the least significant address bit; no address error).
   // ---------------------------------------------------------------------
 
+  /// Records a data-breakpoint hit. The first address of an instruction
+  /// wins, so a word access that straddles two watched bytes reports the one
+  /// the programmer is most likely thinking of.
+  void _noteBreak(int addr) {
+    if (!breakHit) {
+      breakAddr = addr;
+      breakPc = _instrPc;
+    }
+    breakHit = true;
+  }
+
   int readB(int addr) {
     addr &= 0xFFFFFF;
     if (profiling) dataAccessCount.bump(addr);
-    if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) breakHit = true;
+    if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) _noteBreak(addr);
     // On-chip peripherals answer for their own registers.
     if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
       for (final s in sci) {
@@ -345,7 +366,7 @@ class H8Cpu {
   void writeB(int addr, int value) {
     addr &= 0xFFFFFF;
     if (profiling) dataAccessCount.bump(addr);
-    if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) breakHit = true;
+    if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) _noteBreak(addr);
     if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
       for (final s in sci) {
         if (s.owns(addr)) {
@@ -534,7 +555,14 @@ class H8Cpu {
     halted = false;
     sleeping = false;
     haltReason = '';
+    clearBreakHit();
+  }
+
+  /// Clears a recorded data-breakpoint hit.
+  void clearBreakHit() {
     breakHit = false;
+    breakAddr = null;
+    breakPc = null;
   }
 
   /// Side-effect-free read that consults the on-chip peripherals, for the
@@ -758,6 +786,7 @@ class H8Cpu {
     if (halted) return sleeping ? sleepStates : 0;
     if (profiling) instrExecCount.bump(pc);
     final instrStart = pc;
+    _instrPc = pc;
     final w0 = _fetchW();
     final b0 = w0 >> 8;
     final b1 = w0 & 0xFF;
