@@ -53,7 +53,7 @@ not a symbol line at all
   });
 
   test('the generated artista 180 symbol file loads', () {
-    final f = File('bernina_artista180/artista180_2026-08-16.sym');
+    final f = File('bernina_artista180/Bernina180_20260816.sym');
     if (!f.existsSync()) {
       markTestSkipped('dump-derived symbol file not present');
       return;

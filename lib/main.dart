@@ -3424,7 +3424,91 @@ class _SimulatorPageState extends State<SimulatorPage>
         ),
         const SizedBox(height: 8),
         for (final p in H8Cpu.ports) _gpioPort(p),
+        const Divider(height: 20),
+        const Text('External inputs',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 4),
+        Text(
+          'Digital inputs latched into the address space rather than onto a '
+          'CPU pin. Until a bit is driven the window reads out of memory — '
+          'for a full dump, the byte the machine was holding when it was '
+          'taken.',
+          style: TextStyle(fontSize: 11, color: _inkA(0.5)),
+        ),
+        const SizedBox(height: 8),
+        for (final e in cpu.externalInputs) _externalInputs(e),
       ],
+    );
+  }
+
+  /// One memory-mapped input latch, drawn like a port so the two read the
+  /// same way.
+  Widget _externalInputs(ExternalInputs e) {
+    // What the CPU would read right now: the override if there is one, and
+    // otherwise whatever the loaded image holds there.
+    final value = e.value ?? cpu.mem.peek(e.base);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Tooltip(
+            message: "${e.name}\nH'${_hex6(e.base)}-"
+                "H'${_hex6(e.base + e.size - 1)}\n"
+                'Every address in the window reads the same byte.',
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.baseline,
+              textBaseline: TextBaseline.alphabetic,
+              children: [
+                Text("H'${_hex6(e.base)}",
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 13)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    "${e.driven ? 'held' : 'from memory'}  H'${_hex2(value)}",
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontFamily: _font, fontSize: 11, color: _inkA(0.5)),
+                  ),
+                ),
+                if (e.driven)
+                  IconButton(
+                    tooltip: 'Release: read from memory again',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.undo, size: 16),
+                    onPressed: () => setState(() {
+                      e.value = null;
+                      _memRev++;
+                    }),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 2),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var bit = 7; bit >= 0; bit--)
+                _gpioBitBox(
+                  bit: bit,
+                  hasPin: true,
+                  isOutput: false,
+                  value: (value >> bit) & 1,
+                  isFirst: bit == 7,
+                  driven: e.driven,
+                  onTap: () => setState(() {
+                    // Taking the override from what is being read keeps the
+                    // other seven bits as they were.
+                    e.value = value ^ (1 << bit);
+                    _memRev++;
+                  }),
+                ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 

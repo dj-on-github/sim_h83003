@@ -35,6 +35,33 @@ class H8Flag {
   static const int c = 0x01; // carry
 }
 
+/// A latch of digital inputs mapped into the address space rather than onto
+/// the CPU's own port pins.
+///
+/// The artista 180 has one at H'080000: reading any address in the window
+/// returns the same byte, because the board decodes the window without the
+/// low address bits. The firmware never writes to it.
+///
+/// [value] is an override. While it is null the window reads out of memory,
+/// which for a full memory dump means the byte the machine was holding when
+/// the dump was taken — so nothing changes until an input is driven.
+class ExternalInputs {
+  ExternalInputs({
+    required this.name,
+    required this.base,
+    required this.size,
+  });
+
+  final String name;
+  final int base;
+  final int size;
+
+  int? value;
+
+  bool owns(int addr) => addr >= base && addr < base + size;
+  bool get driven => value != null;
+}
+
 /// Describes one of the H8/3003's I/O ports (hardware manual section 9,
 /// mode 3/4 register addresses). Each port has a data direction register
 /// (DDR, write-only on real hardware) and a data register (DR); port 7 is
@@ -174,6 +201,21 @@ class H8Cpu {
     H8Port(name: 'B', pinMask: 0xFF, ddrAddr: 0xFFFFD4, drAddr: 0xFFFFD6),
     H8Port(name: 'C', pinMask: 0xFF, ddrAddr: 0xFFFFD5, drAddr: 0xFFFFD7),
   ];
+
+  /// Latches of digital inputs mapped into the address space. Reading one
+  /// returns [ExternalInputs.value] when it has been driven, and whatever
+  /// memory holds otherwise.
+  final List<ExternalInputs> externalInputs = [
+    ExternalInputs(name: 'digital inputs', base: 0x080000, size: 0x020000),
+  ];
+
+  /// The latch that answers for [addr], if any.
+  ExternalInputs? externalInputFor(int addr) {
+    for (final e in externalInputs) {
+      if (e.owns(addr)) return e;
+    }
+    return null;
+  }
 
   /// Ports indexed by data register address, for the bus decode.
   static final Map<int, H8Port> portByDr = {
@@ -360,6 +402,13 @@ class H8Cpu {
     if (adc.owns(addr)) return adc.read(addr);
     final port = portByDr[addr];
     if (port != null) return portRead(port);
+    for (final e in externalInputs) {
+      if (e.owns(addr)) {
+        final v = e.value;
+        if (v != null) return v;
+        break;
+      }
+    }
     return mem.peek(addr);
   }
 
@@ -581,6 +630,13 @@ class H8Cpu {
     if (adc.owns(addr)) return adc.read(addr);
     final port = portByDr[addr];
     if (port != null) return portRead(port);
+    for (final e in externalInputs) {
+      if (e.owns(addr)) {
+        final v = e.value;
+        if (v != null) return v;
+        break;
+      }
+    }
     return mem.peek(addr);
   }
 

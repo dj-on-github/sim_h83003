@@ -55,11 +55,15 @@ Map<int, String> curatedFor(int resetVector) {
 }
 
 /// Verified in the dump whose reset vector is H'000400
-/// (MemoryDump-SewingMachine-2026-08-16_16-14-24.bin). These are points
-/// confirmed while reading the code, not necessarily function entries.
+/// (Bernina180_20260816.bin). These are points confirmed while reading
+/// the code, not necessarily function entries.
 const Map<int, String> curatedV400 = {
   0x000400: 'boot_reset',
+  0x20046C: 'fp_multiply',
+  0x200608: 'fp_add',
+  0x20070C: 'fp_int_to_float',
   0x20071E: 'fp_normalise_loop',
+  0x2006C8: 'fp_to_int',
   0x20083E: 'adc_start_conversion',
   0x20084A: 'adc_get_result',
   0x200860: 'adc_convert_polled',
@@ -79,6 +83,9 @@ const Map<int, String> curatedV400 = {
   0x209C96: 'adc_sample_an6',
   0x209E48: 'input_scan',
   0x20A030: 'analog_input_init',
+  0x208A5C: 'config_flash_program',
+  0x210652: 'touch_calibration_load',
+  0x210FB4: 'touch_calibration_apply',
   0x20651C: 'fill_table_11A6E8',
 };
 
@@ -102,8 +109,25 @@ const Map<int, String> dataV400 = {
   0x11A815: 'an4_under_count',
   0x11A816: 'an6_in_window_count',
   0x11A817: 'an6_out_count',
+  0x11A80C: 'touch_x_sample',
+  0x11A80D: 'touch_y_sample',
   0x11A818: 'adc_current_channel',
   0x11A819: 'adc_next_channel',
+  0x11A87E: 'touch_cal_x_scale',
+  0x11A882: 'touch_cal_y_scale',
+  0x11A886: 'touch_cal_x_offset',
+  0x11A88A: 'touch_cal_y_offset',
+  0x11B102: 'touch_x_pixels',
+  0x11B104: 'touch_y_pixels',
+  0x57FF80: 'config_block',
+  0x57FF81: 'config_valid_marker',
+  0x57FFA0: 'flash_cal_x_scale',
+  0x57FFA4: 'flash_cal_y_scale',
+  0x57FFA8: 'flash_cal_x_offset',
+  0x57FFAC: 'flash_cal_y_offset',
+  0x57FFB0: 'firmware_version_string',
+  0xFFFED9: 'touch_x_raw',
+  0xFFFEDA: 'touch_y_raw',
   0x2155B4: 'sci0_command_table',
   0x216662: 'sci0_check_byte',
   0xFFFEC0: 'mode_FFFEC0',
@@ -133,10 +157,30 @@ const Map<int, String> symbolNotes = {
   0x216662: 'frame check byte',
   0xFFFEC0: 'must be 1 for an4_press_handler to act; 0 in normal running',
   0xFFFEC1: 'digital inputs packed by input_scan; bit 5 gates an4_press',
-  0xFFFEF0: 'latest AN4 sample; written but never read anywhere in the image',
-  0xFFFEF1: 'latest AN6 sample; read only by the window test at H\'209CE6',
+  0xFFFEF0: 'latest AN4 sample; a shadow, not the coordinate — the touch '
+      'position the UI uses is touch_x_raw',
+  0xFFFEF1: 'latest AN6 sample; likewise a shadow of touch_y_raw',
   0xFFFEF7: 'bits 1 and 2, set and cleared around the AN4 and AN6 samples',
+  0x11A80C: 'X sample, copied to touch_x_raw when a contact is accepted',
+  0x11A80D: 'Y sample, copied to touch_y_raw',
+  0x11A87E: 'RAM copy of flash_cal_x_scale, = 1.325967',
+  0x11A882: 'RAM copy of flash_cal_y_scale, = 1.006289',
+  0x11A886: 'RAM copy of flash_cal_x_offset, = 0.720993',
+  0x11A88A: 'RAM copy of flash_cal_y_offset, = -0.757862',
+  0x11B102: 'touch X in screen pixels, 0-320',
+  0x11B104: 'touch Y in screen pixels, 0-240',
+  0x57FF80: 'configuration block in the data flash',
+  0x57FF81: "H'A5 when the block is valid; anything else falls back to "
+      'defaults',
+  0x57FFA0: 'per-machine touch calibration, big-endian IEEE-754 singles',
+  0x57FFB0: 'firmware version, copied here from H\'200100 when programmed',
+  0xFFFED9: 'raw X the calibration is applied to',
+  0xFFFEDA: 'raw Y the calibration is applied to',
   0x20071E: 'the loop the machine spends most of its time in',
+  0x208A5C: 'programs the config block, writing the H\'A5 marker last',
+  0x210652: 'copies the four calibration constants from flash into RAM',
+  0x210FB4: "touch_x_pixels = round(touch_x_raw * x_scale + x_offset), "
+      'and likewise for Y',
   0x2091F0: 'runs once, from analog_input_init; not on the polling path',
   0x209C44: 'live path: converts AN4, stores it, counts samples >= H\'4C',
   0x209C96: 'live path: converts adc_current_channel, window H\'4C-H\'96',
