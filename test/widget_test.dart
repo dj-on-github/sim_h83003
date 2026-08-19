@@ -1,4 +1,5 @@
-// Smoke tests: the app builds, and the IO pane keeps its fixed width.
+// Smoke tests: the app builds, the IO pane keeps its fixed width, and the
+// memory view can be pinned instead of chasing the PC.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -28,5 +29,54 @@ void main() {
 
     expect(find.text('GPIO'), findsOneWidget);
     expect(tester.getSize(find.byKey(const Key('ioPane'))).width, 300.0);
+  });
+
+  group('following the PC in the memory view', () {
+    Finder switchFinder() => find.byKey(const Key('followPcSwitch'));
+
+    testWidgets('is on by default, next to Go to', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const SimH8App());
+
+      expect(find.text('Follow PC'), findsOneWidget);
+      expect(switchFinder(), findsOneWidget);
+      expect(tester.widget<Switch>(switchFinder()).value, isTrue);
+    });
+
+    testWidgets('can be switched off and back on', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const SimH8App());
+
+      await tester.tap(switchFinder());
+      await tester.pumpAndSettle();
+      expect(tester.widget<Switch>(switchFinder()).value, isFalse);
+
+      await tester.tap(switchFinder());
+      await tester.pumpAndSettle();
+      expect(tester.widget<Switch>(switchFinder()).value, isTrue);
+    });
+
+    testWidgets('with it off, stepping leaves the view where it was',
+        (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const SimH8App());
+
+      // Park the view a long way from the PC.
+      final list = find.byType(Scrollable).first;
+      await tester.drag(list, const Offset(0, -4000));
+      await tester.pumpAndSettle();
+      final parked = tester.widget<Scrollable>(list).controller!.offset;
+
+      await tester.tap(switchFinder());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Step'));
+      await tester.pumpAndSettle();
+      expect(tester.widget<Scrollable>(list).controller!.offset, parked,
+          reason: 'the view should not chase the PC while pinned');
+    });
   });
 }

@@ -132,6 +132,11 @@ class _SimulatorPageState extends State<SimulatorPage>
     with SingleTickerProviderStateMixin {
   final H8Cpu cpu = H8Cpu();
 
+  /// Whether the memory window scrolls to keep the PC in view. Off lets a
+  /// chosen region stay put while the program runs, which is the only way to
+  /// watch one address change.
+  bool _followPcInMemory = true;
+
   /// Top address shown in the memory window (drives the header label).
   int _memBase = 0x000100;
 
@@ -605,6 +610,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   }
 
   void _ensurePcVisibleHex() {
+    if (!_followPcInMemory) return;
     if (!_attached(_memScroll)) return;
     final pos = _memScroll.position;
     final firstRow = (pos.pixels / _rowExtent).floor();
@@ -1784,10 +1790,45 @@ class _SimulatorPageState extends State<SimulatorPage>
               alignment: Alignment.centerRight,
               child: FittedBox(
                 fit: BoxFit.scaleDown,
-                child: TextButton.icon(
-                  onPressed: _gotoAddress,
-                  icon: const Icon(Icons.my_location, size: 16),
-                  label: Text("Go to  H'${_hex6(_memBase)}"),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Tooltip(
+                      message: _followPcInMemory
+                          ? 'Following the PC: the view scrolls to it as the '
+                              'program runs'
+                          : 'Not following: the view stays where you put it',
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('Follow PC',
+                              style: TextStyle(
+                                  fontSize: 12,
+                                  color: _inkA(
+                                      _followPcInMemory ? 0.85 : 0.45))),
+                          const SizedBox(width: 2),
+                          Switch(
+                            key: const Key('followPcSwitch'),
+                            value: _followPcInMemory,
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                            onChanged: (v) => setState(() {
+                              _followPcInMemory = v;
+                              // Turning it back on should catch up at once
+                              // rather than waiting for the PC to move.
+                              if (v) _ensurePcVisibleHex();
+                            }),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    TextButton.icon(
+                      onPressed: _gotoAddress,
+                      icon: const Icon(Icons.my_location, size: 16),
+                      label: Text("Go to  H'${_hex6(_memBase)}"),
+                    ),
+                  ],
                 ),
               ),
             ),
