@@ -6,7 +6,7 @@
 # github.com/shizmob/ghidra-h8-300 or carllom/sleigh-h8),
 # then run this from the Script Manager.
 #
-# It labels 1687 addresses, marks 1381 functions, disassembles from every entry point,
+# It labels 1690 addresses, marks 1381 functions, disassembles from every entry point,
 # and marks the on-chip register block volatile so the
 # decompiler does not fold away peripheral reads.
 # @category H8
@@ -179,6 +179,9 @@ LABELS = [
     (0x0022FE, "tramp_vec5"),
     (0x002312, "tramp_vec6"),
     (0x002328, "tramp_vec22"),
+    (0x020000, "lcd_registers"),
+    (0x020002, "lcd_bytes_per_line"),
+    (0x020004, "lcd_line_count"),
     (0x0203D4, "sci0_rx_payload"),
     (0x020886, "sci0_frame_len"),
     (0x02089E, "sci0_rx_state"),
@@ -601,7 +604,7 @@ LABELS = [
     (0x20DFB0, "isr_IMIB4"),
     (0x20E04A, "isr_IMIA4"),
     (0x20E054, "sub_20E054"),
-    (0x20E062, "sub_20E062"),
+    (0x20E062, "lcd_controller_init"),
     (0x20E0D8, "sub_20E0D8"),
     (0x20E0FE, "sub_20E0FE"),
     (0x20E126, "sub_20E126"),

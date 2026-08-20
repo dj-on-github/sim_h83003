@@ -393,12 +393,16 @@ adc_sample_an4           = H'209C44     ; live path: converts AN4, stores it, co
 adc_sample_an6           = H'209C96     ; live path: converts adc_current_channel, window H'4C-H'96
 input_scan               = H'209E48     ; polls the port bits and H'080000 into input_flags
 analog_input_init        = H'20A030     ; sets the P4 drive bits, then primes AN4/AN6 once
+lcd_controller_init      = H'20E062     ; writes the display controller registers in order, then enables the panel by writing H'DB back to H'020001 last
 touch_calibration_load   = H'210652     ; copies the four calibration constants from flash into RAM
 touch_calibration_apply  = H'210FB4     ; touch_x_pixels = round(touch_x_raw * x_scale + x_offset), and likewise for Y
 
 ; ====================================================================
 ; Identified data
 ; ====================================================================
+lcd_registers            = H'020000     ; SED1351F register window, H'020001-H'02000F. Written once each by lcd_controller_init and never read anywhere in the image
+lcd_bytes_per_line       = H'020002     ; set to H'4F = 79, one less than the frame buffer's 80 bytes per line
+lcd_line_count           = H'020004     ; set to H'EF = 239, one less than the 240 display lines
 sci0_rx_payload          = H'0203D4     ; payload bytes of the frame being received
 sci0_frame_len           = H'020886     ; expected length of the current frame
 sci0_rx_state            = H'02089E     ; receive state machine
@@ -442,7 +446,7 @@ an4_an6_drive_flags      = H'FFFEF7     ; bits 1 and 2, set and cleared around t
 
 ; ====================================================================
 ; Call targets found by the static walk
-; 1353 subroutines reached from the vectors, the handler
+; 1352 subroutines reached from the vectors, the handler
 ; table and the recovered jump tables. These are addresses that
 ; were called — not routines anyone has read.
 ; ====================================================================
@@ -895,7 +899,6 @@ sub_20DB1A               = H'20DB1A
 sub_20DB24               = H'20DB24
 sub_20DF78               = H'20DF78
 sub_20E054               = H'20E054
-sub_20E062               = H'20E062
 sub_20E0D8               = H'20E0D8
 sub_20E0FE               = H'20E0FE
 sub_20E126               = H'20E126

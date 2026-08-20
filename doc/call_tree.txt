@@ -1,0 +1,9 @@
+The generator is tool/call_tree.dart:
+
+dart run tool/call_tree.dart bernina_artista180/Bernina180_20260816.bin --sym bernina_artista180/Bernina180_20260816.sym --apptable 200000 --all-roots --out call_hierarchy.txt
+
+--root SYMBOL starts anywhere you like — --root touch_calibration_apply gives just that subtree — and --no-header drops the comment block if you'd rather the file started straight at boot_reset.
+
+One limit worth knowing: calls made through a computed target (JSR @ERn) can't be attributed to their caller, so a routine reached that way shows up in the jump-table section rather than under whatever dispatched to it. That's the same blind spot that hid the A/D driver from the original analysis.
+
+

@@ -93,6 +93,7 @@ const Map<int, String> curatedV400 = {
   0x208A5C: 'config_flash_program',
   0x210652: 'touch_calibration_load',
   0x210FB4: 'touch_calibration_apply',
+  0x20E062: 'lcd_controller_init',
   0x20651C: 'fill_table_11A6E8',
 };
 
@@ -106,6 +107,9 @@ const Map<int, String> dataV400 = {
   0x0203D4: 'sci0_rx_payload',
   0x020886: 'sci0_frame_len',
   0x02089E: 'sci0_rx_state',
+  0x020000: 'lcd_registers',
+  0x020002: 'lcd_bytes_per_line',
+  0x020004: 'lcd_line_count',
   0x040000: 'lcd_frame_buffer',
   0x080000: 'digital_inputs',
   0x114DC6: 'mode_114DC6',
@@ -150,7 +154,14 @@ const Map<int, String> symbolNotes = {
   0x0203D4: 'payload bytes of the frame being received',
   0x020886: 'expected length of the current frame',
   0x02089E: 'receive state machine',
+  0x020000: 'SED1351F register window, H\'020001-H\'02000F. Written once each '
+      'by lcd_controller_init and never read anywhere in the image',
+  0x020002: "set to H'4F = 79, one less than the frame buffer's 80 bytes per "
+      'line',
+  0x020004: "set to H'EF = 239, one less than the 240 display lines",
   0x040000: 'LCD frame buffer, 320x240 at 2bpp, MSB first (H\'4B00 bytes)',
+  0x20E062: 'writes the display controller registers in order, then enables '
+      "the panel by writing H'DB back to H'020001 last",
   0x080000: 'external byte of digital inputs, polled by input_scan',
   0x114DC6: 'bit 7 gates the AN6 window test',
   0x114DD7: 'per-handler once-only latch',

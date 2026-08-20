@@ -1,0 +1,2 @@
+dart run tool/decompile.dart bernina_artista180/Bernina180_20260816.bin <symbol_name> --sym bernina_artista180/Bernina180_20260816.sym
+

@@ -1,0 +1,2 @@
+dart run tool/disasm.dart bernina_artista180/Bernina180_20260816.bin --sym bernina_artista180/Bernina180_20260816.sym --start 20E062 --end 20E07F
+
