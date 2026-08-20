@@ -361,6 +361,12 @@ isr_TXI0                 = H'2324DA     ; application handler for vector 54
 ; ====================================================================
 ; Identified code
 ; ====================================================================
+read_serial_data_byte    = H'00044C     ; reads RDR0 or RDR1 depending on bit 1 of H'FFFD1C, then clears RDRF in the matching SSR
+send_serial_data_byte    = H'000472     ; sends the byte in R6L on the channel bit 1 of H'FFFD1C selects, spinning on TDRE at H'00047E or H'00048C first
+serial_clear_rx_errors   = H'0004EE     ; returns R6=1 when SSR's error bits (ORER|FER|PER, H'38) are clear; otherwise reads a byte to drain RDR, clears those bits, zeroes H'FFFD1E and returns R6=0
+get_rx_data_full_bit     = H'00053C     ; spins until RDRF is set, servicing errors through H'00049A meanwhile, then reads RDR, clears RDRF and returns the received BYTE in R6L — not a bit
+get_sci_rx_ready_bit     = H'000576     ; returns SSR bit 6 (RDRF, H'40) for the channel CHAN_SELECTION picks, zero-extended into R6
+get_sci_tx_ready_bit     = H'000590     ; returns SSR bit 7 (TDRE, H'80) for the channel CHAN_SELECTION picks, zero-extended into R6
 fp_multiply              = H'20046C
 fp_add                   = H'200608
 fp_to_int                = H'2006C8
@@ -425,6 +431,7 @@ flash_cal_y_scale        = H'57FFA4
 flash_cal_x_offset       = H'57FFA8
 flash_cal_y_offset       = H'57FFAC
 firmware_version_string  = H'57FFB0     ; firmware version, copied here from H'200100 when programmed
+CHAN_SELECTION           = H'FFFD1C     ; bit 1 picks SCI1 over SCI0 for read_serial_data_byte and send_serial_data_byte; 76 references, other bits set and cleared through ER6
 mode_FFFEC0              = H'FFFEC0     ; must be 1 for an4_press_handler to act; 0 in normal running
 input_flags              = H'FFFEC1     ; digital inputs packed by input_scan; bit 5 gates an4_press
 touch_x_raw              = H'FFFED9     ; raw X the calibration is applied to
@@ -435,7 +442,7 @@ an4_an6_drive_flags      = H'FFFEF7     ; bits 1 and 2, set and cleared around t
 
 ; ====================================================================
 ; Call targets found by the static walk
-; 1359 subroutines reached from the vectors, the handler
+; 1353 subroutines reached from the vectors, the handler
 ; table and the recovered jump tables. These are addresses that
 ; were called — not routines anyone has read.
 ; ====================================================================
@@ -443,13 +450,7 @@ sub_00040A               = H'00040A
 sub_00040E               = H'00040E
 sub_000412               = H'000412
 sub_00041C               = H'00041C
-sub_00044C               = H'00044C
-sub_000472               = H'000472
 sub_00049A               = H'00049A
-sub_0004EE               = H'0004EE
-sub_00053C               = H'00053C
-sub_000576               = H'000576
-sub_000590               = H'000590
 sub_0005AA               = H'0005AA
 sub_0005F0               = H'0005F0
 sub_000640               = H'000640
