@@ -11,6 +11,14 @@
 typedef H8Disasm = ({String text, int length});
 
 String _h2(int v) => v.toRadixString(16).toUpperCase().padLeft(2, '0');
+/// Effective address of a 16-bit absolute operand.
+///
+/// The H8/300H sign-extends @aa:16, so a field of H'FD1C addresses H'FFFD1C.
+/// Printing the raw field is what makes a perfectly correct `MOV.B @aa:16`
+/// look like a 16-bit access; the :8 form has always been shown as its full
+/// address, and this makes the two agree.
+int _abs16(int w) => w < 0x8000 ? w : 0xFF0000 | w;
+
 String _h4(int v) => v.toRadixString(16).toUpperCase().padLeft(4, '0');
 String _h6(int v) => v.toRadixString(16).toUpperCase().padLeft(6, '0');
 String _h8(int v) => v.toRadixString(16).toUpperCase().padLeft(8, '0');
@@ -498,12 +506,12 @@ H8Disasm _disasmMovAbs(int Function(int) peek, int addr, int w0,
   switch (mode) {
     case 0x0:
       return (
-        text: "MOV.$sz @H'${_h4(wordAt(2))}:16,$r",
+        text: "MOV.$sz @H'${_h6(_abs16(wordAt(2)))}:16,$r",
         length: 4
       );
     case 0x8:
       return (
-        text: "MOV.$sz $r,@H'${_h4(wordAt(2))}:16",
+        text: "MOV.$sz $r,@H'${_h6(_abs16(wordAt(2)))}:16",
         length: 4
       );
     case 0x2:
@@ -686,7 +694,7 @@ H8Disasm _disasmMovLong(int Function(int) peek, int addr) {
     case 0x6B:
       final mode = (b3 >> 4) & 7;
       if (mode == 0) {
-        final a = "@H'${_h4(wordAt(4))}:16";
+        final a = "@H'${_h6(_abs16(wordAt(4)))}:16";
         return store
             ? (text: 'MOV.L $erd,$a', length: 6)
             : (text: 'MOV.L $a,$erd', length: 6);
@@ -749,7 +757,7 @@ H8Disasm _disasmLdcStcW(int Function(int) peek, int addr) {
       if ((b3 & 0x0F) != 0) return _ill(wordAt(0));
       final mode = (b3 >> 4) & 7;
       if (mode == 0) {
-        final a = "@H'${_h4(wordAt(4))}:16";
+        final a = "@H'${_h6(_abs16(wordAt(4)))}:16";
         return store
             ? (text: 'STC.W CCR,$a', length: 6)
             : (text: 'LDC.W $a,CCR', length: 6);

@@ -1,0 +1,4 @@
+
+h8300-elf-gcc -mh -mint32 -Os -ffreestanding -nostdlib -nostartfiles -Wl,-Ttext=0x250B00 read_serial_byte.c -o read_serial_byte.elf
+h8300-elf-objcopy -O binary read_serial_byte.elf read_serial_byte.bin
+

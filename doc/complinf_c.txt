@@ -1,0 +1,5 @@
+
+h8300-elf-gcc -mh -mint32 -Os -ffreestanding -nostdlib -nostartfiles \
+  -Wl,-Ttext=0x250B00 patch.c -o patch.elf
+h8300-elf-objcopy -O binary patch.elf patch.bin
+

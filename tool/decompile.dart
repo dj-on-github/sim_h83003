@@ -522,14 +522,19 @@ void main(List<String> args) {
   /// for; a goto to either is structure rather than control flow, and is
   /// dropped.
   void region(int from, int to, String indent,
-      {int? loopHead, int? fallOut, int? dropCondAt}) {
+      {int? loopHead, int? fallOut, int? dropCondAt,
+       int? skipDoWhileAt}) {
     var i = from;
     while (i < to && i < blocks.length) {
       final b = blocks[i];
 
       // do-while: a later block branches back here on a condition, so the
       // test is at the bottom and the body always runs once.
-      if (i != dropCondAt && b.dispatch == null) {
+      // skipDoWhileAt stops this recursing for ever: the body is
+      // emitted by calling region() again from this very block, and
+      // without the guard that call rediscovers the same loop.
+      if (i != dropCondAt && i != skipDoWhileAt &&
+          b.dispatch == null) {
         int? tail;
         for (var j = i; j < to; j++) {
           final cj = blocks[j].condCc;
@@ -542,7 +547,8 @@ void main(List<String> args) {
         if (tail != null) {
           if (i != from) lines.add('  ${labelFor(b.start)}:');
           lines.add('${indent}do {');
-          region(i, tail + 1, '$indent    ', dropCondAt: tail);
+          region(i, tail + 1, '$indent    ',
+              dropCondAt: tail, skipDoWhileAt: i);
           lines.add('$indent} '
               'while (${d.condition(blocks[tail].condCc!)});');
           i = tail + 1;

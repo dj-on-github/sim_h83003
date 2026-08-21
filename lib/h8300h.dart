@@ -16,6 +16,7 @@
 
 import 'dart:typed_data';
 
+import 'flash.dart';
 import 'adc.dart';
 import 'dmac.dart';
 import 'h8disasm.dart';
@@ -205,6 +206,19 @@ class H8Cpu {
   /// Latches of digital inputs mapped into the address space. Reading one
   /// returns [ExternalInputs.value] when it has been driven, and whatever
   /// memory holds otherwise.
+  /// Flash devices on the external bus. Empty by default: with nothing
+  /// attached the address space is plain memory, which is how every tool
+  /// behaved before this existed. Attach one to make a region answer the
+  /// JEDEC command sequences the boot ROM's programming routines use.
+  final List<JedecFlash> flash = [];
+
+  /// Puts a flash device on the bus, backed by this CPU's memory.
+  void attachFlash(JedecFlash f) {
+    f.peek = mem.peek;
+    f.poke = mem.poke;
+    flash.add(f);
+  }
+
   final List<ExternalInputs> externalInputs = [
     ExternalInputs(name: 'digital inputs', base: 0x080000, size: 0x020000),
   ];
@@ -409,6 +423,9 @@ class H8Cpu {
         break;
       }
     }
+    for (final f in flash) {
+      if (f.owns(addr)) return f.read(addr);
+    }
     return mem.peek(addr);
   }
 
@@ -435,6 +452,12 @@ class H8Cpu {
     if (adc.owns(addr)) {
       adc.write(addr, value);
       return;
+    }
+    for (final f in flash) {
+      if (f.owns(addr)) {
+        f.write(addr, value);
+        return;
+      }
     }
     mem.poke(addr, value);
   }
