@@ -14,7 +14,7 @@ LDFLAGS = -mh -mint32 -nostdlib -nostartfiles -T boot.ld -Wl,--gc-sections
 
 OBJS = vectors.o boot.o
 
-all: bootrom.bin
+all: bootrom.bin mergebootrom
 
 %.o: %.S ; $(CC) $(CFLAGS) -c $< -o $@
 %.o: %.c h8_3003.h ; $(CC) $(CFLAGS) -c $< -o $@
@@ -27,5 +27,13 @@ bootrom.bin: bootrom.elf
 	$(OBJCOPY) -O binary $< $@
 	@echo "size: $$(wc -c < $@) bytes"
 
-clean: ; rm -f *.o bootrom.elf bootrom.bin
+# mergebootrom is a host tool, not target code, so it uses the system
+# compiler rather than the cross one.
+HOSTCC      = cc
+HOSTCFLAGS  = -std=c99 -Wall -Wextra -pedantic -O2
+
+mergebootrom: mergebootrom.c
+	$(HOSTCC) $(HOSTCFLAGS) $< -o $@
+
+clean: ; rm -f *.o bootrom.elf bootrom.bin mergebootrom
 .PHONY: all clean

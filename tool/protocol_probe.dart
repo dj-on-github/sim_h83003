@@ -10,7 +10,7 @@
 // Usage:
 //   dart run tool/protocol_probe.dart <image.bin> --capture FILE.json
 //   dart run tool/protocol_probe.dart <image.bin> --compare FILE.json
-//     [--warmup N] [--settle N] [--send "48 65"] [--flash BASE:SIZE]
+//     [--warmup N] [--settle N] [--send "48 65"] [--flash machine|BASE:SIZE]
 
 import 'dart:convert';
 import 'dart:io';
@@ -45,13 +45,20 @@ class Machine {
     loadRawBinary(File(path).readAsBytesSync(), 0, cpu.mem.poke);
     if (download) cpu.mem.poke(0x200000, 0x01);
     if (flashSpec != null) {
-      // BASE:SIZE, both hex. Without this the address space is plain memory
-      // and every programming command is refused at the identify.
-      final parts = flashSpec.split(':');
-      cpu.attachFlash(JedecFlash(
-        base: int.parse(parts[0], radix: 16),
-        size: int.parse(parts.length > 1 ? parts[1] : '80000', radix: 16),
-      ));
+      // "machine" attaches the artista 180's own two devices; otherwise
+      // BASE:SIZE, both hex. Without either, the address space is plain
+      // memory and every programming command is refused at the identify.
+      if (flashSpec == 'machine') {
+        for (final r in artista180Flash) {
+          cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+        }
+      } else {
+        final parts = flashSpec.split(':');
+        cpu.attachFlash(JedecFlash(
+          base: int.parse(parts[0], radix: 16),
+          size: int.parse(parts.length > 1 ? parts[1] : '80000', radix: 16),
+        ));
+      }
     }
     cpu.reset();
   }

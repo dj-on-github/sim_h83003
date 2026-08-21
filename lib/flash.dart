@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 // A JEDEC-style flash device on the external bus.
 //
 // The boot ROM talks to its program memory the way every AMD/Atmel-style
@@ -26,6 +28,106 @@
 // sector geometry other than uniform. [busyReads] stands in for the internal
 // timing — it is a count of reads rather than a duration, so tests are
 // deterministic.
+
+/// One flash device's place in the address map.
+class FlashRegion {
+  const FlashRegion(this.name, this.base, this.size);
+
+  final String name;
+  final int base;
+  final int size;
+
+  int get end => base + size;
+}
+
+/// The artista 180 carries two flash devices, one per external bus area.
+///
+/// The regions are read off a full memory dump rather than assumed:
+///
+///  * Area 0 holds a 32K device at H'000000. Its contents repeat every 32K
+///    up to H'020000, so only the low fifteen address lines reach it -- the
+///    same fifteen the H'5555 and H'2AAA unlock offsets need. Above it in
+///    the same area sit the LCD registers at H'020000, the frame buffer at
+///    H'040000 and the input latch at H'080000, none of which are flash;
+///    taking the device to be larger swallows them and the machine stops
+///    drawing.
+///
+///  * Area 1 holds a 2M device at H'200000 with the application in it. It
+///    does not repeat within the area at either 512K or 1M, and nothing
+///    writes to it while the machine runs normally.
+///
+/// A flash image file holds the two back to back in this order.
+const List<FlashRegion> artista180Flash = [
+  FlashRegion('boot', 0x000000, 0x008000),
+  FlashRegion('application', 0x200000, 0x200000),
+];
+
+/// Size of a flash image file holding [regions] back to back.
+int flashImageSize([List<FlashRegion> regions = artista180Flash]) =>
+    regions.fold(0, (total, r) => total + r.size);
+
+/// True when a file of [length] bytes reaches the top of the highest region,
+/// which means it is a picture of the whole address space -- a full memory
+/// dump -- rather than the regions concatenated. Both are accepted, because
+/// a dump of a working machine is the obvious thing to have to hand.
+bool flashImageIsAddressed(int length,
+    [List<FlashRegion> regions = artista180Flash]) {
+  var top = 0;
+  for (final r in regions) {
+    if (r.end > top) top = r.end;
+  }
+  return length >= top;
+}
+
+/// Where [region]'s bytes start inside a flash image file.
+int flashImageOffset(FlashRegion region, bool addressed,
+    [List<FlashRegion> regions = artista180Flash]) {
+  if (addressed) return region.base;
+  var offset = 0;
+  for (final r in regions) {
+    if (r.base == region.base && r.size == region.size) return offset;
+    offset += r.size;
+  }
+  return offset;
+}
+
+/// Gathers the current contents of [regions] into a flash image, in the
+/// plain back-to-back form. [peek] reads the array directly rather than
+/// through any device, so this is what is really stored and not what a
+/// device part-way through an autoselect would answer with.
+Uint8List buildFlashImage(int Function(int) peek,
+    [List<FlashRegion> regions = artista180Flash]) {
+  final image = Uint8List(flashImageSize(regions));
+  for (final region in regions) {
+    final offset = flashImageOffset(region, false, regions);
+    for (var i = 0; i < region.size; i++) {
+      image[offset + i] = peek(region.base + i);
+    }
+  }
+  return image;
+}
+
+/// Writes [image] into memory at each region's base. Bytes past the end of
+/// a short file are written erased; the count of those is returned so the
+/// caller can say how much of the image was missing.
+int applyFlashImage(List<int> image, void Function(int, int) poke,
+    {List<FlashRegion> regions = artista180Flash, bool? addressed}) {
+  final byAddress = addressed ?? flashImageIsAddressed(image.length, regions);
+  var padded = 0;
+  for (final region in regions) {
+    final offset = flashImageOffset(region, byAddress, regions);
+    for (var i = 0; i < region.size; i++) {
+      final j = offset + i;
+      if (j < image.length) {
+        poke(region.base + i, image[j]);
+      } else {
+        poke(region.base + i, 0xFF);
+        padded++;
+      }
+    }
+  }
+  return padded;
+}
 
 /// The command sequence recognised at the unlock offsets.
 enum _Phase { read, unlock1, unlock2, erasePrefix, eraseUnlock1, eraseUnlock2 }
@@ -84,6 +186,12 @@ class JedecFlash {
   /// Counters, so a test or the UI can see what the device was asked to do.
   int programmedPages = 0;
   int programmedBytes = 0;
+
+  /// Stores the device ignored because no command sequence was in progress.
+  /// On real flash these do nothing; a high count on a region means either
+  /// software that expects RAM there, or a region that is not really flash.
+  int ignoredWrites = 0;
+  final Map<int, int> ignoredByBank = {};
   int erasedSectors = 0;
   int identifyCount = 0;
 
@@ -148,8 +256,14 @@ class JedecFlash {
 
     switch (_phase) {
       case _Phase.read:
-        if (_isUnlockA(addr) && value == 0xAA) _phase = _Phase.unlock1;
-        // Anything else is ignored: flash cannot be written by a bare store.
+        if (_isUnlockA(addr) && value == 0xAA) {
+          _phase = _Phase.unlock1;
+        } else {
+          // Ignored: flash cannot be written by a bare store.
+          ignoredWrites++;
+          final bank = addr & 0xFF0000;
+          ignoredByBank[bank] = (ignoredByBank[bank] ?? 0) + 1;
+        }
         return;
 
       case _Phase.unlock1:

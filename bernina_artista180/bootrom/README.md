@@ -1,75 +1,90 @@
-# Boot ROM, rewritten in C — work in progress
+# Boot ROM, rewritten in C
 
-Reconstruction of the artista 180's boot ROM (`H'000000`–`H'002FFF`) as C,
-built with the `h8300-elf` GCC toolchain.
+Reconstruction of the artista 180's boot ROM (`H'000000`–`H'002FFF` in the
+original) as C, built with the `h8300-elf` GCC toolchain.
 
-    make            # -> bootrom.bin (1638 bytes)
+    make            # -> bootrom.bin, and the mergebootrom host tool
 
-## Status: boots the original application to a matching screen
+## Trying it
 
-Verified by splicing `bootrom.bin` over an erased `H'000000`–`H'002FFF` in a
-full memory image and running it in the simulator against the untouched
-application flash:
+`mergebootrom` puts a compiled ROM into a full memory dump, which is what the
+simulator loads:
 
-| | original | rebuilt |
-| --- | --- | --- |
-| serial greeting | `BOSN` | `BOSN` |
-| hands over to application | instruction 698,493 | instruction 25,986 |
-| application still running at 25M | yes, PC `H'000200` | yes, PC `H'20A114` |
-| frame buffer | 6,818 non-zero bytes | 6,827 |
-| screen difference | — | **12 pixels of 76,800 (0.02%)** |
+    ./mergebootrom -b bootrom.bin -m ../Bernina180_20260816.bin -o merged.bin
 
-The twelve pixels are the blinking element in the display, caught at a
-different point in its cycle. The handover happens sooner because the
-handshake below is stubbed rather than performed.
+Two details there are not a plain `memcpy`, and getting either wrong leaves an
+image that looks right and behaves oddly:
+
+* The boot flash is a 32K device. Everything past the new ROM is erased to
+  `H'FF`, so a ROM shorter than the one it replaces cannot leave the tail of
+  the old one behind for a stale pointer to find.
+* Only the low fifteen address lines reach that device, so its contents
+  repeat every 32K up to `H'020000`. All four copies are written.
+
+## Status: complete
+
+The rebuilt ROM boots the original application to a **pixel-identical**
+screen (0 of 76,800 differ) and answers the download protocol **byte for
+byte** — 19 of 19 commands, with and without the simulator's flash devices
+attached.
+
+Nothing is stubbed. All nineteen protocol commands, the host handshake, the
+flash driver and the vector-slot routines are reconstructed.
 
 ## The low vector slots are an ABI
 
 The application calls boot ROM routines through `JSR`/`JMP @@aa:8`, a
 memory-indirect call that reads its target from the low 256 bytes — the
-vector table. The call sites are a thunk block at `H'250AE8`–`H'250AF4`, at
-the end of the application code:
+vector table. The call sites are a thunk block at `H'250AE8`–`H'250AF4`.
 
-| slot | vector | routine |
+| slot | original | routine |
 | --- | --- | --- |
-| `H'04` | 1 | `H'001090` |
-| `H'08` | 2 | `H'000426` — the delay loop |
-| `H'0C` | 3 | `H'000ADC` |
-| `H'14` | 5 | `H'0022FE` |
-| `H'58` | 22 | `H'002328` |
+| 1 | `H'001090` | the serial service, and the whole download protocol |
+| 2 | `H'000426` | the delay loop |
+| 3 | `H'000ADC` | write a block of any length into flash |
+| 4 | `H'002122` | bridge the two serial ports back to back |
+| 5 | `H'0022FE` | select serial port 0 |
+| 6 | `H'002312` | is port 0 selected? |
+| 22 | `H'002328` | the flag `'Y'` raises |
 
-Only slot 1 is used while the machine runs — 14,750 calls in 25M
-instructions, all from `H'250AE8`. Leaving these slots at zero sends the
-application to address 0 the first time it uses one.
+The application is the untouched original binary, so it calls these the
+original ROM's way: first argument in `ER6`, any others on the stack, result
+back in `R6`. GCC uses `ER0`/`ER1`/`ER2` and returns in `R0`, so each slot has
+a short assembly shim in `vectors.S` that translates between the two. Only
+slot 1 is reached while the machine runs normally.
 
-The table's shape matters too: trampolines occupy vectors 7-21, 24-26,
-28-30, 32-34, 36-38, 40-42 and 44-60 — 47 of them, with reserved gaps at 23,
-27, 31, 35, 39 and 43, and vector 22 holding a utility rather than a
-trampoline.
+The table's shape matters too: trampolines occupy vectors 7-21, 24-26, 28-30,
+32-34, 36-38, 40-42 and 44-60 — 47 of them, with reserved gaps at 23, 27, 31,
+35, 39 and 43, and vector 22 holding a utility rather than a trampoline.
 
-## Still stubbed
+## Two things C cannot be sloppy about
 
-**`H'001090`'s command dispatch.** `serial_service()` implements the two
-entry guards faithfully — the transmitter must be free and the line
-error-free — but not the 240-entry dispatch on `H'FFFD1E` over about 120
-handlers at `H'0014AE`-`H'002031`. That is the host download protocol and
-most of the remaining boot ROM. With nothing connected the state stays 0 and
-there is nothing for it to do, which is why the machine boots without it. A
-firmware update over serial would not work.
+Both cost real bugs during the rebuild, and neither shows up without a
+hardware model to catch it:
 
-**`H'000FB6`** — 218 bytes on the boot path whose result decides whether
-the machine starts the application. `host_handshake()` in `boot.c` stubs it
-as "no host present", which reaches the right branch but skips whatever
-state the real routine leaves behind.
+* **Status flags must be cleared by writing a constant**, never by
+  `SSR &= ~mask`. The SCI clears a flag when software writes 0 and ignores
+  writes of 1, so a read-modify-write also clears any flag that *became* set
+  between the read and the write-back. A character finishing arrival in that
+  window is lost.
+* **Flash accesses must be `volatile`.** The unlock sequence writes `H'AA`
+  and then the command byte to the same address; without `volatile` the
+  compiler sees a dead store and drops the `H'AA`, so the device never leaves
+  read mode and every identify, erase and program silently does nothing.
 
-## What is reconstructed
+## Bugs found in the original ROM
 
-`boot.c`: the serial API (send, read, blocking read, error clearing and NAK,
-the ready-bit accessors), the delay loop, bus controller and SCI
-initialisation, the boot sequence and the handover.
+Reproduced as they stand, since this is a reconstruction, but worth fixing
+before building on it:
 
-`vectors.S`: the vector table and all 54 interrupt trampolines. These cannot
-be C — each builds a `JMP @aa:24` instruction in on-chip RAM out of the
-handler address fetched from the application's table at `H'200000`, then
-jumps to it, so that the handler is reached with `ER0` restored. The
-trampoline encoding assembles byte-for-byte identically to the original.
+* `H'000EBC` (the Atmel `H'13` download path) writes every byte of a page to
+  the same address — the destination is never advanced inside the loop. That
+  path cannot ever have worked.
+* Ending an `'M'` edit immediately after a page boundary re-commits the wrong
+  page, overwriting the page just written with a copy of the next one.
+* `flash_identify`'s manufacturer tests fall through into the device tests
+  below them, so identify codes 6 and 7 can never be returned.
+* The serial bridge's escape matcher compares its counter against `E6`, which
+  it never initialises. If `E6` arrives non-zero the escape can never start
+  matching. Written as a comparison against zero here, which is the evident
+  intent.

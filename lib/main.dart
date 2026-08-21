@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dmac.dart';
+import 'flash.dart';
 import 'h8300h.dart';
 import 'hex_files.dart';
 import 'itu.dart';
@@ -233,6 +234,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   bool _viewIo = false;
   bool _viewTrace = false;
   bool _viewProfile = false;
+  bool _viewFlash = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
   /// switches between the tabbed and side-by-side arrangements.
@@ -245,6 +247,19 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _ioKey = GlobalKey();
   final GlobalKey _traceKey = GlobalKey();
   final GlobalKey _profKey = GlobalKey();
+  final GlobalKey _flashKey = GlobalKey();
+
+  /// Flash tab. With the model off nothing is attached and every address
+  /// behaves as ordinary RAM, which is how the simulator has always worked.
+  /// With it on, the two devices answer the JEDEC command sequences and
+  /// their contents can only be changed by a proper erase or program.
+  bool _flashOn = false;
+  final TextEditingController _flashPathCtl = TextEditingController();
+  String _flashStatus = '';
+
+  /// Whether the last image was read as a picture of the address space
+  /// rather than as the two devices concatenated. Shown in the table.
+  bool _flashAddressed = false;
 
   /// True only when [c] is attached to exactly one scrollable.
   bool _attached(ScrollController c) => c.positions.length == 1;
@@ -267,7 +282,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 9, vsync: this);
+    _tab = TabController(length: 10, vsync: this);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -1325,6 +1340,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             Tab(text: 'IO'),
             Tab(text: 'Trace'),
             Tab(text: 'Profile'),
+            Tab(text: 'Flash'),
           ],
         ),
         Expanded(
@@ -1346,6 +1362,8 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _traceKey, child: _KeepAlive(child: _traceView())),
               KeyedSubtree(
                   key: _profKey, child: _KeepAlive(child: _profileView())),
+              KeyedSubtree(
+                  key: _flashKey, child: _KeepAlive(child: _flashView())),
             ],
           ),
         ),
@@ -1420,6 +1438,13 @@ class _SimulatorPageState extends State<SimulatorPage>
         (
           pane: KeyedSubtree(
               key: _profKey, child: _KeepAlive(child: _profileView())),
+          flex: 1,
+          width: null
+        ),
+      if (_viewFlash)
+        (
+          pane: KeyedSubtree(
+              key: _flashKey, child: _KeepAlive(child: _flashView())),
           flex: 1,
           width: null
         ),
@@ -1509,6 +1534,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         _viewToggle('TRACE', _viewTrace, (v) => _viewTrace = v),
         const SizedBox(width: 4),
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
+        const SizedBox(width: 4),
+        _viewToggle('FLASH', _viewFlash, (v) => _viewFlash = v),
       ],
     );
   }
@@ -1523,7 +1550,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         (_viewDma ? 1 : 0) +
         (_viewIo ? 1 : 0) +
         (_viewTrace ? 1 : 0) +
-        (_viewProfile ? 1 : 0);
+        (_viewProfile ? 1 : 0) +
+        (_viewFlash ? 1 : 0);
     return Tooltip(
       message: enabled
           ? 'Show the $label view'
@@ -3760,6 +3788,249 @@ class _SimulatorPageState extends State<SimulatorPage>
     if (bySymbol != null) return bySymbol;
     return symbolAddress(t);
   }
+
+  /// Puts the two flash devices on the bus, or takes them off again.
+  ///
+  /// Turning the model on replaces the contents of both regions with what is
+  /// in the image file: that is the point of it, so the CPU is stopped and
+  /// reset rather than left running on code that has just changed underneath
+  /// it. Turning it off leaves memory as it stands and simply stops the
+  /// devices intercepting, so every address is ordinary RAM again.
+  Future<void> _setFlashOn(bool on) async {
+    if (!on) {
+      cpu.flash.clear();
+      setState(() {
+        _flashOn = false;
+        _flashStatus = 'Off. Both regions are plain memory again, holding '
+            'whatever is in them now.';
+      });
+      return;
+    }
+    await _loadFlashImage();
+  }
+
+  /// Reads the image file and, if it can be read, attaches the devices.
+  Future<void> _loadFlashImage() async {
+    final path = _flashPathCtl.text.trim();
+    if (path.isEmpty) {
+      setState(() {
+        _flashOn = false;
+        _flashStatus = 'Choose a flash image file first.';
+      });
+      return;
+    }
+
+    final bytes = await readBytesFromPath(path);
+    if (bytes == null) {
+      setState(() {
+        _flashOn = false;
+        _flashStatus = 'Could not read "$path".';
+      });
+      return;
+    }
+
+    _pause();
+    final addressed = flashImageIsAddressed(bytes.length);
+
+    cpu.flash.clear();
+    final padded = applyFlashImage(bytes, cpu.mem.poke, addressed: addressed);
+    for (final region in artista180Flash) {
+      cpu.attachFlash(JedecFlash(base: region.base, size: region.size));
+    }
+    _reset();
+
+    final shape = addressed
+        ? 'read as a memory dump, each device taken from its own address'
+        : 'read as the two devices back to back';
+    setState(() {
+      _flashOn = true;
+      _flashAddressed = addressed;
+      _flashStatus = '${bytes.length} bytes $shape.'
+          '${padded > 0 ? "  $padded bytes past the end of the file were "
+              "filled with H'FF." : ""}'
+          '  CPU reset.';
+    });
+  }
+
+  /// Writes what is in the two flash regions to a file in the plain
+  /// two-devices-back-to-back form, whichever way the loaded image was read.
+  ///
+  /// The bytes come from memory directly rather than through the devices, so
+  /// this is the array as it stands and not whatever a device in the middle
+  /// of an autoselect would answer with. It works with the model off as well
+  /// as on, which is how a starting image gets made from a memory dump.
+  Future<void> _saveFlashImage() async {
+    _pause();
+    final image = buildFlashImage(cpu.mem.peek);
+
+    try {
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save flash image',
+        fileName: 'flash.bin',
+        bytes: image,
+      );
+      if (path == null) {
+        _showSnack('Save cancelled.');
+        return;
+      }
+      // On desktop, saveFile returns a path without writing — write here.
+      await writeBytesToPath(path, image);
+      if (_flashPathCtl.text.trim().isEmpty) _flashPathCtl.text = path;
+      setState(() {
+        _flashStatus = 'Wrote ${image.length} bytes to $path.';
+      });
+    } catch (e) {
+      _showSnack('Save failed: $e');
+    }
+  }
+
+  /// Locates the image file. The bytes come back from the picker itself, but
+  /// the path is what the field keeps, so the file can be re-read later
+  /// after it has been changed outside the simulator.
+  Future<void> _pickFlashFile() async {
+    FilePickerResult? picked;
+    try {
+      picked = await FilePicker.pickFiles(type: FileType.any);
+    } catch (e) {
+      _showSnack('Could not open the file picker: $e');
+      return;
+    }
+    if (picked == null || picked.files.isEmpty) return; // cancelled
+
+    final path = picked.files.first.path;
+    if (path == null) {
+      _showSnack('That file has no path this platform can re-read.');
+      return;
+    }
+    _flashPathCtl.text = path;
+    if (_flashOn) {
+      await _loadFlashImage();
+    } else {
+      setState(() => _flashStatus = 'File chosen. Switch the model on to '
+          'load it.');
+    }
+  }
+
+  Widget _flashView() {
+    final rows = <TableRow>[
+      TableRow(children: [
+        _flashCell('Device', bold: true),
+        _flashCell('From', bold: true),
+        _flashCell('To', bold: true),
+        _flashCell('Size', bold: true),
+        _flashCell('In file at', bold: true),
+      ]),
+    ];
+    final addressed = _flashOn && _flashAddressed;
+    for (final r in artista180Flash) {
+      rows.add(TableRow(children: [
+        _flashCell(r.name),
+        _flashCell("H'${_addr6(r.base)}"),
+        _flashCell("H'${_addr6(r.end - 1)}"),
+        _flashCell("H'${_addr6(r.size)}"),
+        _flashCell("H'${_addr6(flashImageOffset(r, addressed))}"),
+      ]));
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Switch(
+              key: const Key('flashEnableSwitch'),
+              value: _flashOn,
+              onChanged: (v) => _setFlashOn(v),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _flashOn
+                    ? 'Flash model on: these regions answer only to a proper '
+                        'erase or program sequence.'
+                    : 'Flash model off: every address behaves as RAM.',
+                style: TextStyle(fontFamily: _font, color: _ink),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                key: const Key('flashPathField'),
+                controller: _flashPathCtl,
+                style: TextStyle(fontFamily: _font, color: _ink),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                  labelText: 'Flash image file',
+                ),
+                onSubmitted: (_) {
+                  if (_flashOn) _loadFlashImage();
+                },
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              key: const Key('flashBrowseButton'),
+              onPressed: _pickFlashFile,
+              child: const Text('Browse…'),
+            ),
+          ]),
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            OutlinedButton(
+              key: const Key('flashReloadButton'),
+              onPressed: _flashOn ? _loadFlashImage : null,
+              child: const Text('Reload'),
+            ),
+            OutlinedButton(
+              key: const Key('flashSaveButton'),
+              onPressed: _saveFlashImage,
+              child: const Text('Save Flash Image…'),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Text(
+            _flashStatus.isEmpty
+                ? 'A plain binary file holding both devices back to back, '
+                    "H'${_addr6(flashImageSize())} bytes. A full memory dump is "
+                    'also accepted, and each device is then taken from its '
+                    'own address.'
+                : _flashStatus,
+            style: TextStyle(fontFamily: _font, color: _inkA(0.75)),
+          ),
+          const SizedBox(height: 16),
+          Table(
+            columnWidths: const {
+              0: IntrinsicColumnWidth(),
+              1: IntrinsicColumnWidth(),
+              2: IntrinsicColumnWidth(),
+              3: IntrinsicColumnWidth(),
+              4: IntrinsicColumnWidth(),
+            },
+            children: rows,
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _addr6(int v) =>
+      (v & 0xFFFFFF).toRadixString(16).toUpperCase().padLeft(6, '0');
+
+  Widget _flashCell(String text, {bool bold = false}) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+        child: Text(
+          text,
+          style: TextStyle(
+            fontFamily: _font,
+            color: bold ? _ink : _inkA(0.85),
+            fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+      );
 
   Widget _traceView() {
     return TraceView(

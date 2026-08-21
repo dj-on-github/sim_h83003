@@ -167,6 +167,61 @@ void main() {
     expect(cpu.readB(base), 0x5A);
   });
 
+  group('images', () {
+    test('building and applying an image is lossless', () {
+      final source = H8Cpu();
+      for (final r in artista180Flash) {
+        for (var i = 0; i < r.size; i += 7) {
+          source.mem.poke(r.base + i, (r.base + i) & 0xFF);
+        }
+      }
+
+      final image = buildFlashImage(source.mem.peek);
+      expect(image.length, flashImageSize());
+
+      final target = H8Cpu();
+      final padded = applyFlashImage(image, target.mem.poke);
+      expect(padded, 0);
+
+      for (final r in artista180Flash) {
+        for (var i = 0; i < r.size; i += 997) {
+          expect(target.mem.peek(r.base + i), source.mem.peek(r.base + i),
+              reason: "at H'${(r.base + i).toRadixString(16)}");
+        }
+      }
+    });
+
+    test('a byte programmed into flash survives a save and a reload', () {
+      final cpu = withFlash();
+      cpu.mem.poke(base + 0x40, 0x00);
+
+      // Program a page the way the boot ROM does: unlock, then the data.
+      command(cpu, 0xA0);
+      for (var i = 0; i < 0x100; i++) {
+        cpu.writeB(base + i, i == 0x40 ? 0xC3 : 0xFF);
+      }
+      expect(cpu.readB(base + 0x40), 0xC3);
+
+      final image = buildFlashImage(cpu.mem.peek);
+      final reloaded = withFlash();
+      applyFlashImage(image, reloaded.mem.poke);
+      expect(reloaded.readB(base + 0x40), 0xC3);
+
+      // And it is still flash afterwards: a bare store does nothing.
+      reloaded.writeB(base + 0x40, 0x00);
+      expect(reloaded.readB(base + 0x40), 0xC3);
+    });
+
+    test('a short image is padded with erased bytes', () {
+      final target = H8Cpu();
+      final padded = applyFlashImage(const [1, 2, 3], target.mem.poke,
+          addressed: false);
+      expect(padded, flashImageSize() - 3);
+      expect(target.mem.peek(artista180Flash[0].base), 1);
+      expect(target.mem.peek(artista180Flash[0].base + 3), 0xFF);
+    });
+  });
+
   test('nothing is attached by default, so memory stays plain memory', () {
     final cpu = H8Cpu();
     expect(cpu.flash, isEmpty);

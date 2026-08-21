@@ -5,9 +5,12 @@
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:sim_h83003/flash.dart';
 import 'package:sim_h83003/h8300h.dart';
 import 'package:sim_h83003/hex_files.dart';
 import 'package:sim_h83003/lcd.dart';
+
+var reportFlash = false;
 
 void main(List<String> args) {
   final image = File(args.first).readAsBytesSync();
@@ -24,6 +27,15 @@ void main(List<String> args) {
 
   final cpu = H8Cpu();
   loadRawBinary(image, 0, cpu.mem.poke);
+  // --flash puts the machine's two flash devices on the bus, so the regions
+  // that are really flash stop accepting bare stores.
+  if (args.contains('--flash')) {
+    for (final r in artista180Flash) {
+      cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+    }
+    print('flash model on: ${artista180Flash.map((r) => r.name).join(", ")}');
+    reportFlash = true;
+  }
   if (patch != null) {
     final b0 = cpu.mem.peek(patch);
     if (b0 >= 0x41 && b0 <= 0x4F) {
@@ -57,6 +69,19 @@ void main(List<String> args) {
       final byte = cpu.mem.peek(0x040000 + y * LcdFormat.stride + (x >> 2));
       final level = (byte >> (6 - 2 * (x & 3))) & 3;
       grey[i++] = LcdFormat.levels[3 - level];
+    }
+  }
+  if (reportFlash) {
+    for (final f in cpu.flash) {
+      print("flash H'${f.base.toRadixString(16).toUpperCase().padLeft(6, '0')}"
+          ': ${f.ignoredWrites} stores ignored, '
+          '${f.programmedPages} pages programmed');
+      final banks = f.ignoredByBank.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      for (final e in banks.take(4)) {
+        print("    bank H'${e.key.toRadixString(16).toUpperCase().padLeft(6, '0')}"
+            ': ${e.value}');
+      }
     }
   }
   File(out).writeAsBytesSync(grey);
