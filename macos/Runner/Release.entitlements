@@ -3,8 +3,10 @@
 <plist version="1.0">
 <dict>
 	<!-- See DebugProfile.entitlements: the sandbox is off deliberately so the
-	     file picker, the command-line hex file and the sibling symbol-table
-	     file all work. Self-distributed, not App Store. -->
+	     file picker, the command-line hex file, the sibling symbol-table file
+	     and the SCI tab's host serial port all work. Turning the sandbox back
+	     on would need com.apple.security.device.serial for the last of those.
+	     Self-distributed, not App Store. -->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
 	<key>com.apple.security.files.user-selected.read-only</key>

@@ -6,7 +6,9 @@
 	     picker, this app reads a hex file named on the command line and
 	     auto-loads the "<name>_sym.json" sitting beside a loaded hex file;
 	     a sandboxed app only gets access to the exact file the user picked,
-	     so both of those would fail. Self-distributed, not App Store. -->
+	     so both of those would fail. The SCI tab's host serial bridge also
+	     opens /dev/cu.* directly, which under the sandbox would need
+	     com.apple.security.device.serial. Self-distributed, not App Store. -->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
 	<key>com.apple.security.cs.allow-jit</key>

@@ -39,6 +39,7 @@ dependencies:
   # surfaces both local storage and cloud providers such as Google Drive.
   # v11+ uses static methods: FilePicker.pickFiles(...).
   file_picker: ^11.0.2
+  flutter_libserialport: ^0.6.0
 
 dev_dependencies:
   flutter_test:

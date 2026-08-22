@@ -1,0 +1,64 @@
+platform :osx, '12.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'ephemeral', 'Flutter-Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure \"flutter pub get\" is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Flutter-Generated.xcconfig, then run \"flutter pub get\""
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_macos_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_macos_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_macos_build_settings(target)
+
+    # libserialport is vendored C from upstream (sigrok) and builds with a
+    # dozen warnings that are not ours to fix and that we would only have to
+    # re-suppress every time the pod is regenerated:
+    #
+    #   * shorten-64-to-32   -- its API returns int where the POSIX calls it
+    #                           wraps return ssize_t/size_t
+    #   * macro-redefined    -- it has a DEBUG(msg) macro, and Flutter's Debug
+    #                           configuration already defines DEBUG=1
+    #   * deprecated-decls   -- kIOMasterPortDefault, renamed in macOS 12
+    #
+    # Silenced for this pod alone, so warnings in our own code and in every
+    # other pod still show.
+    next unless target.name == 'libserialport'
+    target.build_configurations.each do |config|
+      config.build_settings['WARNING_CFLAGS'] = [
+        '$(inherited)',
+        '-Wno-shorten-64-to-32',
+        '-Wno-macro-redefined',
+        '-Wno-deprecated-declarations',
+      ]
+    end
+  end
+end

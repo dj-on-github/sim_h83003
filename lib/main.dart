@@ -21,6 +21,8 @@ import 'hex_files.dart';
 import 'itu.dart';
 import 'lcd.dart';
 import 'sci.dart';
+import 'sci_bridge.dart';
+import 'serial_link.dart';
 import 'sparse_memory.dart';
 import 'symbols.dart';
 // Re-exported so existing importers of main.dart keep working.
@@ -249,6 +251,31 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _profKey = GlobalKey();
   final GlobalKey _flashKey = GlobalKey();
 
+  /// SCI tab, host serial bridge. One simulated channel can be joined to a
+  /// real port on this machine, so the software that talks to a Bernina can
+  /// talk to the simulation instead.
+  final SerialLink _serial = SerialLink();
+  List<String> _serialPorts = const [];
+  String? _serialPortName;
+  int _serialChannelIndex = 1; // SCI1 is the machine's PC port
+  bool _serialOn = false;
+  String _serialStatus = '';
+
+  /// Bytes the simulation has transmitted, waiting to go out on the wire.
+  /// Collected as they leave the shift register and flushed once a frame,
+  /// so a burst costs one write rather than one per byte.
+  final List<int> _serialOut = [];
+
+  /// The system clock the SCI's divisors are measured against. The machine's
+  /// own crystal is not recorded anywhere in the dump, but the boot ROM's
+  /// default divisor of H'11 gives exactly 19200 baud at 11.0592 MHz -- a
+  /// stock UART crystal -- and nothing else nearby lands on a standard rate.
+  /// Editable, because that is a deduction rather than a measurement.
+  static const int _defaultPhiHz = 11059200;
+  int _serialPhiHz = _defaultPhiHz;
+  final TextEditingController _serialPhiCtl =
+      TextEditingController(text: '$_defaultPhiHz');
+
   /// Flash tab. With the model off nothing is attached and every address
   /// behaves as ordinary RAM, which is how the simulator has always worked.
   /// With it on, the two devices answer the JEDEC command sequences and
@@ -283,6 +310,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   void initState() {
     super.initState();
     _tab = TabController(length: 10, vsync: this);
+    _serialPorts = SerialLink.availablePorts();
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -329,6 +357,7 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   @override
   void dispose() {
+    _detachSerial();
     _runTimer?.cancel();
     _tab.dispose();
     _memScroll.removeListener(_onMemScroll);
@@ -516,6 +545,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     _effHz = 0;
     setState(() {
       _runTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+        _pumpSerial();
         final targetHz = widget.settings.cpuHz; // 0 == max speed
         const budgetUs = 10000; // up to ~10ms of CPU work per 16ms frame
         final tickStartUs = wall.elapsedMicroseconds;
@@ -560,6 +590,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             }
           }
         }
+        _pumpSerial(); // and again, so this frame's output leaves now
         final stopping = (cpu.halted && !cpu.sleeping) || paused;
         // Repaint the screen every tick so it animates smoothly. This drives
         // only the Screen pane, not the heavy memory/disassembly views.
@@ -578,6 +609,81 @@ class _SimulatorPageState extends State<SimulatorPage>
         }
       });
     });
+  }
+
+  /// The channel the host port is joined to.
+  SciChannel get _bridged => cpu.sci[_serialChannelIndex];
+
+  /// What the simulation has currently programmed the channel to, in baud.
+  int get _bridgedBaud => sciBaudAt(_bridged, _serialPhiHz);
+
+  /// Moves bytes between the simulated channel and the host port, once a
+  /// frame. Also follows the bit rate: the download protocol changes it
+  /// mid-conversation, and the far end has already followed, so the host
+  /// port has to as well or the link turns to noise.
+  void _pumpSerial() {
+    if (!_serialOn) return;
+    pumpSciBridge(
+      channel: _bridged,
+      outgoing: _serialOut,
+      phiHz: _serialPhiHz,
+      setBaud: _serial.setBaud,
+      drain: _serial.drain,
+      send: _serial.send,
+    );
+  }
+
+  void _refreshSerialPorts() {
+    setState(() {
+      _serialPorts = SerialLink.availablePorts();
+      if (_serialPortName != null && !_serialPorts.contains(_serialPortName)) {
+        _serialPortName = null;
+      }
+    });
+  }
+
+  void _setSerialOn(bool on) {
+    if (!on) {
+      _detachSerial();
+      setState(() => _serialStatus = 'Bridge off.');
+      return;
+    }
+
+    final port = _serialPortName;
+    if (port == null) {
+      setState(() => _serialStatus = 'Choose a serial port first.');
+      return;
+    }
+
+    final baud = _bridgedBaud;
+    if (baud <= 0) {
+      setState(() => _serialStatus =
+          'The channel has no usable bit rate yet — run the machine until it '
+          'has set up its SCI.');
+      return;
+    }
+
+    final error = _serial.open(port, baud);
+    if (error != null) {
+      setState(() => _serialStatus = error);
+      return;
+    }
+
+    _serialOut.clear();
+    _bridged.onTransmit = _serialOut.add;
+    setState(() {
+      _serialOn = true;
+      _serialStatus = 'Bridged ${_bridged.name} to $port at $baud baud.';
+    });
+  }
+
+  void _detachSerial() {
+    for (final c in cpu.sci) {
+      c.onTransmit = null;
+    }
+    _serialOut.clear();
+    _serial.close();
+    _serialOn = false;
   }
 
   void _pause() {
@@ -2761,12 +2867,145 @@ class _SimulatorPageState extends State<SimulatorPage>
               ]),
               const SizedBox(height: 14),
               _sciTransmitted(ch),
+              const SizedBox(height: 18),
+              _sciHostPort(),
             ],
           ),
         ),
       ],
     );
   }
+
+  /// Bridge to a real serial port on this machine. Sits at the bottom of the
+  /// SCI tab because it belongs to the channel above it rather than to the
+  /// machine as a whole.
+  Widget _sciHostPort() {
+    final baud = _bridgedBaud;
+    final label = TextStyle(fontFamily: _font, color: _ink);
+    final dim = TextStyle(fontFamily: _font, color: _inkA(0.7));
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: _inkA(0.25)),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('HOST SERIAL PORT', style: label),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SizedBox(
+                width: 300,
+                child: DropdownButtonFormField<String>(
+                  key: const Key('serialPortDropdown'),
+                  initialValue: _serialPortName,
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    labelText: 'Port',
+                  ),
+                  items: [
+                    for (final p in _serialPorts)
+                      DropdownMenuItem(
+                        value: p,
+                        child: Text(SerialLink.describe(p),
+                            overflow: TextOverflow.ellipsis, style: dim),
+                      ),
+                  ],
+                  onChanged: _serialOn
+                      ? null
+                      : (v) => setState(() => _serialPortName = v),
+                ),
+              ),
+              OutlinedButton(
+                key: const Key('serialRefreshButton'),
+                onPressed: _serialOn ? null : _refreshSerialPorts,
+                child: const Text('Refresh'),
+              ),
+              SizedBox(
+                width: 130,
+                child: DropdownButtonFormField<int>(
+                  key: const Key('serialChannelDropdown'),
+                  initialValue: _serialChannelIndex,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    labelText: 'Channel',
+                  ),
+                  items: [
+                    for (var i = 0; i < cpu.sci.length; i++)
+                      DropdownMenuItem(
+                          value: i, child: Text(cpu.sci[i].name, style: dim)),
+                  ],
+                  onChanged: _serialOn
+                      ? null
+                      : (v) =>
+                          setState(() => _serialChannelIndex = v ?? 1),
+                ),
+              ),
+              SizedBox(
+                width: 150,
+                child: TextField(
+                  key: const Key('serialPhiField'),
+                  controller: _serialPhiCtl,
+                  style: dim,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    labelText: 'Clock φ (Hz)',
+                  ),
+                  onChanged: (t) {
+                    final v = int.tryParse(t.trim());
+                    if (v != null && v > 0) setState(() => _serialPhiHz = v);
+                  },
+                ),
+              ),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                Switch(
+                  key: const Key('serialEnableSwitch'),
+                  value: _serialOn,
+                  onChanged: _setSerialOn,
+                ),
+                Text('Bridge', style: label),
+              ]),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'The channel is set to '
+            '${baud > 0 ? "$baud baud" : "no usable rate yet"} '
+            '(BRR H\'${_hex2b(_bridged.brr)}, CKS ${_bridged.smr & SciMode.cks}'
+            ' at $_serialPhiHz Hz). The host port follows this while the '
+            'bridge is on, so a protocol that changes rate mid-conversation '
+            'keeps working.',
+            style: dim,
+          ),
+          if (_serialStatus.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(_serialStatus, style: label),
+          ],
+          if (_serialOn) ...[
+            const SizedBox(height: 6),
+            Text(
+              'in ${_serial.bytesIn}  out ${_serial.bytesOut}'
+              '${_serial.lastError != null ? "   ${_serial.lastError}" : ""}',
+              style: dim,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  static String _hex2b(int v) =>
+      (v & 0xFF).toRadixString(16).toUpperCase().padLeft(2, '0');
 
   Widget _sciHeader() {
     return Container(
@@ -2947,11 +3186,17 @@ class _SimulatorPageState extends State<SimulatorPage>
             const Text('Transmitted',
                 style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
             const SizedBox(width: 8),
-            Text(
-              ch.txCount == log.length
-                  ? '${ch.txCount} bytes'
-                  : '${ch.txCount} bytes (showing the last ${log.length})',
-              style: TextStyle(fontSize: 11, color: _inkA(0.55)),
+            // Flexible, not fixed: in the side-by-side layout this pane can
+            // be narrow enough that the count and the button together do not
+            // fit, and an unbounded Text overflows the row.
+            Flexible(
+              child: Text(
+                ch.txCount == log.length
+                    ? '${ch.txCount} bytes'
+                    : '${ch.txCount} bytes (showing the last ${log.length})',
+                style: TextStyle(fontSize: 11, color: _inkA(0.55)),
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
             const Spacer(),
             TextButton.icon(

@@ -95,6 +95,11 @@ class SciChannel {
   /// Bytes the firmware has transmitted, oldest first.
   final List<int> txLog = [];
 
+  /// Called with each byte as it leaves the transmitter, when set. This is
+  /// how the channel is bridged to a real serial port; the model itself has
+  /// no idea whether anything is listening.
+  void Function(int byte)? onTransmit;
+
   /// How many transmitted bytes to keep for display.
   static const int txLogLimit = 8192;
 
@@ -226,6 +231,7 @@ class SciChannel {
       txLog.add(tdr & 0xFF);
       txCount++;
       if (txLog.length > txLogLimit) txLog.removeAt(0);
+      onTransmit?.call(tdr & 0xFF);
       ssr |= SciStatus.tdre; // TDR free for the next byte
       ssr &= ~SciStatus.tend; // transmission in progress
       _tsrBusy = true;
