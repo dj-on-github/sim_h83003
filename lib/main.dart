@@ -15,6 +15,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dmac.dart';
+import 'emb_relay.dart';
+import 'emb_server.dart';
 import 'flash.dart';
 import 'h8300h.dart';
 import 'hex_files.dart';
@@ -256,6 +258,11 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// talk to the simulation instead.
   final SerialLink _serial = SerialLink();
   List<String> _serialPorts = const [];
+
+  /// Port names to the labels shown in the menu, worked out when the list is
+  /// refreshed. Never during a build: each lookup allocates and frees a
+  /// native handle, and the menu rebuilds every frame.
+  Map<String, String> _serialPortLabels = const {};
   String? _serialPortName;
   int _serialChannelIndex = 1; // SCI1 is the machine's PC port
   bool _serialOn = false;
@@ -266,15 +273,32 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// so a burst costs one write rather than one per byte.
   final List<int> _serialOut = [];
 
-  /// The system clock the SCI's divisors are measured against. The machine's
-  /// own crystal is not recorded anywhere in the dump, but the boot ROM's
-  /// default divisor of H'11 gives exactly 19200 baud at 11.0592 MHz -- a
-  /// stock UART crystal -- and nothing else nearby lands on a standard rate.
-  /// Editable, because that is a deduction rather than a measurement.
+  /// The system clock the SCI's divisors are measured against.
+  ///
+  /// The machine's crystal is not recorded anywhere in the dump, but two
+  /// divisors pin it down: the boot ROM's default of H'11 gives exactly 19200
+  /// baud at 11.0592 MHz, and the H'05 that the download protocol switches to
+  /// gives exactly 57600 at the same clock. EMB-Serial, written from captures
+  /// of a real machine, uses those two rates for those two divisors, which
+  /// makes this a corroborated figure rather than a guess. Still editable.
   static const int _defaultPhiHz = 11059200;
   int _serialPhiHz = _defaultPhiHz;
   final TextEditingController _serialPhiCtl =
       TextEditingController(text: '$_defaultPhiHz');
+
+  /// SCI tab, Embroidery Relay. Stands up the TCP protocol that
+  /// EmbroideryCommunicator speaks and turns each request into the machine's
+  /// character-at-a-time serial protocol, on the same channel the host-port
+  /// bridge would use.
+  EmbServer? _embServer;
+  SciEmbLink? _embLink;
+  EmbSerialStack? _embStack;
+  EmbRelay? _embRelay;
+  bool _netOn = false;
+  String _netStatus = '';
+  static const int _defaultRelayPort = 8888;
+  final TextEditingController _netPortCtl =
+      TextEditingController(text: '$_defaultRelayPort');
 
   /// Flash tab. With the model off nothing is attached and every address
   /// behaves as ordinary RAM, which is how the simulator has always worked.
@@ -306,11 +330,17 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   static const Color _accentFixed = Color(0xFF2A7FFF);
 
+  /// For notes the user needs to act on, readable on either background.
+  Color get _warn => Theme.of(context).brightness == Brightness.dark
+      ? const Color(0xFFFFB74D)
+      : const Color(0xFFB45309);
+
   @override
   void initState() {
     super.initState();
     _tab = TabController(length: 10, vsync: this);
     _serialPorts = SerialLink.availablePorts();
+    _serialPortLabels = SerialLink.describePorts(_serialPorts);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
     _memScroll.addListener(_onMemScroll);
@@ -358,6 +388,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void dispose() {
     _detachSerial();
+    unawaited(_detachNetwork());
     _runTimer?.cancel();
     _tab.dispose();
     _memScroll.removeListener(_onMemScroll);
@@ -634,9 +665,12 @@ class _SimulatorPageState extends State<SimulatorPage>
   }
 
   void _refreshSerialPorts() {
+    final ports = SerialLink.availablePorts();
+    final labels = SerialLink.describePorts(ports);
     setState(() {
-      _serialPorts = SerialLink.availablePorts();
-      if (_serialPortName != null && !_serialPorts.contains(_serialPortName)) {
+      _serialPorts = ports;
+      _serialPortLabels = labels;
+      if (_serialPortName != null && !ports.contains(_serialPortName)) {
         _serialPortName = null;
       }
     });
@@ -668,6 +702,8 @@ class _SimulatorPageState extends State<SimulatorPage>
       setState(() => _serialStatus = error);
       return;
     }
+    // Both want the channel's transmit hook; only one can have it.
+    if (_netOn) unawaited(_detachNetwork());
 
     _serialOut.clear();
     _bridged.onTransmit = _serialOut.add;
@@ -675,6 +711,69 @@ class _SimulatorPageState extends State<SimulatorPage>
       _serialOn = true;
       _serialStatus = 'Bridged ${_bridged.name} to $port at $baud baud.';
     });
+  }
+
+  /// Starts or stops the relay.
+  ///
+  /// The relay and the host-port bridge both take over the channel's
+  /// transmit hook, so only one of them can be running; turning this on
+  /// turns that off.
+  Future<void> _setNetworkOn(bool on) async {
+    if (!on) {
+      await _detachNetwork();
+      setState(() => _netStatus = 'Relay stopped.');
+      return;
+    }
+
+    final port = int.tryParse(_netPortCtl.text.trim());
+    if (port == null || port < 1 || port > 65535) {
+      setState(() => _netStatus = 'That is not a usable port number.');
+      return;
+    }
+
+    if (_serialOn) _detachSerial();
+
+    final link = SciEmbLink(_bridged);
+    final stack = EmbSerialStack(link);
+    final relay =
+        EmbRelay(stack, describeLink: () => 'simulated ${_bridged.name}');
+    final server = EmbServer(relay: relay)
+      ..onChanged = () {
+        if (mounted) setState(() {});
+      };
+
+    final error = await server.start(port);
+    if (error != null) {
+      link.dispose();
+      await stack.dispose();
+      setState(() => _netStatus = error);
+      return;
+    }
+
+    _embLink = link;
+    _embStack = stack;
+    _embRelay = relay;
+    _embServer = server;
+    setState(() {
+      _netOn = true;
+      _serialOn = false;
+      _netStatus = 'Listening on 127.0.0.1:${server.port}, '
+          'bridged to ${_bridged.name}.';
+    });
+  }
+
+  Future<void> _detachNetwork() async {
+    final server = _embServer;
+    final link = _embLink;
+    final stack = _embStack;
+    _embServer = null;
+    _embLink = null;
+    _embStack = null;
+    _embRelay = null;
+    _netOn = false;
+    await server?.stop();
+    link?.dispose();
+    await stack?.dispose();
   }
 
   void _detachSerial() {
@@ -2869,6 +2968,8 @@ class _SimulatorPageState extends State<SimulatorPage>
               _sciTransmitted(ch),
               const SizedBox(height: 18),
               _sciHostPort(),
+              const SizedBox(height: 12),
+              _sciNetworkRelay(),
             ],
           ),
         ),
@@ -2915,7 +3016,7 @@ class _SimulatorPageState extends State<SimulatorPage>
                     for (final p in _serialPorts)
                       DropdownMenuItem(
                         value: p,
-                        child: Text(SerialLink.describe(p),
+                        child: Text(_serialPortLabels[p] ?? p,
                             overflow: TextOverflow.ellipsis, style: dim),
                       ),
                   ],
@@ -3006,6 +3107,94 @@ class _SimulatorPageState extends State<SimulatorPage>
 
   static String _hex2b(int v) =>
       (v & 0xFF).toRadixString(16).toUpperCase().padLeft(2, '0');
+
+  /// The Embroidery Relay listener. Below the host-port section because it is
+  /// the other way of reaching the same channel: one puts the machine on a
+  /// real wire, the other puts it on a socket.
+  Widget _sciNetworkRelay() {
+    final server = _embServer;
+    final label = TextStyle(fontFamily: _font, color: _ink);
+    final dim = TextStyle(fontFamily: _font, color: _inkA(0.7));
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: _inkA(0.25)),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('NETWORK CONNECTION', style: label),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SizedBox(
+                width: 130,
+                child: TextField(
+                  key: const Key('relayPortField'),
+                  controller: _netPortCtl,
+                  enabled: !_netOn,
+                  style: dim,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    labelText: 'TCP port',
+                  ),
+                ),
+              ),
+              FilledButton(
+                key: const Key('relayEnableButton'),
+                onPressed: () => _setNetworkOn(!_netOn),
+                child: Text(_netOn ? 'Stop relay' : 'Start relay'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Speaks the Embroidery Relay TCP protocol, so EmbroideryCommunicator '
+            'can drive the simulated machine as if it were a real one. Each '
+            'request becomes the character-at-a-time serial exchange on '
+            '${_bridged.name}, which is why the machine has to be running for '
+            'the relay to answer.',
+            style: dim,
+          ),
+          if (_netStatus.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(_netStatus, style: label),
+          ],
+          if (_netOn && server != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              server.client == null
+                  ? 'No client connected.  ${server.requestsHandled} requests '
+                      'handled.'
+                  : 'Client ${server.client}.  ${server.requestsHandled} '
+                      'requests handled.'
+                      '${_embRelay?.lastRequest.isNotEmpty == true ? "  Last: ${_embRelay!.lastRequest}" : ""}'
+                      '${_embStack?.lastCommand.isNotEmpty == true ? " -> ${_embStack!.lastCommand}" : ""}',
+              style: dim,
+            ),
+            if (!_running) ...[
+              const SizedBox(height: 6),
+              Text(
+                'The machine is paused, so the relay cannot get an answer out '
+                'of it. Press Run.',
+                style: TextStyle(fontFamily: _font, color: _warn),
+              ),
+            ],
+            if (server.lastError != null) ...[
+              const SizedBox(height: 6),
+              Text(server.lastError!, style: dim),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
 
   Widget _sciHeader() {
     return Container(

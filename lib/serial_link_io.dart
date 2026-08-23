@@ -35,16 +35,25 @@ class SerialLink {
     }
   }
 
-  /// A human-readable name for the port, falling back to the device name.
-  static String describe(String port) {
-    try {
-      final p = SerialPort(port);
-      final d = p.description;
-      p.dispose();
-      return (d == null || d.isEmpty) ? port : '$port  ($d)';
-    } catch (_) {
-      return port;
+  /// Human-readable names for [ports], worked out once.
+  ///
+  /// Each lookup allocates and frees a native port structure, so this must
+  /// not be called from a widget build: the menu is rebuilt every frame and
+  /// that would churn native handles continuously, next to a reader isolate
+  /// holding a pointer into the same library.
+  static Map<String, String> describePorts(List<String> ports) {
+    final out = <String, String>{};
+    for (final name in ports) {
+      try {
+        final p = SerialPort(name);
+        final d = p.description;
+        p.dispose();
+        out[name] = (d == null || d.isEmpty) ? name : '$name  ($d)';
+      } catch (_) {
+        out[name] = name;
+      }
     }
+    return out;
   }
 
   bool get isOpen => _port != null;
@@ -67,14 +76,16 @@ class SerialLink {
       }
 
       // 8N1, no flow control: what the machine's SCI is set to.
-      final cfg = SerialPortConfig()
+      //
+      // Assigning to `config` hands the object to the port, which stores it
+      // and frees it in dispose(). Disposing it here as well is a double
+      // free -- that is what the crash on Linux was.
+      p.config = SerialPortConfig()
         ..baudRate = rate
         ..bits = 8
         ..parity = SerialPortParity.none
         ..stopBits = 1
         ..setFlowControl(SerialPortFlowControl.none);
-      p.config = cfg;
-      cfg.dispose();
 
       _port = p;
       _portName = port;
@@ -82,7 +93,11 @@ class SerialLink {
       _bytesIn = 0;
       _bytesOut = 0;
 
-      _reader = SerialPortReader(p);
+      // A short poll interval so the reader isolate returns to Dart often.
+      // It blocks in a native wait for this long at a time, and a kill only
+      // takes effect once it is back in Dart, so this bounds how long the
+      // port has to stay alive after close().
+      _reader = SerialPortReader(p, timeout: _readerPollMs);
       _sub = _reader!.stream.listen(
         (data) {
           _received.addAll(data);
@@ -104,10 +119,12 @@ class SerialLink {
     final p = _port;
     if (p == null || rate <= 0 || rate == _baud) return;
     try {
+      // The getter hands back the port's own config rather than a copy, so
+      // this edits it in place and hands the same object back. Nothing is
+      // disposed: the port owns it.
       final cfg = p.config;
       cfg.baudRate = rate;
       p.config = cfg;
-      cfg.dispose();
       _baud = rate;
     } catch (e) {
       _lastError = '$e';
@@ -133,21 +150,48 @@ class SerialLink {
     return out;
   }
 
+  /// How long the reader blocks in one native wait, and how long the port is
+  /// kept alive after closing so that the reader is certainly out of it.
+  static const int _readerPollMs = 50;
+  static const Duration _readerShutdown = Duration(milliseconds: 250);
+
+  /// Closes the link. The port stops being usable immediately; freeing it
+  /// happens a moment later.
+  ///
+  /// The reader runs a blocking read on its own isolate, holding a raw
+  /// pointer to the port. Killing an isolate is not immediate -- and it is
+  /// not even attempted until the spawn has completed, so a close that
+  /// follows an open closely may not kill it at all. Freeing the port while
+  /// that is still going reads through a dangling pointer, which is what was
+  /// crashing after a connection. So the handles are detached now and freed
+  /// after the reader has certainly stopped.
   void close() {
-    try {
-      _sub?.cancel();
-      _reader?.close();
-      _port?.close();
-      _port?.dispose();
-    } catch (_) {
-      // Closing a port that has already gone (an unplugged adapter) throws;
-      // there is nothing useful to do about it.
-    }
-    _sub = null;
-    _reader = null;
+    final port = _port;
+    final reader = _reader;
+    final sub = _sub;
+
     _port = null;
+    _reader = null;
+    _sub = null;
     _portName = null;
     _baud = 0;
     _received.clear();
+
+    if (port == null) return;
+    unawaited(_release(port, reader, sub));
+  }
+
+  static Future<void> _release(SerialPort port, SerialPortReader? reader,
+      StreamSubscription<Uint8List>? sub) async {
+    try {
+      await sub?.cancel(); // cancelling is what kills the reader isolate
+      reader?.close();
+      await Future<void>.delayed(_readerShutdown);
+      port.close();
+      port.dispose();
+    } catch (_) {
+      // An adapter unplugged mid-conversation makes all of these throw, and
+      // there is nothing useful to do about it.
+    }
   }
 }

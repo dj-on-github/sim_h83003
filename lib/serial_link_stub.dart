@@ -5,7 +5,8 @@
 
 class SerialLink {
   static List<String> availablePorts() => const [];
-  static String describe(String port) => port;
+  static Map<String, String> describePorts(List<String> ports) =>
+      {for (final p in ports) p: p};
 
   bool get isOpen => false;
   String? get portName => null;

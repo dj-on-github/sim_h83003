@@ -11,7 +11,8 @@ void main(List<String> args) {
     print('no serial ports');
     return;
   }
+  final labels = SerialLink.describePorts(ports);
   for (final p in ports) {
-    print('  ${SerialLink.describe(p)}');
+    print('  ${labels[p] ?? p}');
   }
 }

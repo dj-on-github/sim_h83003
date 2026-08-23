@@ -5,6 +5,9 @@
 // so that it can be tested without a serial port: everything that touches
 // real hardware is passed in as a callback.
 
+import 'dart:async';
+
+import 'emb_relay.dart';
 import 'sci.dart';
 
 /// The bit rate [channel] is currently programmed to, at a system clock of
@@ -46,5 +49,37 @@ void pumpSciBridge({
   if (outgoing.isNotEmpty) {
     send(List<int>.from(outgoing));
     outgoing.clear();
+  }
+}
+
+
+/// An [EmbLink] over a simulated SCI channel.
+///
+/// Writing queues bytes into the channel's receiver, which delivers them at
+/// the rate the firmware has programmed rather than all at once; reading
+/// picks them off the transmitter as they are shifted out. The relay's awaits
+/// are satisfied as the CPU runs, so this needs no pumping of its own — but
+/// it does need the CPU to be running, and a paused machine will simply time
+/// the relay out.
+class SciEmbLink implements EmbLink {
+  SciEmbLink(this.channel) {
+    channel.onTransmit = _out.add;
+  }
+
+  final SciChannel channel;
+  final StreamController<int> _out = StreamController<int>.broadcast();
+
+  @override
+  void write(List<int> data) => channel.receive(data);
+
+  @override
+  Stream<int> get received => _out.stream;
+
+  /// Detaches from the channel. The transmit hook is only cleared if it is
+  /// still ours, so a link that has already been replaced does not unhook
+  /// whatever replaced it.
+  void dispose() {
+    if (channel.onTransmit == _out.add) channel.onTransmit = null;
+    _out.close();
   }
 }
