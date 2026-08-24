@@ -23,7 +23,74 @@ typedef unsigned long  u32;
 #define BRCR   REG8(0xFFFFF3UL)   /* bus release */
 
 /* I/O ports */
+/* A/D converter. The result registers are ten bits in a pair, but every
+ * reading here is taken from the high byte alone. */
+#define ADDRAH REG8(0xFFFFE0UL)
+#define ADDRBH REG8(0xFFFFE2UL)
+#define ADDRCH REG8(0xFFFFE4UL)
+#define ADDRDH REG8(0xFFFFE6UL)
+#define ADCSR  REG8(0xFFFFE8UL)
+#define ADCSR_ADF   0x80   /* conversion finished */
+#define ADCSR_START 0x28   /* ADST | SCAN */
+
+#define P4DDR  REG8(0xFFFFC5UL)
+#define P4DR   REG8(0xFFFFC7UL)
+#define P4PCR  REG8(0xFFFFDAUL)   /* input pull-up control */
+#define P5DDR  REG8(0xFFFFC8UL)
+#define P6DDR  REG8(0xFFFFC9UL)
+#define P5DR   REG8(0xFFFFCAUL)
+#define P6DR   REG8(0xFFFFCBUL)
 #define P8DDR  REG8(0xFFFFCDUL)
+#define P8DR   REG8(0xFFFFCFUL)
+#define P9DDR  REG8(0xFFFFD0UL)
+#define P9DR   REG8(0xFFFFD2UL)
+#define PBDDR  REG8(0xFFFFD4UL)
+#define PBDR   REG8(0xFFFFD6UL)
+#define PCDDR  REG8(0xFFFFD5UL)
+#define PCDR   REG8(0xFFFFD7UL)
+
+/* Integrated timer unit. Three of its five channels are used. */
+#define TSTR   REG8(0xFFFF60UL)
+#define TSNC   REG8(0xFFFF61UL)
+#define TMDR   REG8(0xFFFF62UL)
+#define TCR0   REG8(0xFFFF64UL)
+#define TIOR0  REG8(0xFFFF65UL)
+#define TIER0  REG8(0xFFFF66UL)
+#define TCNT0  REG16(0xFFFF68UL)
+#define GRA0   REG16(0xFFFF6AUL)
+#define GRB0   REG16(0xFFFF6CUL)
+#define TCR1   REG8(0xFFFF6EUL)
+#define TIOR1  REG8(0xFFFF6FUL)
+#define TIER1  REG8(0xFFFF70UL)
+#define TCNT1  REG16(0xFFFF72UL)
+#define GRA1   REG16(0xFFFF74UL)
+#define GRB1   REG16(0xFFFF76UL)
+#define TCR2   REG8(0xFFFF78UL)
+#define TIOR2  REG8(0xFFFF79UL)
+#define TIER2  REG8(0xFFFF7AUL)
+#define TCNT2  REG16(0xFFFF7CUL)
+#define GRA2   REG16(0xFFFF7EUL)
+#define GRB2   REG16(0xFFFF80UL)
+#define TFCR   REG8(0xFFFF63UL)
+#define TOER   REG8(0xFFFF90UL)
+#define TCR4   REG8(0xFFFF92UL)
+#define TIOR4  REG8(0xFFFF93UL)
+#define TIER4  REG8(0xFFFF94UL)
+#define TCNT4  REG16(0xFFFF96UL)
+#define GRA4   REG16(0xFFFF98UL)
+#define GRB4   REG16(0xFFFF9AUL)
+
+/* Programmable timing pattern controller: the port A and port B pins it
+ * drives are the stepper motor phases. */
+#define TPMR   REG8(0xFFFFA0UL)
+#define TPCR   REG8(0xFFFFA1UL)
+#define NDERB  REG8(0xFFFFA2UL)
+#define NDERA  REG8(0xFFFFA3UL)
+#define NDRB   REG8(0xFFFFA4UL)
+#define NDRA   REG8(0xFFFFA5UL)
+
+#define PADDR  REG8(0xFFFFD1UL)
+#define PADR   REG8(0xFFFFD3UL)
 
 /* Serial channel 0 */
 #define SMR0   REG8(0xFFFFB0UL)
