@@ -107,7 +107,14 @@ tables.
 ~47,000 instructions, more than twice parts 1–7 together. The hit-box table
 and the five routines with the highest fan-in in it -- the button layer, the
 list filler and the two hit tests -- are written and checked. 327 routines
-remain. **1,255 cases pass over 347 routines.**
+remain, the action dispatcher -- what a press does -- is written, and so are
+the two bars every screen draws. **1,465 cases pass over 350 routines**, with
+321 routines still behind the dispatcher.
+
+**Part 9, the harness — done.** The suite went from twenty-five minutes to
+under five seconds: the memory keeps an undo log instead of the comparer
+copying four megabytes a run, and each image is booted once and lent to case
+after case instead of twice per case. **1,477 cases pass over 354 routines.**
 
 Nothing draws yet: the last call in the bring-up, `sub_2105C4`, is still a
 stub, and that is the one that reaches the LCD.
@@ -1597,6 +1604,339 @@ built out of the five routines above, so the individual screens should be
 much smaller than their count suggests -- but there are seventy-nine of them
 and the action dispatcher, `H'21548A`, is another seventy-way table of its
 own. It is the one stub inside this part.
+
+## Part 8c, the action dispatcher
+
+`H'21548A` is what a press actually *does*, and the answer is a surprise:
+nothing. Every press that reaches it ends up choosing one help record and
+leaving H'115D12 pointing at it, and the message screen draws it. No setting
+is changed and no motor moves. The machine's controls are elsewhere; this is
+the help system.
+
+### Four dispatches to reach a number
+
+The routine is 137 leaf addresses and about 4,300 bytes of ROM, and almost
+all of it is table:
+
+| | |
+| --- | --- |
+| `H'215516` | 70 entries, on the screen being left (`H'11A16D`) -- 11 distinct handlers |
+| `H'2156CE` | 130 entries, on the value the box carried -- 42 distinct, and 20 screens share it |
+| `H'21608C`, `H'2161DA`, `H'2163E2` | three screens with a table of their own |
+| `H'2166F2` / `H'21675A` | 54 kinds of pattern, keys and handlers, the handlers reversed |
+| `H'216CCE` | 11 pattern categories, the fallback for a kind that is not listed |
+
+Every leaf is four instructions: load the table base at `H'11B29E`, index it
+by a fixed offset, store the pointer, branch out. They are table entries, not
+routines, so what is written here is the offsets -- one number where the ROM
+spends four instructions and a jump-table slot. The addresses are all listed
+in a comment above the tables so a reader can still find any of them.
+
+Six of the 137 are not that shape, and each is one test: four choose between
+two records on whether the embroidery module is fitted (`H'57FF80`), one on
+whether the screen is `H'35`, and one is the "no record" exit.
+
+**The other half.** A press on the *second* box of a pair takes a different
+route entirely: not the value, but what kind of pattern the value names.
+Field `H'14` of the descriptor is searched against the 54 keys, and field
+`H'17` -- the category -- is the fallback. Three screens short-circuit it and
+one of them, `H'41`, also raises `H'11B0A9` on the way past.
+
+### The cases had to be rebuilt once
+
+The first set of 87 cases put the screen number in `H'11A16D` and pressed.
+All 87 passed, and then nine of ten planted errors went unnoticed -- which is
+the only reason the mistake came out. `screen_action` *starts* by calling
+`screen_remember(4)`, which copies `H'11A169` into `H'11A16D`, so every case
+was dispatching on the same screen and the tables were never read. Setting
+`H'11A169` instead, and adding one case per distinct table entry rather than
+per screen, took it to 176 cases -- and all ten errors are caught.
+
+Two boot-state differences had to be pinned down as well before the cases
+would agree: `H'11B0A8`, which `screen_switch` clears, and the pair
+`H'FFFEE0`/`H'11A1BA`, whose comparison decides whether leaving a screen puts
+the old one aside.
+
+**1,431 cases pass over 348 routines**, and the last two stubs are the screen
+dispatcher itself and the embroidery module's state machine.
+
+## Part 8d, the two bars
+
+`H'20FA18` and `H'20FF7A`: the stitch-width bar down the right-hand edge of
+the screen and the stitch-length bar across the top. Twenty callers each --
+every screen that lets either be changed draws them.
+
+They are drawn **incrementally**, which is why each keeps five words of its
+own state: the value it was last drawn at, where that put the end of it, the
+limit the mark was last drawn at, whether the mark was drawn, and where the
+mark is. A call that is not a fresh redraw paints only the strip between the
+old end and the new one -- in the bar's colour when it has grown and in
+nothing when it has shrunk.
+
+The scaling is floating point over a range that never leaves a byte, the
+same shape as the speed calculation in part 3q: for the width bar a byte
+times H'1.01 plus a half, subtracted from H'95 because the bar runs upwards;
+for the length bar just plus a half, added to H'D3 because it runs right.
+The limit mark is a second number scaled the same way and drawn as a line
+across the bar, put on and taken off as bit 7 of `H'FFFEE5` changes.
+
+### Where the cases stop, and why
+
+A bar's value is a percentage: the callers pass 0 to 100 and the drawing is
+laid out for that. Feed it H'C8 and the scaled coordinate goes negative, the
+rectangle is drawn from y = -53, and where those writes land depends on
+24-bit address wrap-around that the simulator and the hardware do not have to
+agree about. **That case is not claimed.** The cases run to H'93, which is
+the largest value that still puts the end of the bar on the screen, and the
+boundary at H'64 -- where the bar stops clearing the space above it -- is
+covered from both sides.
+
+### Eight planted errors, six caught, two provably not
+
+Six of eight mutations were caught at once; the seventh needed a case with
+the mark landing exactly on the end of the bar, which was added.
+
+The eighth is **not catchable, and should not be**: changing `>` to `>=` in
+the "has the bar grown or shrunk" test cannot show, because the enclosing
+test is `value != last` and the two differ only when `value == last`. Same
+for the length bar's `<`. Recorded here rather than papered over with a case
+that could not fail either way.
+
+**1,465 cases pass over 350 routines.** 325 routines and about 44,800
+instructions are still behind `H'22382A`.
+
+## Part 9, the harness: 25 minutes to 5 seconds
+
+By the end of part 8 the comparison suite was 1,465 cases and took about
+twenty-five minutes. With three hundred routines still to write, and every
+one of them wanting a run, that had become the thing slowing the work down.
+
+Two changes took it to **4.6 seconds**.
+
+### The memory keeps its own undo log
+
+`RoutineComparer` used to copy every allocated byte before a run and compare
+every allocated byte after it, to find what the routine changed. That is four
+megabytes each way for a routine that usually touches a few dozen bytes --
+and it was done through `peek()`, one call per byte.
+
+`SparseMemory` now takes an optional `undoLog`: a map that records, for every
+byte written, the value it held *first*. What a run changed is then exactly
+that map, filtered to the addresses whose value actually differs at the end.
+It is the same answer, it costs nothing when nothing is written, and an
+address written and then written back still counts as unchanged.
+
+Nested runs chain rather than clobber: a run installs its own log and folds
+it into the caller's on the way out, keeping whichever old value was seen
+first. That is what lets the second change work.
+
+### The machine is booted once, not two thousand times
+
+Every case booted both images 1.9M instructions to reach the same state --
+five and a half billion steps per suite, all of it identical. Now each
+(image, boot step) is booted once and lent to case after case:
+
+* memory goes back from the undo log,
+* everything else -- registers, flags, cycle count, and the SCI, ITU, A/D and
+  DMA models -- goes back from a `saveState()` the machine now offers.
+
+Two details had to be right. The cached state is taken **after** the mask,
+the timer enables and the counters have been dealt with, not before: with the
+timers still running, restoring would leave the counters to jump the moment
+anything read them. And the timer unit's `_lastCycles` is part of its state,
+because the counters advance by the difference between it and the CPU's cycle
+count -- restore one without the other and the next read leaps.
+
+### Proving it
+
+Two switches, both kept:
+
+* `--verify-restore` compares the whole of memory against a copy taken at the
+  boot, after every single case. The full suite passes under it in 34
+  seconds. That is the expensive way, and it is the one that found both
+  details above.
+* `--no-boot-cache` boots afresh for every case, exactly as before.
+
+A warning learned the hard way: `--no-boot-cache` re-reads the image file per
+case, so rebuilding the image while such a run is going produces a run in
+which different cases saw different code. Sixty-three "failures" came from
+exactly that and none of them were real.
+
+**1,477 cases pass over 354 routines**, in 4.6 seconds.
+
+## Part 9b, the item preview
+
+`H'2125B0` and the three routines under it. When the operator moves through a
+list, the item under the cursor is drawn large in a panel at the top of the
+screen, and which of three ways depends on byte H'17 of its descriptor: below
+H'05 or H'10-H'11 one way, H'05 to H'0F another, H'12 and above a third.
+
+Two of the three go through the scratch buffer at `H'0E8010` and copy it out
+**a pixel at a time**, which is how the picture is turned: the source is read
+along one axis and written along the other. A stitch pattern comes out ninety
+degrees round from how it is stored, because it is stored the way it is sewn.
+The third blits straight into the panel, centred on H'9A, H'14 from the width
+and height in the picture's own header.
+
+One case was failing until the font table was left alone: filling it with
+zeroes made every glyph pointer zero, both sides drew from address 0, and the
+result was a thousand bytes of rubbish in a place neither of them should have
+been writing. The boot leaves a real table there; the case now uses it.
+
+## Part 9c, the dispatcher's front half, and the module's slate
+
+Twenty routines, in three groups.
+
+### Six under the picker and the store
+
+`H'24ADF0` is the ROM's `memmove`, and a proper one: when the source lies
+below the destination and the two overlap it copies backwards so the copy
+does not eat its own tail. `H'21F36E` moves a whole screen between the front
+buffer and one of four stores at `H'0ECB10`. `H'248668` waits for the link to
+go quiet, a hundred turns of a delay, and `H'229714` draws the two arrows
+beside the pattern strip -- each one lit or not, and repainted only when it
+changes. `H'21341E` finds the box carrying the current speed, lights it, and
+draws its item in the preview panel.
+
+### Eight that wipe the module's slate
+
+`H'244578` is called from sixteen places, all of them the start of some piece
+of embroidery work, and it is the one routine that puts the module back to a
+known state. Reaching it meant writing the seven routines under it as well.
+
+Two records describe the pattern in the slot named by `H'11A660`: sixteen
+bytes at `H'11A25A` indexed by slot << 4, and eighteen bytes at `H'11A41A`
+indexed by slot * H'12. Both indices are worked out afresh for every single
+field -- fourteen multiplications to write fourteen bytes -- and the
+reconstruction does the same, because doing it once would be a different
+program.
+
+`H'231994` and part of `H'2445F6` write the same stitch defaults, and the
+difference between them is the interesting part: `H'231994` leaves `H'11A263`
+alone and writes `H'11A265` before `H'11A264`. Two versions of the same block
+that drifted apart.
+
+### Seven from the top of the dispatcher
+
+`H'22382A` starts with the pending screen change (`H'2237D0`), the touch
+settling (`H'210E02`), the foot switch (`H'215448`), the key scan
+(`H'21F68C`), and the screen save and restore (`H'21F4C6`), with
+`H'249D6C` and `H'244C62` under them saying whether the module will take an
+order.
+
+The key scan is eighteen bits over four ports tested in a fixed order, the
+first one down named in `H'11B10E` from H'6D up. One key is special: H'75
+starts the module, and when the module is present but busy the key is not
+reported at all -- the scan carries straight on into the last two tests below
+it. The first reading of that had it returning early and leaving `H'11B10E`
+untouched, which is a different thing, and the comparison caught it.
+
+Two more readings were wrong and were caught the same way. `H'244C62` and
+`H'249D6C` looked like they returned whichever byte they found set -- the
+decompiler puts the `r6l = 0` in the wrong arm -- and both actually branch to
+a shared `SUB.B R6L,R6L`. Clean booleans.
+
+### The mutations, and the stale build that hid three of them
+
+Sixty-nine planted errors across the twenty routines. All but six were caught
+straight away, and the six were:
+
+  * `memmove`'s `s <= d` and `s + len >= d` at their exact boundaries. When
+    the source and destination are equal both directions are the identity;
+    when they exactly touch there is no overlap and both are correct. Not
+    detectable by any test, because there is nothing to detect.
+  * `H'248668`'s second mask, `& H'22` against `& H'02`. The H'20 bit it
+    drops is tested on its own two lines later.
+  * `H'248668`'s hundred turns. The routine writes nothing, so only the
+    result is compared, and both counts give the same result.
+  * `H'229714`'s `<` against `<=`, guarded by an equality test above it.
+  * the order of the last three writes in `H'244578`, which the net-write
+    comparison cannot see and which nothing else can either.
+
+Three others *looked* like survivors and were not. `make` compares
+timestamps at one-second resolution, and a mutation written and compiled
+inside the same second as the previous one left the old `app.o` in place, so
+the harness was measuring the wrong binary. Every mutation run now removes
+`app.o` first. That is worth writing down because the failure mode is silent
+and it points the wrong way: a stale build makes a real error look like a
+proven equivalence.
+
+**1,659 cases pass over 374 routines**, in eight seconds.
+
+### Where the dispatcher actually stands
+
+The call graph below `H'22382A` reaches 206 routines. All but three are now
+written. The three are `H'22382A` itself and `H'222AAC` and `H'237E3C`, and
+all three end in a computed jump into a table of *inline* blocks -- the
+screen bodies are not separate routines at all, which is why walking the call
+graph makes the dispatcher look almost finished when it is not. Fifteen of
+the 206 are written but have no head-to-head case yet.
+
+Across the whole application there are 1,388 call targets. 404 are written
+and 374 of those have cases.
+
+## Part 9d, the module key
+
+`H'237E3C` is where a key press goes when the embroidery module is attached,
+and it is the reversed jump table again: twelve key codes at `H'237E7A` --
+H'6D, H'70-H'75, H'77-H'79, H'7D and H'81, exactly the ones `H'21F68C` names
+-- walked forward while the index counts *down* from H'18 in twos, so the
+handler pointers at `H'237E82` are stored back to front.
+
+The handler itself is not written yet: it waits on the module's own state
+machine at `H'235B0E`, which is 145 instructions of its own with an
+eighteen-way jump table under it. Nine routines beneath it are written here:
+
+  * `H'23E45A` -- two instructions, the address of the module's reply buffer
+  * `H'230E6E` and `H'230EA8` -- the first screen store emptied, and the
+    embroidery panel put into it
+  * `H'236E9A` -- the module's cursor rubbed out, a twenty-five pixel box
+    fetched back from the third store
+  * `H'2426F0`, `H'23191C` -- a pattern marked ready, and the module asked to
+    go home
+  * `H'2431C2`, `H'244A2A` -- the end of a talk to the module, and the module
+    started again from nothing
+  * `H'249DE8` -- waiting for the module to name itself
+
+That last one is the nicest find. It reads five bytes from the module's reply
+buffer and compares them against five bytes at `H'200103` -- which is inside
+the *application's own* identity block, the thing the linker script calls
+`appinfo`. The machine checks the module's firmware against its own version
+stamp. The two sides are compared as words with the ROM's byte sign extended
+and the module's not, so an expected byte of H'80 or over could never match;
+none of the five is.
+
+### A failing case that was not a bug
+
+`H'2431C2` parks the machine, and the case for it failed with four hundred
+bytes of difference in the panel drawing area. Following it down: `H'2085B2`
+parks, `H'207988` is a whole sewing pass, and inside that `H'205266` came out
+with H'11A6B6 = H'19 in the rebuild and H'00 in the original.
+
+`H'205266` ends by interpolating through `H'2051AC`, which adds `H'11A6C2` to
+its result. Nothing in the case set `H'11A6C2` -- so each side read whatever
+its own boot had left there, and the two boots do not agree on that byte. The
+reconstruction was right; the case was under-specified. Pinning `H'11A6C2`,
+and merging in the fills that the existing `panel_service` and `sew_service`
+cases use, made all of it pass.
+
+That is worth stating plainly: **a failing comparison is not proof of a wrong
+reconstruction.** It is proof that the two runs differ, and the difference can
+just as easily be an input the case forgot to hold still. The only way to tell
+is to follow it down to the byte, which took five rounds of bisection here.
+
+Two written-but-untested routines picked up real cases out of it: `H'2085B2`
+and `H'207988`.
+
+### The mutations
+
+Forty planted errors over the eleven routines. All were caught except two,
+and both are the same shape as the survivor in part 9c: `H'244A2A`'s
+quarter-second delay and `H'249DE8`'s H'9C4 tries. Neither routine writes
+anything while it waits, and nothing outside changes underneath it, so the
+count is invisible to a comparison that looks at memory.
+
+**1,702 cases pass over 385 routines**, in twelve seconds.
 
 ## The parts, in order
 

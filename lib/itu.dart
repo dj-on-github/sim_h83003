@@ -201,6 +201,38 @@ class Itu {
 
   int _lastCycles = 0;
 
+  /// One channel's state, packed.
+  List<int> channelState(ItuChannel c) => [
+        c.tcr, c.tior, c.tier, c.tsr, c.tcnt,
+        c.gra, c.grb, c.bra, c.brb, c.running ? 1 : 0,
+      ];
+
+  void restoreChannel(ItuChannel c, List<int> v) {
+    c.tcr = v[0]; c.tior = v[1]; c.tier = v[2]; c.tsr = v[3]; c.tcnt = v[4];
+    c.gra = v[5]; c.grb = v[6]; c.bra = v[7]; c.brb = v[8];
+    c.running = v[9] != 0;
+  }
+
+  /// The whole timer unit, packed. [_lastCycles] is in there because the
+  /// counters advance by the difference between it and the CPU's cycle
+  /// count: restore one without the other and the next read jumps.
+  List<int> saveState() {
+    final out = <int>[tstr, tsnc, tmdr, tfcr, toer, tocr, _lastCycles];
+    for (final c in channels) {
+      out.addAll(channelState(c));
+    }
+    return out;
+  }
+
+  void restoreState(List<int> v) {
+    tstr = v[0]; tsnc = v[1]; tmdr = v[2]; tfcr = v[3];
+    toer = v[4]; tocr = v[5]; _lastCycles = v[6];
+    for (var i = 0; i < channels.length; i++) {
+      restoreChannel(channels[i], v.sublist(7 + i * 10, 17 + i * 10));
+    }
+    syncToMemory();
+  }
+
   bool owns(int addr) => addr >= base && addr <= end;
 
   void reset() {

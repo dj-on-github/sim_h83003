@@ -139,6 +139,50 @@ class H8Cpu {
     dmac.syncToMemory();
   }
 
+  /// Everything the machine holds outside its memory: the registers, the
+  /// flags, the cycle count and the four peripheral models. Packed as plain
+  /// integers so that a caller can put the machine back exactly where it was
+  /// without booting it again -- which is what the routine comparer does
+  /// between one case and the next.
+  ///
+  /// Memory is *not* included: it is restored from the memory's own undo log,
+  /// which is cheaper than copying four megabytes.
+  List<int> saveState() {
+    final out = <int>[...er, pc, ccr, cycles, halted ? 1 : 0, sleeping ? 1 : 0];
+    for (final s in sci) {
+      final v = s.saveState();
+      out..add(v.length)..addAll(v);
+    }
+    final i = itu.saveState();
+    out..add(i.length)..addAll(i);
+    final a = adc.saveState();
+    out..add(a.length)..addAll(a);
+    final d = dmac.saveState();
+    out..add(d.length)..addAll(d);
+    return out;
+  }
+
+  void restoreState(List<int> v) {
+    for (var n = 0; n < 8; n++) {
+      er[n] = v[n];
+    }
+    pc = v[8];
+    ccr = v[9];
+    cycles = v[10];
+    halted = v[11] != 0;
+    sleeping = v[12] != 0;
+    var i = 13;
+    for (final s in sci) {
+      s.restoreState(v.sublist(i + 1, i + 1 + v[i]));
+      i += 1 + v[i];
+    }
+    itu.restoreState(v.sublist(i + 1, i + 1 + v[i]));
+    i += 1 + v[i];
+    adc.restoreState(v.sublist(i + 1, i + 1 + v[i]));
+    i += 1 + v[i];
+    dmac.restoreState(v.sublist(i + 1, i + 1 + v[i]));
+  }
+
   /// Sparse 16-Mbyte memory (24-bit address space).
   final SparseMemory mem = SparseMemory();
 

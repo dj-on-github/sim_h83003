@@ -39,11 +39,22 @@ class SparseMemory {
     return bank == null ? 0 : bank[addr & (bankSize - 1)];
   }
 
+  /// When this is set, every byte about to be written is recorded here
+  /// against the value it had first, so a caller can work out afterwards
+  /// exactly what a run changed -- and put it back -- without scanning the
+  /// whole address space. Only the *first* value seen for an address is
+  /// kept, which is what makes it the state before the run rather than the
+  /// state one write ago. Null, and nothing is recorded.
+  Map<int, int>? undoLog;
+
   /// Writes one byte, allocating the containing 64K bank on first touch.
   void poke(int addr, int value) {
     addr &= addrMask;
     final bank = _banks[addr >> bankBits] ??= Uint8List(bankSize);
-    bank[addr & (bankSize - 1)] = value & 0xFF;
+    final offset = addr & (bankSize - 1);
+    final log = undoLog;
+    if (log != null && !log.containsKey(addr)) log[addr] = bank[offset];
+    bank[offset] = value & 0xFF;
   }
 
   /// True when the bank containing [addr] has been allocated.

@@ -52,6 +52,20 @@ class AdConverter {
   /// Conversions performed, for display.
   int conversions = 0;
 
+  /// The converter's state, packed. The input levels are not included:
+  /// they are what is on the pins, not what the model has done.
+  List<int> saveState() =>
+      [adcsr, adcr, _doneAt, _converting ? 1 : 0, conversions, ...results];
+
+  void restoreState(List<int> v) {
+    adcsr = v[0]; adcr = v[1]; _doneAt = v[2];
+    _converting = v[3] != 0; conversions = v[4];
+    for (var i = 0; i < results.length; i++) {
+      results[i] = v[5 + i];
+    }
+    syncToMemory();
+  }
+
   bool owns(int addr) => addr >= base && addr <= end;
 
   int get selectedChannel => adcsr & AdcStatus.channel;

@@ -130,6 +130,22 @@ class SciChannel {
   bool get transmitting => _tsrBusy;
 
   /// True when this address belongs to the channel.
+  /// The whole of this channel's state, packed, so a caller can put it back
+  /// where it was without rebuilding the machine. The transmit and receive
+  /// logs are left alone: they are for display, not for behaviour.
+  List<int> saveState() => [
+        smr, brr, scr, tdr, ssr, rdr,
+        _tsrBusy ? 1 : 0, _tsrDoneAt, txCount, _rxReadyAt,
+        rxQueue.length, ...rxQueue,
+      ];
+
+  void restoreState(List<int> v) {
+    smr = v[0]; brr = v[1]; scr = v[2]; tdr = v[3]; ssr = v[4]; rdr = v[5];
+    _tsrBusy = v[6] != 0; _tsrDoneAt = v[7]; txCount = v[8]; _rxReadyAt = v[9];
+    rxQueue..clear()..addAll(v.sublist(11, 11 + v[10]));
+    syncToMemory();
+  }
+
   bool owns(int addr) => addr >= base && addr <= base + 5;
 
   void reset() {

@@ -89,10 +89,6 @@ int rom_host_confirmed(void)
 #define STUB(name, addr)                                                      \
     static void name(void) { /* H'addr -- NOT RECONSTRUCTED */ }
 
-/* The same, for one that has to be visible outside its own file scope. */
-#define STUB2(name, addr)                                                     \
-    void name(void) { /* H'addr -- NOT RECONSTRUCTED */ }
-
 /* ---- the I2C bus on port 4 ---------------------------------------------
  * Bit-banged, SDA on P4 bit 7 and SCL on bit 6, talking to a 24Cxx-style
  * serial EEPROM at the usual pair of addresses -- H'50 to write, H'51 to
@@ -10727,6 +10723,293 @@ void isr_40(void) { isr_itu4_a_body(); }
 void isr_41(void) __attribute__((interrupt_handler));
 void isr_41(void) { isr_millisecond_body(); }
 
+/* ---- the item preview -------------------------------------------------
+ * H'2125B0 and the three routines under it. When the operator moves through
+ * a list, the item under the cursor is drawn large in a panel at the top of
+ * the screen, and which of three ways depends on the item's category -- byte
+ * H'17 of its descriptor.
+ *
+ * Two of the three go through the scratch buffer at H'0E8010 and copy it out
+ * a pixel at a time, which is how the picture is turned: the source is read
+ * along one axis and written along the other. A stitch pattern is drawn
+ * ninety degrees round from how it is stored, because it is stored the way
+ * it is sewn.
+ */
+#define PREVIEW_PANEL_X0  0x006C
+#define PREVIEW_PANEL_Y0  0x0006
+#define PREVIEW_PANEL_X1  0x00C8
+#define PREVIEW_PANEL_Y1  0x0023
+#define PREVIEW_SCRATCH   0x000E8010UL
+
+static u32 item_descriptor(u16 item)
+{
+    return ITEM_TABLE + (u32)(long)(short)(u16)(ITEM_STRIDE * item);
+}
+
+/* The item's number, drawn under the picture. */
+static void item_preview_number(u16 item)
+{
+    char buf[8];
+
+    int_to_decimal((short)REG16(item_descriptor(item) + 0x14), buf);
+    text_draw(buf, 0x006C, 0x0007, 0x0084, 0x0010, 0x0001, 0x01,
+              (const u8 *)0x001196EAUL);
+}
+
+static void item_preview_clear(void)
+{
+    draw_rect(PREVIEW_PANEL_X0, PREVIEW_PANEL_Y0,
+              PREVIEW_PANEL_X1, PREVIEW_PANEL_Y1,
+              LCD_FRAME_A, 0x00, 0x01);
+}
+
+/* H'21260A. A stitch: unpacked into the scratch buffer and copied out turned
+ * a quarter turn, the source's x becoming the screen's y and running the
+ * other way. */
+void item_preview_stitch(u16 item)
+{
+    short sy, dx, sx, dy;
+
+    bitmap_draw(0x0000, 0x0000, 0x0027, 0x002F,
+                (const u8 *)REG32(item_descriptor(item) + 0x08),
+                PREVIEW_SCRATCH);
+    item_preview_clear();
+
+    for (sy = 0x0009, dx = 0x0083; sy <= 0x002D; sy++, dx++) {
+        for (sx = 0x0005, dy = 0x0023; sx <= 0x0022; sx++, dy--) {
+            plot_pixel((u16)dx, (u16)dy, LCD_FRAME_A,
+                       read_pixel((u16)sx, (u16)sy, PREVIEW_SCRATCH));
+        }
+    }
+    item_preview_number(item);
+}
+
+/* H'212760. A whole-pattern picture: the same scratch buffer, copied out the
+ * right way up and put further to the right. */
+void item_preview_pattern(u16 item)
+{
+    short sy, dy, sx, dx;
+
+    bitmap_draw(0x0000, 0x0000, 0x0022, 0x0022,
+                (const u8 *)REG32(item_descriptor(item) + 0x08),
+                PREVIEW_SCRATCH);
+    item_preview_clear();
+
+    for (sy = 0x0003, dy = 0x0006; sy <= 0x0020; sy++, dy++) {
+        for (sx = 0x0002, dx = 0x0089; sx <= 0x0020; sx++, dx++) {
+            plot_pixel((u16)dx, (u16)dy, LCD_FRAME_A,
+                       read_pixel((u16)sx, (u16)sy, PREVIEW_SCRATCH));
+        }
+    }
+}
+
+/* H'212844. Anything else: the picture is blitted straight into the panel,
+ * centred on H'9A, H'14 from the width and height in its own header. */
+void item_preview_plain(u16 item)
+{
+    const u32 desc = item_descriptor(item);
+    const u32 src  = REG32(desc + 0x0C);
+    const u16 w    = header_word_0((const u8 *)src);
+    const u16 h    = header_word_1((const u8 *)src);
+    const u16 x0   = (u16)(0x009A - (u16)((short)w / 2));
+    const u16 y0   = (u16)(0x0014 - (u16)((short)h / 2));
+
+    item_preview_clear();
+    bitmap_draw(x0, y0, (u16)(w + x0), (u16)(h + y0),
+                (const u8 *)src, LCD_FRAME_A);
+    item_preview_number(item);
+}
+
+/* H'2125B0. Which of the three, by category. Screen H'18 has no panel. */
+void item_preview(u16 item)
+{
+    u8 cat;
+
+    if (REG8(0x11A169UL) == 0x18) return;
+
+    cat = REG8(item_descriptor(item) + 0x17);
+    if (cat >= 0x05 && cat <= 0x0F) item_preview_plain(item);
+    else if (cat >= 0x12)           item_preview_pattern(item);
+    else                            item_preview_stitch(item);
+}
+
+/* ---- the two bars ------------------------------------------------------
+ * H'20FA18 and H'20FF7A, with twenty callers each: the width bar down the
+ * right-hand edge of the screen and the length bar across the top of it.
+ * Every screen that lets either be changed draws them, and they are drawn
+ * incrementally -- only the part that moved is painted, which is why each
+ * keeps its own idea of where it was.
+ *
+ * The bar is one number scaled to pixels and the limit mark is another,
+ * drawn as a line across it. The scaling is done in floating point over a
+ * range that never leaves a byte, the same as the speed calculation in part
+ * 3q: a byte times H'1.01 plus a half, or just plus a half.
+ *
+ *   H'11A85E / H'11A874   the value the bar was last drawn at
+ *   H'11A860 / H'11A872   where that put the end of it
+ *   H'11A862 / H'11A878   the limit the mark was last drawn at
+ *   H'11A864 / H'11A87A   whether the mark was drawn
+ *   H'11A866 / H'11A87C   where the mark is
+ */
+#define BAR_W_X0    0x0127
+#define BAR_W_X1    0x012C
+#define BAR_W_TOP   0x0030
+#define BAR_W_BASE  0x0095
+#define BAR_L_Y0    0x0014
+#define BAR_L_Y1    0x0019
+#define BAR_L_LEFT  0x00D3
+#define BAR_L_RIGHT 0x0137
+
+/* The width bar runs up from H'95, so a bigger number is a smaller y. */
+static u16 bar_w_pixel(long v)
+{
+    return (u16)(BAR_W_BASE - (u16)(int)((float)v * 1.01f + 0.5f));
+}
+
+/* The length bar runs right from H'D3. */
+static u16 bar_l_pixel(long v)
+{
+    return (u16)((u16)(int)((float)v + 0.5f) + BAR_L_LEFT);
+}
+
+/* H'20FA18. The width bar. [fresh] redraws the whole thing; without it only
+ * the difference from last time is painted. */
+void bar_width(u16 value, u8 fresh, u32 buffer, u8 colour)
+{
+    u16 y;
+    u16 limit;
+
+    if (fresh != 0) {
+        y = bar_w_pixel((long)(short)value);
+        draw_rect(BAR_W_X0, y, BAR_W_X1, BAR_W_BASE, buffer, colour, 0x01);
+        if ((short)value < 0x0064) {
+            draw_rect(BAR_W_X0, BAR_W_TOP, BAR_W_X1, (u16)(y - 1),
+                      buffer, 0x00, 0x01);
+        }
+        REG16(0x11A860UL) = y;
+        REG16(0x11A85EUL) = value;
+        REG16(0x11A862UL) = 0xFFFF;
+        REG16(0x11A864UL) = 0xFFFF;
+        REG16(0x11A866UL) =
+            bar_w_pixel((long)(u32)(u8)(REG8(0xFFFEE8UL) & 0x7F));
+    } else if (value != REG16(0x11A85EUL)) {
+        y = bar_w_pixel((long)(short)value);
+        if ((short)value > (short)REG16(0x11A85EUL)) {
+            draw_rect(BAR_W_X0, y, BAR_W_X1, (u16)(REG16(0x11A860UL) - 1),
+                      buffer, colour, 0x01);
+        } else {
+            draw_rect(BAR_W_X0, REG16(0x11A860UL), BAR_W_X1, (u16)(y - 1),
+                      buffer, 0x00, 0x01);
+        }
+        REG16(0x11A860UL) = y;
+        REG16(0x11A85EUL) = value;
+    }
+
+    /* The limit mark, moved when the limit has changed. */
+    limit = (u16)(u8)(REG8(0xFFFEE8UL) & 0x7F);
+    if (limit != REG16(0x11A862UL)) {
+        if ((short)REG16(0x11A866UL) >= (short)REG16(0x11A860UL)) {
+            if (REG16(0x11A864UL) == 0) {
+                draw_hline(BAR_W_X0, BAR_W_X1, REG16(0x11A866UL),
+                           buffer, colour);
+            }
+        } else {
+            if (REG16(0x11A864UL) != 0) {
+                draw_hline(BAR_W_X0, BAR_W_X1, REG16(0x11A866UL),
+                           buffer, 0x00);
+            }
+        }
+        REG16(0x11A866UL) = bar_w_pixel((long)(u32)limit);
+        REG16(0x11A862UL) = limit;
+    }
+
+    /* And taken off or put back when bit 7 of H'FFFEE5 changes. */
+    {
+        const u16 on = (u16)(u8)(REG8(0xFFFEE5UL) & 0x80);
+
+        if (on != REG16(0x11A864UL)) {
+            draw_hline(BAR_W_X0, BAR_W_X1, REG16(0x11A866UL), buffer,
+                       (u8)((REG8(0xFFFEE5UL) & 0x80) ? colour : 0x00));
+            REG16(0x11A864UL) = on;
+        }
+    }
+}
+
+/* H'20FF7A. The length bar. Two pictures sit beside it -- H'34BAE7 and
+ * H'34BA1B -- and which of them is shown follows bit 4 of H'FFFEF8. */
+void bar_length(u16 value, u8 fresh, u32 buffer, u8 colour)
+{
+    u16 x;
+    u16 limit;
+
+    if (fresh != 0) REG16(0x11A876UL) = 0xFFFF;
+
+    {
+        const u16 flag = (u16)(u8)(REG8(0xFFFEF8UL) & 0x10);
+
+        if (flag != REG16(0x11A876UL)) {
+            bitmap_draw(0x00D2, 0x0006, 0x0139, 0x0013,
+                        (const u8 *)((REG8(0xFFFEF8UL) & 0x10)
+                                     ? 0x0034BAE7UL : 0x0034BA1BUL),
+                        LCD_FRAME_A);
+            REG16(0x11A876UL) = (u16)(u8)(REG8(0xFFFEF8UL) & 0x10);
+        }
+    }
+
+    if (fresh != 0) {
+        x = bar_l_pixel((long)(short)value);
+        draw_rect(BAR_L_LEFT, BAR_L_Y0, x, BAR_L_Y1, buffer, colour, 0x01);
+        if ((short)value < 0x0064) {
+            draw_rect((u16)(x + 1), BAR_L_Y0, BAR_L_RIGHT, BAR_L_Y1,
+                      buffer, 0x00, 0x01);
+        }
+        REG16(0x11A872UL) = x;
+        REG16(0x11A874UL) = value;
+        REG16(0x11A878UL) = 0xFFFF;
+        REG16(0x11A87AUL) = 0xFFFF;
+        REG16(0x11A87CUL) =
+            bar_l_pixel((long)(u32)(u8)(REG8(0xFFFEE5UL) & 0x7F));
+    } else if (value != REG16(0x11A874UL)) {
+        x = bar_l_pixel((long)(short)value);
+        if ((short)value < (short)REG16(0x11A874UL)) {
+            draw_rect((u16)(x + 1), BAR_L_Y0, REG16(0x11A872UL), BAR_L_Y1,
+                      buffer, 0x00, 0x01);
+        } else {
+            draw_rect((u16)(REG16(0x11A872UL) + 1), BAR_L_Y0, x, BAR_L_Y1,
+                      buffer, colour, 0x01);
+        }
+        REG16(0x11A872UL) = x;
+        REG16(0x11A874UL) = value;
+    }
+
+    limit = (u16)(u8)(REG8(0xFFFEE5UL) & 0x7F);
+    if (limit != REG16(0x11A878UL)) {
+        if ((short)REG16(0x11A87CUL) <= (short)REG16(0x11A872UL)) {
+            if (REG16(0x11A87AUL) == 0) {
+                draw_vline(REG16(0x11A87CUL), BAR_L_Y0, BAR_L_Y1,
+                           buffer, colour);
+            }
+        } else {
+            if (REG16(0x11A87AUL) != 0) {
+                draw_vline(REG16(0x11A87CUL), BAR_L_Y0, BAR_L_Y1,
+                           buffer, 0x00);
+            }
+        }
+        REG16(0x11A87CUL) = bar_l_pixel((long)(u32)limit);
+        REG16(0x11A878UL) = limit;
+    }
+
+    {
+        const u16 on = (u16)(u8)(REG8(0xFFFEE5UL) & 0x80);
+
+        if (on != REG16(0x11A87AUL)) {
+            draw_vline(REG16(0x11A87CUL), BAR_L_Y0, BAR_L_Y1, buffer,
+                       (u8)((REG8(0xFFFEE5UL) & 0x80) ? colour : 0x00));
+            REG16(0x11A87AUL) = on;
+        }
+    }
+}
+
 /* ---- the hit-box table ------------------------------------------------
  * Every screen the operator sees is a list of boxes, and this is the layer
  * all seventy-nine of them are built on. H'11B0BA points at the list and
@@ -11280,6 +11563,667 @@ u16 hitbox_fill_from_list(u16 first, u16 last, u16 value, u32 list)
     return (u16)(v + 1);
 }
 
+/* ---- five that most of the screens lean on ----------------------------- */
+
+void screen_store(u8 slot, u8 out);
+
+/* ---- what the dispatcher does before it dispatches --------------------
+ * Seven routines from the top of H'22382A: the pending screen change, the
+ * touch settling, the foot switch, whether the module will take an order,
+ * the key scan, and the screen save and restore.
+ */
+
+/* H'244C62. Whether the module has nothing of its own going on: seven bytes
+ * that all have to be clear. */
+u8 module_is_idle(void)
+{
+    if (REG8(0x00114D7BUL) != 0) return 0x00;
+    if (REG8(0x00114D7EUL) != 0) return 0x00;
+    if (REG8(0x001040B4UL) != 0) return 0x00;
+    if (REG8(0x00104042UL) != 0) return 0x00;
+    if (REG8(0x00114D7FUL) != 0) return 0x00;
+    if (REG8(0x00114D69UL) != 0) return 0x00;
+    if (REG8(0x00114D72UL) != 0) return 0x00;
+    return 0x01;
+}
+
+/* H'249D6C. Whether the module will take an order: idle, and the link quiet.
+ * The link test is the same one written out twice that H'248668 waits on. */
+u8 module_ready(void)
+{
+    if (REG16(0x0011A63AUL) != 0) return 0x00;
+    if (module_is_idle() == 0) return 0x00;
+    if ((REG8(0x00114D50UL) & 0x21) != 0) return 0x00;
+    if (REG8(0x0011F29EUL) != 0) return 0x00;
+    if (REG8(0x0011F2B6UL) != 0) return 0x00;
+    if ((REG8(0x00114D50UL) & 0x22) != 0) return 0x00;
+    if (REG8(0x0011F29EUL) != 0) return 0x00;
+    if (REG8(0x0011F2B6UL) != 0) return 0x00;
+    if (REG8(0x00114D50UL) & 0x20) return 0x00;
+    if (REG8(0x00114D86UL) != 0) return 0x00;
+    return 0x01;
+}
+
+/* H'2237D0. A screen change left waiting by something that could not do it
+ * itself: three bytes put back where the hardware reads them, a word put
+ * back, and then the move. H'11B29C is the flag the dispatcher tests and
+ * this clears; H'11B29B says a return happened. */
+void screen_restore_pending(void)
+{
+    REG8(0x00FFFEE4UL) = REG8(0x0011B294UL);
+    REG8(0x00FFFEE7UL) = REG8(0x0011B295UL);
+    REG8(0x00FFFEEAUL) = REG8(0x0011B296UL);
+    REG16(0x0011B108UL) = REG16(0x0011B298UL);
+    screen_switch(REG8(0x0011B29AUL), 0x01, 0x00);
+    REG8(0x0011B29CUL) = 0x00;
+    REG8(0x0011B29BUL) = 0x01;
+}
+
+/* H'210E02. Whether the touch reading has settled. The two coordinate bytes
+ * are remembered in H'11B2CA and H'11B2CC and a countdown in H'11A19A is set
+ * to ten whenever they move. Ten readings the same and the countdown reaches
+ * zero -- but the routine only says "yes" on the very first call, when the
+ * countdown was zero to begin with. */
+u8 touch_settled(void)
+{
+    if (REG16(0x0011A19AUL) == 0) {
+        REG16(0x0011A19AUL) = 0x000A;
+        return 0x01;
+    }
+
+    if (REG8(0x00FFFED9UL) == REG16(0x0011B2CAUL) &&
+        REG8(0x00FFFEDAUL) == REG16(0x0011B2CCUL)) {
+        REG16(0x0011A19AUL) = (u16)(REG16(0x0011A19AUL) - 1);
+        return 0x00;
+    }
+
+    REG16(0x0011B2CAUL) = REG8(0x00FFFED9UL);
+    REG16(0x0011B2CCUL) = REG8(0x00FFFEDAUL);
+    REG16(0x0011A19AUL) = 0x000A;
+    return 0x00;
+}
+
+/* H'215448. The foot switch, read from bit 7 of H'FFFEC4 with the position
+ * in H'FFFEC5: nothing at all unless the switch is down, then screen H'17
+ * for position zero and screen H'00 for position six. Any other position is
+ * ignored. */
+void foot_switch_screen(void)
+{
+    u8 where;
+
+    if (!(REG8(0x00FFFEC4UL) & 0x80)) return;
+
+    where = REG8(0x00FFFEC5UL);
+    if (where == 0x00)      screen_switch(0x17, 0x01, 0x00);
+    else if (where == 0x06) screen_switch(0x00, 0x01, 0x00);
+}
+
+/* H'21F68C. The key scan: eighteen bits over four ports tested in a fixed
+ * order and the first one down named in H'11B10E, H'6D upwards. H'FFFF is
+ * "nothing down".
+ *
+ * One key is special. H'75 is the one that starts the module, and if bit 0
+ * of H'FFFEC4 says the module is there it is only accepted when the module
+ * will take the order. When it will not, the key is not reported at all and
+ * the scan carries on into the last two tests below it.
+ */
+void key_scan(void)
+{
+    if (REG8(0x00FFFEDCUL) & 0x04) { REG16(0x0011B10EUL) = 0x006D; return; }
+    if (REG8(0x00FFFEDDUL) & 0x08) { REG16(0x0011B10EUL) = 0x006E; return; }
+    if (REG8(0x00FFFEDDUL) & 0x20) { REG16(0x0011B10EUL) = 0x006F; return; }
+    if (REG8(0x00FFFEDCUL) & 0x01) { REG16(0x0011B10EUL) = 0x0070; return; }
+    if (REG8(0x00FFFEDBUL) & 0x01) { REG16(0x0011B10EUL) = 0x0071; return; }
+    if (REG8(0x00FFFEDDUL) & 0x01) { REG16(0x0011B10EUL) = 0x0072; return; }
+    if (REG8(0x00FFFEDCUL) & 0x08) { REG16(0x0011B10EUL) = 0x0073; return; }
+    if (REG8(0x00FFFEDDUL) & 0x02) { REG16(0x0011B10EUL) = 0x0074; return; }
+    if (REG8(0x00FFFEDDUL) & 0x04) { REG16(0x0011B10EUL) = 0x0076; return; }
+    if (REG8(0x00FFFEDBUL) & 0x04) { REG16(0x0011B10EUL) = 0x0077; return; }
+    if (REG8(0x00FFFEDCUL) & 0x02) { REG16(0x0011B10EUL) = 0x0078; return; }
+    if (REG8(0x00FFFEDDUL) & 0x10) { REG16(0x0011B10EUL) = 0x0079; return; }
+    if (REG8(0x00FFFEDBUL) & 0x40) { REG16(0x0011B10EUL) = 0x007A; return; }
+    if (REG8(0x00FFFEC1UL) & 0x02) { REG16(0x0011B10EUL) = 0x007B; return; }
+    if (REG8(0x00FFFEDBUL) & 0x80) { REG16(0x0011B10EUL) = 0x007C; return; }
+    if (REG8(0x00FFFEDBUL) & 0x02) { REG16(0x0011B10EUL) = 0x007D; return; }
+    if (REG8(0x00FFFEDCUL) & 0x10) { REG16(0x0011B10EUL) = 0x0081; return; }
+
+    if (REG8(0x00FFFEDBUL) & 0x08 &&
+        (!(REG8(0x00FFFEC4UL) & 0x01) || module_ready() != 0)) {
+        REG16(0x0011B10EUL) = 0x0075;
+        REG8(0x0011A16FUL) = 0x01;
+        return;
+    }
+
+    if (REG8(0x00FFFEDCUL) & 0x20) REG16(0x0011B10EUL) = 0x007E;
+    else                           REG16(0x0011B10EUL) = 0xFFFF;
+}
+
+/* H'21F4C6. The screen picture and its state put away and fetched back.
+ * H'11A172 asks for the put-away and H'11A173 for the fetch, and which of
+ * four slots is in H'11B100. Sixteen bytes of state travel with the picture:
+ * the live copy is at H'11B0AE and each slot keeps its own at H'11B0BE and
+ * every sixteen bytes after that.
+ *
+ * A slot number outside one to four leaves through the back door: the ask is
+ * not cleared and the fetch below it does not happen either. */
+void screen_put_away(void)
+{
+    const u32 STATE = 0x0011B0AEUL;
+    u8 slot;
+    short i;
+
+    if (REG8(0x0011A172UL) != 0) {
+        slot = REG8(0x0011B100UL);
+        if (slot < 0x01 || slot > 0x04) return;
+        screen_store(slot, 0x01);
+        for (i = 0; i < 4; i++)
+            REG32(0x0011B0BEUL + (u32)(slot - 1) * 0x10 + (u32)i * 4) =
+                REG32(STATE + (u32)i * 4);
+        REG8(0x0011A172UL) = 0x00;
+    }
+
+    if (REG8(0x0011A173UL) != 0) {
+        slot = REG8(0x0011B100UL);
+        if (slot < 0x01 || slot > 0x04) return;
+        screen_store(slot, 0x00);
+        for (i = 0; i < 4; i++)
+            REG32(STATE + (u32)i * 4) =
+                REG32(0x0011B0BEUL + (u32)(slot - 1) * 0x10 + (u32)i * 4);
+        REG8(0x0011A173UL) = 0x00;
+    }
+}
+
+/* ---- the module's slate wiped clean -----------------------------------
+ * H'244578 is called from sixteen places, all of them the start of some
+ * piece of embroidery work, and it is the one routine that puts the module
+ * back to a known state: three buffers zeroed, the current slot's two
+ * records started off, and the pattern store emptied.
+ *
+ * Two records describe the pattern in the slot named by H'11A660. The
+ * first is sixteen bytes at H'11A25A -- the stitch settings, indexed by
+ * slot << 4 -- and the second is eighteen bytes at H'11A41A, indexed by
+ * slot * H'12. Both indices are worked out afresh for every single field
+ * in the original, which is written out here as it stands.
+ */
+#define PAT_A(off) (0x0011A25AUL \
+    + (u32)(long)(short)(u16)((u16)REG8(0x11A660UL) << 4) + (u32)(off))
+#define PAT_B(off) (0x0011A41AUL \
+    + (u32)(long)(short)(u16)(0x12 * (u16)REG8(0x11A660UL)) + (u32)(off))
+
+/* H'23A036. Bit 3 of the attribute byte belonging to the pattern the slot
+ * holds. The attributes are one byte each at H'0FFEB8. */
+u8 pattern_attr_bit3(void)
+{
+    const u8 pattern = REG8(PAT_B(0x00));
+
+    return (REG8(0x000FFEB8UL + pattern) & 0x08) ? 0x01 : 0x00;
+}
+
+/* H'231994. The current slot's stitch settings back to their defaults.
+ * H'11A263 is the one field it leaves alone, and it writes H'11A265 before
+ * H'11A264 -- both differences from the fuller version in H'2445F6. */
+void stitch_reset_current(void)
+{
+    REG16(PAT_A(0x0C)) = 0x0000;
+    REG16(PAT_A(0x0E)) = 0x0000;
+    REG8(PAT_A(0x00)) = 0x32;
+    REG8(PAT_A(0x01)) = 0x32;
+    REG8(PAT_A(0x02)) = 0x32;
+    REG8(PAT_A(0x03)) = 0x32;
+    REG8(PAT_A(0x04)) = 0x5F;
+    REG8(PAT_A(0x05)) = 0x00;
+    REG8(PAT_A(0x06)) = 0x24;
+    REG8(PAT_A(0x07)) = 0x32;
+    REG8(PAT_A(0x08)) = 0x32;
+    REG8(PAT_A(0x0B)) = 0x00;
+    REG8(PAT_A(0x0A)) = 0x00;
+    REG8(0x0011F4D9UL) = 0x32;
+    REG8(0x0011F4DAUL) = 0x32;
+    REG16(0x0011F292UL) = 0x0000;
+    REG8(0x00114D96UL) = pattern_attr_bit3() != 0 ? 0x01 : 0x00;
+}
+
+/* H'23E6C4. The slot number waiting in H'11A640 becomes the current one and
+ * its second record is started off: the slot itself, whatever H'114DA1
+ * holds, and H'114D8C divided down by H'1B. Slot zero means nothing to
+ * pick up and the routine does nothing at all. */
+void pattern_slot_begin(void)
+{
+    const u8 slot = REG8(0x0011A640UL);
+
+    if (slot == 0x00) return;
+
+    REG8(0x0011A660UL) = slot;
+    REG8(0x0011A63FUL) = slot;
+    REG8(PAT_B(0x04)) = REG8(0x0011A640UL);
+    REG8(PAT_B(0x03)) = REG8(0x00114DA1UL);
+    REG8(PAT_B(0x05)) = (u8)((u16)REG8(0x00114D8CUL) / 0x1B);
+    stitch_reset_current();
+}
+
+/* H'2416D6. Fourteen words of module counters, H'11F2E4 to H'11F300, and
+ * the original clears them in an order of its own. */
+void link_counters_clear(void)
+{
+    REG16(0x0011F2F6UL) = 0x0000;
+    REG16(0x0011F2F8UL) = 0x0000;
+    REG16(0x0011F2FAUL) = 0x0000;
+    REG16(0x0011F2FCUL) = 0x0000;
+    REG16(0x0011F2FEUL) = 0x0000;
+    REG16(0x0011F300UL) = 0x0000;
+    REG16(0x0011F2E4UL) = 0x0000;
+    REG16(0x0011F2E8UL) = 0x0000;
+    REG16(0x0011F2E6UL) = 0x0000;
+    REG16(0x0011F2EAUL) = 0x0000;
+    REG16(0x0011F2EEUL) = 0x0000;
+    REG16(0x0011F2F2UL) = 0x0000;
+    REG16(0x0011F2F0UL) = 0x0000;
+    REG16(0x0011F2F4UL) = 0x0000;
+}
+
+/* H'23E462. A single RTS. Something used to happen here. */
+void module_reset_hook(void)
+{
+}
+
+/* H'244AAC. The pattern store, H'104D4A up to but not including H'10C27A,
+ * zeroed a byte at a time. */
+void pattern_store_clear(void)
+{
+    u32 p;
+
+    for (p = 0x00104D4AUL; p < 0x0010C27AUL; p++) REG8(p) = 0x00;
+}
+
+/* H'2445F6. The module's own state. This writes the same stitch defaults as
+ * H'231994 and three more fields with them, then empties the second record
+ * altogether and clears the pattern store. */
+void module_state_clear(void)
+{
+    short i;
+
+    for (i = 0; i < 0x000C; i++) REG8(0x0011A612UL + (u16)i) = 0x00;
+
+    REG8(0x001040BCUL) = 0x14;
+    REG8(0x001040BDUL) = 0x96;
+    REG8(0x00100282UL) = 0x09;
+    REG8(0x00100283UL) = 0x3E;
+    REG8(0x00100280UL) = 0x00;
+    REG8(0x00100281UL) = 0x00;
+    REG16(0x0011F302UL) = 0x007D;
+    REG8(0x00114D9BUL) = 0x01;
+    link_counters_clear();
+    module_reset_hook();
+    REG16(0x0011F2ECUL) = 0x0024;
+
+    REG16(PAT_A(0x0C)) = 0x0000;
+    REG16(PAT_A(0x0E)) = 0x0000;
+    REG8(PAT_A(0x00)) = 0x32;
+    REG8(PAT_A(0x01)) = 0x32;
+    REG8(PAT_A(0x02)) = 0x32;
+    REG8(PAT_A(0x03)) = 0x32;
+    REG8(PAT_A(0x04)) = 0x5F;
+    REG8(PAT_A(0x05)) = 0x00;
+    REG8(PAT_A(0x06)) = 0x24;
+    REG8(PAT_A(0x07)) = 0x32;
+    REG8(PAT_A(0x08)) = 0x32;
+    REG8(PAT_A(0x09)) = 0x00;
+    REG8(PAT_A(0x0A)) = 0x00;
+    REG8(PAT_A(0x0B)) = 0x00;
+
+    REG8(PAT_B(0x00)) = 0x00;
+    REG8(PAT_B(0x01)) = 0x00;
+    REG8(PAT_B(0x02)) = 0x00;
+    REG8(PAT_B(0x03)) = 0x00;
+    REG8(PAT_B(0x04)) = 0x00;
+    REG8(PAT_B(0x05)) = 0x00;
+
+    REG32(0x0011F2C6UL) = 0x00104D4AUL;
+    REG8(0x0011F4D9UL) = 0x32;
+    REG8(0x0011F4DAUL) = 0x32;
+    pattern_store_clear();
+
+    REG16(0x0011F4DCUL) = 0x0000;
+    REG16(0x0011F4DEUL) = 0x0000;
+    REG8(0x00114D73UL) = 0x00;
+    REG8(0x0011F4E6UL) = 0x00;
+    REG8(0x0011F310UL) = 0x00;
+    REG8(0x0011F311UL) = 0x00;
+    REG8(0x0011F312UL) = 0x00;
+    REG8(0x0011F313UL) = 0x00;
+    REG8(0x0011F314UL) = 0x00;
+    REG16(0x0011A62AUL) = 0x0000;
+    REG16(0x0011A62CUL) = 0x0000;
+    REG8(0x0011F30EUL) = 0x00;
+    REG8(0x0011F305UL) = 0x00;
+    REG8(0x0011F304UL) = 0x00;
+    REG8(0x00114D66UL) = 0x00;
+    REG8(0x00114D62UL) = 0x00;
+    REG8(0x00114D98UL) = 0x00;
+    REG8(0x00104040UL) = 0x00;
+    REG16(0x00114D4CUL) = (u16)(REG16(0x00114D4CUL) & ~0x4000);
+}
+
+/* H'244578. The whole slate: the slot picked up, three buffers zeroed, and
+ * the module's state cleared behind them. */
+void module_buffers_clear(void)
+{
+    short i;
+
+    pattern_slot_begin();
+    for (i = 0; i < 0x003D; i++) REG8(0x00114D7AUL + (u16)i) = 0x00;
+    for (i = 0; i < 0x00AC; i++) REG8(0x00104C98UL + (u16)i) = 0x00;
+    for (i = 0; i < 0x0400; i++) REG8(0x000FFE80UL + (u16)i) = 0x00;
+    module_state_clear();
+    REG8(0x00104040UL) = 0x00;
+    REG8(0x001040B5UL) = 0x00;
+}
+
+/* ---- the module key, and what it reaches -------------------------------
+ * H'237E3C is the handler for a key press when the embroidery module is
+ * attached, and it is a jump table of twelve: the key codes H'6D, H'70-H'75,
+ * H'77-H'79, H'7D and H'81 that H'21F68C names. Nine routines under it are
+ * written here; the handler itself waits on the module's own state machine
+ * at H'235B0E, which is not written yet.
+ */
+
+void link_delay(u16 units);
+void link_send_start(void);
+
+/* H'23E45A. Where the module's replies land. Two instructions. */
+u32 module_reply_buffer(void)
+{
+    return 0x00104C90UL;
+}
+
+/* H'230E6E. The first screen store emptied, a word at a time, all H'2580 of
+ * them -- one whole screen. */
+void screen_store1_clear(void)
+{
+    u32 p;
+    long n;
+
+    p = 0x000ECB10UL;
+    for (n = 0; n < 0x2580L; n++) { REG16(p) = 0x0000; p += 2; }
+}
+
+/* H'230EA8. The embroidery panel put away into the first store: a box from
+ * H'26,H'53 to H'C1,H'EA, and only when H'11F4E6 says there is one. */
+void embroidery_panel_save(void)
+{
+    if (REG8(0x0011F4E6UL) == 0) return;
+
+    region_copy(0x0026, 0x0053, 0x00C1, 0x00EA, 0x0053,
+                LCD_FRAME_A, 0x000ECB10UL);
+}
+
+/* H'236E9A. The module's cursor rubbed out: a twenty-five pixel box around
+ * H'11F4DC, H'11F4DE fetched back from the third store, and the position
+ * forgotten. H'114D99 is set on the way in whatever else happens. */
+void module_cursor_erase(void)
+{
+    REG8(0x00114D99UL) = 0x01;
+
+    if (REG8(0x00114D98UL) != 0x01) return;
+
+    REG8(0x00114D98UL) = 0x00;
+
+    if (REG16(0x0011F4DCUL) != 0 && REG16(0x0011F4DEUL) != 0)
+        region_copy((u16)(REG16(0x0011F4DCUL) - 0x0C),
+                    (u16)(REG16(0x0011F4DEUL) - 0x0C),
+                    (u16)(REG16(0x0011F4DCUL) + 0x0C),
+                    (u16)(REG16(0x0011F4DEUL) + 0x0C),
+                    (u16)(REG16(0x0011F4DEUL) - 0x0C),
+                    0x000F6110UL, LCD_FRAME_A);
+
+    REG16(0x0011F4DCUL) = 0x0000;
+    REG16(0x0011F4DEUL) = 0x0000;
+}
+
+/* H'2426F0. Bit 1 of H'11A63C set when there is a pattern to be going on
+ * with: either one waiting in H'11A640, or the current slot's record says
+ * kind three. */
+void pattern_mark_ready(void)
+{
+    if (REG8(0x0011A640UL) == 0 && REG8(PAT_B(0x03)) != 0x03) return;
+
+    REG8(0x0011A63CUL) |= 0x02;
+}
+
+/* H'23191C. Asks the module to go home, and says whether it was already on
+ * its way. H'114D93 is the ask; H'FFFEC6 has to be at rest, meaning zero or
+ * five. When there is no ask, a module already homing has its step counter
+ * put back to one and the answer is H'01.
+ *
+ * The two branches share their tail, so a module that is asked while
+ * H'FFFEC6 is busy falls into the second test rather than leaving. */
+u8 module_home_request(void)
+{
+    if (REG8(0x00114D93UL) != 0) {
+        const u8 state = REG8(0x00FFFEC6UL);
+
+        if (state == 0x00 || state == 0x05) {
+            REG8(0x00FFFEC4UL) |= 0x20;
+            REG8(0x00114D66UL) = 0x01;
+            REG8(0x00114D62UL) = 0x08;
+            REG8(0x00114D65UL) = 0x00;
+            REG8(0x00114D94UL) = 0x00;
+            if (REG8(0x00114D95UL) != 0) {
+                REG8(0x00114D95UL) = 0x00;
+                REG8(0x00114D50UL) &= (u8)~0x01;
+                REG8(0x00114D50UL) &= (u8)~0x02;
+            }
+            return 0x00;
+        }
+    }
+
+    if (REG8(0x00114D66UL) != 0) {
+        REG8(0x00114D65UL) = 0x01;
+        return 0x01;
+    }
+    return 0x00;
+}
+
+/* H'2431C2. The end of a talk to the module, but only from three of the
+ * hardware's states. ITU1 is handed back, the machine parked, and ITU1
+ * borrowed again -- in that order, which is the order the ROM has. */
+void module_talk_end(void)
+{
+    const u8 state = REG8(0x00FFFEC0UL);
+
+    if (state != 0x04 && state != 0x06 && state != 0x07) return;
+
+    REG8(0x00114DA0UL) = 0x01;
+    itu1_return();
+    module_park();
+    itu1_borrow();
+}
+
+/* H'244A2A. The module started again from nothing: the link brought up, a
+ * message H'04/H'06 sent, and a quarter-second wait for the answer. Bit 7 of
+ * H'114D51 is the answer having arrived. */
+void module_restart(void)
+{
+    if (REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) return;
+
+    sci0_module_init();
+    link_delay(0x000A);
+    REG8(0x0011F2A1UL) = 0x04;
+    REG8(0x0011F2A2UL) = 0x06;
+    link_send_start();
+    link_delay(0x00FA);
+
+    if (!(REG8(0x00114D51UL) & 0x80)) return;
+
+    REG8(0x00FFFEC4UL) |= 0x01;
+    REG8(0x00FFFEC4UL) |= 0x20;
+    REG8(0x00114D78UL) = 0x03;
+    REG8(0x00114DA0UL) = 0x00;
+    REG8(0x00114DBAUL) = 0x01;
+    REG8(0x00114DBBUL) = 0x00;
+    module_talk_end();
+}
+
+/* H'249DE8. Waits for the module to name itself: five bytes at the head of
+ * the reply buffer against five in the machine's own identity block at
+ * H'200103, tried up to H'9C4 times with a delay between. Returns H'01 when
+ * they matched and H'00 when the tries ran out.
+ *
+ * The two sides are compared as words, and the ROM's byte is sign extended
+ * while the module's is not, so any expected byte of H'80 or over could
+ * never match. None of the five is.
+ */
+u8 module_identify(void)
+{
+    short n;
+
+    for (n = 0; n <= 0x09C4; n++) {
+        const u32 buf = module_reply_buffer();
+        u8 i, same = 0;
+
+        for (i = 0; i <= 0x04; i++) {
+            if ((u16)REG8(buf + i) ==
+                (u16)(short)(signed char)REG8(0x00200103UL + i)) same++;
+        }
+        if (same >= 0x05) break;
+        link_delay(0x0001);
+    }
+
+    return n >= 0x09C4 ? 0x00 : 0x01;
+}
+
+/* H'24ADF0. The ROM's memmove, and it is a proper one: an overlap where the
+ * source is below the destination is copied backwards so it does not eat its
+ * own tail. The loop count is tested before the decrement, so a length of
+ * zero copies nothing. */
+void *mem_move(void *dst, const void *src, u32 len)
+{
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    u32 n = len;
+
+    if ((u32)s <= (u32)d && (u32)s + len >= (u32)d) {
+        d += len;
+        s += len;
+        while (n != 0) { n--; *--d = *--s; }
+        return dst;
+    }
+    while (n != 0) { n--; *d++ = *s++; }
+    return dst;
+}
+
+/* H'21F36E. One of four stored screens copied to or from the front buffer.
+ * They sit at H'0ECB10 and every H'4B00 after it -- one whole screen each --
+ * and [out] says which way the copy goes. */
+void screen_store(u8 slot, u8 out)
+{
+    u32 at;
+
+    switch (slot) {
+    case 0x01: at = 0x000ECB10UL; break;
+    case 0x02: at = 0x000F1610UL; break;
+    case 0x03: at = 0x000F6110UL; break;
+    case 0x04: at = 0x000FAC10UL; break;
+    default: return;
+    }
+
+    if (out != 0) region_copy(0x0000, 0x0000, 0x013F, 0x00EF, 0x0000,
+                              LCD_FRAME_A, at);
+    else          region_copy(0x0000, 0x0000, 0x013F, 0x00EF, 0x0000,
+                              at, LCD_FRAME_A);
+}
+
+void link_delay(u16 units);
+
+/* H'248668. Waits for the link to go quiet, giving up after a hundred turns
+ * of H'0A units each. Returns 1 when it went quiet and 0 when it did not.
+ *
+ * The test is written out twice in the original, the same three conditions
+ * each time, and then a fourth on bit 5 of H'114D50. Reproduced as it is. */
+u8 link_wait_idle(void)
+{
+    u8 n;
+
+    for (n = 0; n < 0x64; n++) {
+        if ((REG8(0x114D50UL) & 0x21) == 0 &&
+            REG8(0x11F29EUL) == 0 && REG8(0x11F2B6UL) == 0 &&
+            (REG8(0x114D50UL) & 0x22) == 0 &&
+            REG8(0x11F29EUL) == 0 && REG8(0x11F2B6UL) == 0 &&
+            !(REG8(0x114D50UL) & 0x20)) {
+            return 0x01;
+        }
+        link_delay(0x000A);
+    }
+    return 0x00;
+}
+
+/* H'229714. The two arrows beside the pattern strip: one is drawn lit when
+ * there is something before the cursor and the other when there is something
+ * after it. H'11B3D6 and H'11B3D7 remember which way each is drawn so the
+ * pair is only repainted when it changes -- unless [fresh] is set, when both
+ * go down whatever they were.
+ */
+#define ARROW_BACK_ON   0x0034E390UL
+#define ARROW_BACK_OFF  0x0034E3C7UL
+#define ARROW_ON_ON     0x0034E3FEUL
+#define ARROW_ON_OFF    0x0034E435UL
+
+void picker_arrows(u16 back_box, u16 on_box, u8 fresh)
+{
+    if (fresh != 0) {
+        if ((short)PICK_POS > (short)PICK_FIRST) {
+            REG8(0x11B3D6UL) = 0x01;
+            hitbox_blit(back_box, LCD_FRAME_A, ARROW_BACK_ON);
+        } else {
+            REG8(0x11B3D6UL) = 0x00;
+            hitbox_blit(back_box, LCD_FRAME_A, ARROW_BACK_OFF);
+        }
+        if ((short)PICK_POS < (short)PICK_LAST) {
+            REG8(0x11B3D7UL) = 0x01;
+            hitbox_blit(on_box, LCD_FRAME_A, ARROW_ON_ON);
+        } else {
+            REG8(0x11B3D7UL) = 0x00;
+            hitbox_blit(on_box, LCD_FRAME_A, ARROW_ON_OFF);
+        }
+        return;
+    }
+
+    if (PICK_POS == PICK_FIRST) {
+        if (REG8(0x11B3D6UL) != 0) {
+            REG8(0x11B3D6UL) = 0x00;
+            hitbox_blit(back_box, LCD_FRAME_A, ARROW_BACK_OFF);
+        }
+    } else if ((short)PICK_POS > (short)PICK_FIRST) {
+        if (REG8(0x11B3D6UL) == 0) {
+            REG8(0x11B3D6UL) = 0x01;
+            hitbox_blit(back_box, LCD_FRAME_A, ARROW_BACK_ON);
+        }
+    }
+
+    if (PICK_POS == PICK_LAST) {
+        if (REG8(0x11B3D7UL) != 0) {
+            REG8(0x11B3D7UL) = 0x00;
+            hitbox_blit(on_box, LCD_FRAME_A, ARROW_ON_OFF);
+        }
+    } else if ((short)PICK_POS < (short)PICK_LAST) {
+        if (REG8(0x11B3D7UL) == 0) {
+            REG8(0x11B3D7UL) = 0x01;
+            hitbox_blit(on_box, LCD_FRAME_A, ARROW_ON_ON);
+        }
+    }
+}
+
+/* H'21341E. The box carrying the current speed found, lit, and its item
+ * drawn in the preview panel. */
+void hitbox_select_current(u16 first, u16 last)
+{
+    const u16 box = hitbox_find(first, last, REG16(0xFFFEE0UL), 0x01);
+
+    if (hitbox_kind(box) == 0x01) hitbox_set_state(box, box, 0x00, 0);
+    hitbox_set_state(box, box, 0x01, 0);
+    item_preview(REG16(0xFFFEE0UL));
+}
+
 /* ---- the touch hit test -----------------------------------------------
  * H'210EE2, and H'211252 beside it. Which box the operator pressed.
  *
@@ -11304,10 +12248,9 @@ static float float_at(u32 a)
     return v.f;
 }
 
-/* H'21548A. What a press actually does -- a switch on H'11A16D over seventy
- * entries, and the rest of the screen dispatcher below it. Not reconstructed
- * yet, so a press is recognised here but nothing happens. */
-STUB2(screen_action, 21548A)
+/* H'21548A. What a press actually does. Written out below the two hit
+ * tests, once everything it calls exists. */
+void screen_action(u16 value, u16 index, u8 second);
 
 /* The value a box stands for, and the two halves of a range on the screens
  * that edit one. */
@@ -11343,14 +12286,15 @@ static u16 hitbox_value_of(u32 e, u16 *out_value)
 /* What both of them do once a box has been picked: the beep, the action if
  * one is due, and the hold-off that keeps one press from reading as many.
  * [seen] is where the last value is remembered -- the two have one each. */
-static u8 hitbox_press(u32 e, u16 value, u32 seen)
+static u8 hitbox_press(u32 e, u16 value, u16 index, u32 seen)
 {
     if (touch_allowed(value) == 0) return 0x02;
 
     message_beep((u16)((REG8(e + 0x0A) == 0x01) ? 0x0001 : 0x0002));
 
     if (REG8(0x11A16FUL) != 0) {
-        screen_action();
+        screen_action(value, index,
+                      (u8)((REG8(e + 0x0A) == 0x01) ? 0x00 : 0x01));
         REG16(seen) = 0xFFFF;
         return 0x02;
     }
@@ -11394,7 +12338,7 @@ u8 remote_hit(u16 first, u16 last, u16 *out_value, u16 *out_index)
     hitbox_value_of(e, out_value);
     REG8(0x11F549UL) = 0x00;
 
-    return hitbox_press(e, *out_value, 0x11A1A2UL);
+    return hitbox_press(e, *out_value, box, 0x11A1A2UL);
 }
 
 /* H'210EE2. */
@@ -11449,9 +12393,367 @@ u8 touch_hit(u16 first, u16 last, u16 *out_value, u16 *out_index)
         *out_index = (u16)i;
         hitbox_value_of(e, out_value);
 
-        return hitbox_press(e, *out_value, 0x11A19EUL);
+        return hitbox_press(e, *out_value, (u16)i, 0x11A19EUL);
     }
     return 0x02;
+}
+
+/* Every one of these is a leaf of the dispatch above, and every one of them
+ * is four instructions that pick a record and branch out. They are the table
+ * entries, not routines, so they are written above as numbers:
+ *
+ * H'21562E  H'2156AE  H'2158D6  H'215912  H'21592C  H'215946  H'215960  H'21597A
+ * H'215994  H'2159AE  H'2159C8  H'2159E2  H'2159FC  H'215A16  H'215A30  H'215A6C
+ * H'215A86  H'215AA0  H'215ADC  H'215AF6  H'215B10  H'215B2A  H'215B44  H'215B5E
+ * H'215B78  H'215B92  H'215BAC  H'215BC6  H'215BE0  H'215BFA  H'215C14  H'215C2E
+ * H'215C48  H'215C62  H'215C7C  H'215C96  H'215CB0  H'215CCA  H'215CE4  H'215CFE
+ * H'215D18  H'215D32  H'215D4C  H'215D88  H'215DA6  H'215E1E  H'215F1C  H'215FF4
+ * H'21606C  H'2160B8  H'2160D2  H'2160EC  H'216106  H'216120  H'21613A  H'216154
+ * H'21616E  H'216188  H'2161A2  H'2161BA  H'21623E  H'216258  H'216272  H'21628C
+ * H'2162A6  H'2162C0  H'2162DA  H'2162F4  H'21630E  H'216328  H'216342  H'21635C
+ * H'216376  H'216390  H'2163C2  H'216446  H'216460  H'21647A  H'216494  H'2164AE
+ * H'2164C8  H'2164E2  H'2164FC  H'216516  H'216530  H'21654A  H'216564  H'21657C
+ * H'216654  H'21666C  H'216836  H'216850  H'21686A  H'216884  H'21689E  H'2168B8
+ * H'2168D2  H'2168EC  H'216906  H'216920  H'21693A  H'216954  H'21696E  H'216988
+ * H'2169A2  H'2169BC  H'2169D6  H'2169F0  H'216A0A  H'216A24  H'216A3E  H'216A58
+ * H'216A72  H'216A8C  H'216AA6  H'216AC0  H'216ADA  H'216AF4  H'216B0E  H'216B28
+ * H'216B42  H'216B5C  H'216B76  H'216B90  H'216BAA  H'216BC4  H'216BDE  H'216BF8
+ * H'216C12  H'216C2C  H'216C46  H'216C60  H'216C9C  H'216CFA  H'216D12  H'216D2A
+ * H'216D42
+ */
+
+/* ---- what a press does ------------------------------------------------
+ * H'21548A. Every press that reaches it ends up choosing one help record,
+ * and that is all it does: H'115D12 is left pointing at the record and the
+ * message screen draws it. Nothing here changes a setting or moves a motor.
+ *
+ * Getting to the record takes up to four dispatches. First on the screen
+ * being left (H'11A16D), then on the value the box carried, and for three
+ * of the screens on a table of their own. The other half of the routine --
+ * the one a press on the second box of a pair takes -- goes by the *kind* of
+ * pattern instead, searching a table of 54 kinds and falling back on the
+ * pattern's category.
+ *
+ * The records are longwords in the table at slot 0, H'11B29E, and what is
+ * reconstructed below is those offsets. They are laid out here exactly as
+ * the ROM's jump tables lay them out, because that is what they are: the
+ * original spends four instructions and a table entry on each where this
+ * spends one number.
+ */
+#define HELP_NONE       0xFFFF    /* no record: the screen is left as it is */
+#define HELP_SCREEN35   0xFFF1    /* H'94 on screen H'35, H'98 otherwise */
+#define HELP_MODULE_1E0 0xFFF2    /* H'1E0 with the module, H'C8 without */
+#define HELP_MODULE_0D4 0xFFF3    /* H'D4 with the module, H'D0 without */
+#define HELP_MODULE_1CC 0xFFF4    /* H'1CC with the module, H'1C8 without */
+#define HELP_MODULE_1D4 0xFFF5    /* H'1D4 without one, H'7C with */
+
+/* The value on the box, 1 to H'82, on the twenty screens that share
+ * one table. H'2156CE. */
+static const u16 help_by_value[] = {
+    0x00A8, 0x00B4, 0x00A4, 0x00B0, 0x00BC, 0x00C0, 0x00C4, 0xFFF2,
+    0x00A0, 0x00AC, 0x00CC, 0x009C, 0x00E8, 0x00DC, 0x00E0, 0x00E4,
+    0x0108, 0x00F4, 0x00F8, 0x00FC, 0x00F0, 0xFFFF, 0x0124, 0x0128,
+    0x00EC, 0x0110, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x011C,
+    0x0120, 0xFFFF, 0xFFFF, 0xFFF3, 0x0104, 0x00D8, 0x0100, 0x010C,
+    0x01C0, 0x01B4, 0x01B8, 0x01C4, 0xFFF4, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFF1, 0xFFF1, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x0118, 0x01B0,
+    0xFFFF, 0x00B8,
+};
+
+/* H'21608C. */
+static const u16 help_menu_35[] = {
+    0x0168, 0x012C, 0x012C, 0x0170, 0x016C, 0x0164, 0x01D8, 0x0174,
+    0x01EC, 0xFFFF, 0x01EC,
+};
+
+/* H'2161DA. */
+static const u16 help_menu_21[] = {
+    0x0168, 0x017C, 0x0178, 0x0148, 0x013C, 0x013C, 0x013C, 0x0174,
+    0x0130, 0x0134, 0x0138, 0x0140, 0x01DC, 0x0144, 0x0144, 0x0144,
+    0x0144, 0x0144, 0x0144, 0x0144, 0x0144, 0x0144, 0x014C, 0x014C,
+    0x0150,
+};
+
+/* H'2163E2. */
+static const u16 help_menu_22[] = {
+    0x0168, 0x0154, 0x0154, 0x0154, 0xFFFF, 0xFFFF, 0xFFFF, 0x0164,
+    0x0158, 0x0158, 0x0158, 0x0140, 0x015C, 0x015C, 0x015C, 0x0160,
+    0x0160, 0x0160, 0x01F0, 0x01F0, 0x01F0, 0xFFFF, 0xFFFF, 0xFFFF,
+    0x0150,
+};
+
+/* The kinds of pattern, and a record for each. The keys are at
+ * H'2166F2 and the handlers at H'21675A, counting down as the search
+ * counts up -- the same reversed-table idiom the service dispatcher
+ * uses. */
+static const u16 help_kind_key[] = {
+    0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008,
+    0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E, 0x000F, 0x0010,
+    0x0011, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017, 0x0018,
+    0x0019, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D,
+    0x002E, 0x002F, 0x0030, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x0146,
+    0x0148, 0x015A, 0x015B, 0x015C, 0x015D, 0x015E,
+};
+static const u16 help_kind_value[] = {
+    0x0004, 0x0008, 0x000C, 0x0010, 0x0014, 0x0018, 0x0018, 0x001C,
+    0x0020, 0x0024, 0x0028, 0x002C, 0x0030, 0x0034, 0x0038, 0x003C,
+    0x0040, 0x0028, 0x0030, 0x0024, 0x0044, 0x0048, 0x0048, 0x004C,
+    0x004C, 0x0184, 0x0188, 0x0190, 0x0194, 0x0198, 0x019C, 0x01A0,
+    0x01A4, 0x01A8, 0x01AC, 0x0050, 0x0054, 0x0058, 0x005C, 0x0060,
+    0x0064, 0x0068, 0x006C, 0x0070, 0x0074, 0x0078, 0x0078, 0x018C,
+    0xFFF5, 0xFFF5, 0xFFF5, 0xFFF5, 0xFFF5, 0xFFF5,
+};
+
+/* And if the kind is not in that table, the pattern's category,
+ * H'05 to H'0F. H'216CCE. */
+static const u16 help_by_category[] = {
+    0x0088, 0x0090, 0x0088, 0x0088, 0x0090, 0x0088, 0x0088, 0x0090,
+    0x0088, 0x0090, 0x008C,
+};
+
+/* One record chosen. The five values above H'FF00 are the ones the original
+ * spells out with a test rather than a table entry. */
+static void help_pick(u16 code)
+{
+    u16 offset = code;
+
+    switch (code) {
+    case HELP_NONE:
+        return;
+    case HELP_SCREEN35:
+        offset = (u16)((REG8(0x11A16DUL) == 0x35) ? 0x0094 : 0x0098);
+        break;
+    case HELP_MODULE_1E0:
+        offset = (u16)((REG8(0x57FF80UL) == 0xAA) ? 0x01E0 : 0x00C8);
+        break;
+    case HELP_MODULE_0D4:
+        offset = (u16)((REG8(0x57FF80UL) == 0xAA) ? 0x00D4 : 0x00D0);
+        break;
+    case HELP_MODULE_1CC:
+        offset = (u16)((REG8(0x57FF80UL) == 0xAA) ? 0x01CC : 0x01C8);
+        break;
+    case HELP_MODULE_1D4:
+        offset = (u16)((REG8(0x57FF80UL) == 0xB4) ? 0x01D4 : 0x007C);
+        break;
+    default:
+        break;
+    }
+    REG32(0x115D12UL) = REG32(TABLE_SLOT(0) + (u32)offset);
+}
+
+/* No record: the screen the press was on is put back, and on most of the
+ * paths the picker cursor is set going again. */
+static void help_give_up(int cursor)
+{
+    screen_switch(REG8(0x11A16DUL), 0x04, 0x00);
+    if (cursor) picker_cursor(0x03);
+}
+
+/* The eleven screens that do not share the big table. */
+static void help_from(const u16 *table, u16 n, u16 v, int cursor)
+{
+    if ((u16)(v - 1) > (u16)(n - 1)) {
+        help_give_up(cursor);
+        return;
+    }
+    if (table[v - 1] == HELP_NONE) {
+        help_give_up(cursor);
+        return;
+    }
+    help_pick(table[v - 1]);
+}
+
+/* H'21562E. Screens H'25 and H'26: values 1 to 4 share one record, and
+ * which one depends on whether the module is fitted. */
+static void help_screen_25(u16 v)
+{
+    if ((short)v >= 0x0001 && (short)v <= 0x0004) {
+        help_pick((u16)((REG8(0x57FF80UL) == 0xAA) ? 0x01D0 : 0x0084));
+        return;
+    }
+    if (v == 0x0005) {
+        help_pick(0x0080);
+        return;
+    }
+    help_give_up(0);
+}
+
+/* H'215DA6, H'215E1E, H'215F1C, H'215FF4, H'21657C. Five screens with a
+ * handful of values each, written out as tests rather than as a table. */
+static void help_screen_13(u16 v)
+{
+    if (v == 0x0017)      help_pick(0x0124);
+    else if (v == 0x0018) help_pick(0x0128);
+    else if (v == 0x001A) help_pick(0x0110);
+    else                  help_give_up(0);
+}
+
+static void help_screen_41(u16 v)
+{
+    if (v == 0x0017)      help_pick(0x0124);
+    else if (v == 0x0018) help_pick(0x0128);
+    else if (v == 0x0040) help_pick(0x011C);
+    else if (v == 0x0041) help_pick(0x0120);
+    else if (v == 0x000E) help_pick(0x00DC);
+    else if (v == 0x0019) help_pick(0x00EC);
+    else if (v == 0x001A) help_pick(0x0110);
+    else                  help_give_up(1);
+}
+
+static void help_screen_38(u16 v)
+{
+    if (v == 0x0010)      help_pick(0x0124);
+    else if (v == 0x0011) help_pick(0x0128);
+    else if (v == 0x0012) help_pick(0x011C);
+    else if (v == 0x0013) help_pick(0x0120);
+    else if (v == 0x0014) help_pick(0x00DC);
+    else if (v == 0x0015) help_pick(0x0150);
+    else                  help_give_up(0);
+}
+
+static void help_screen_24(u16 v)
+{
+    if (v == 0x0001)      help_pick(0x0170);
+    else if (v == 0x0002) help_pick(0x0170);
+    else if (v == 0x0019) help_pick(0x0150);
+    else                  help_give_up(0);
+}
+
+static void help_screen_37(u16 v)
+{
+    if (v == 0x0001)      help_pick(0x0164);
+    else if (v == 0x0002) help_pick(0x0180);
+    else if (v == 0x0003) help_pick(0x01E4);
+    else if (v == 0x0004) help_pick(0x01E8);
+    else if (v == 0x0014) help_pick(0x00DC);
+    else if (v == 0x0015) help_pick(0x0150);
+    else                  help_give_up(0);
+}
+
+/* ---- the other half: a press on the second box of a pair ---------------
+ * H'21666C. Here the record comes from what kind of pattern the value names
+ * rather than from the value itself. Field H'14 of the descriptor is the
+ * kind and field H'17 the category, and the category is the fallback.
+ */
+static void help_by_pattern(u16 v)
+{
+    const u32 rec = ITEM_TABLE +
+        (u32)(long)(short)(u16)(ITEM_STRIDE * v);
+    const u16 kind = REG16(rec + 0x14);
+    u16 k;
+
+    for (k = 0; k < 54; k++) {
+        if (help_kind_key[k] == kind) {
+            help_pick(help_kind_value[k]);
+            return;
+        }
+    }
+
+    {
+        const u8 cat = REG8(rec + 0x17);
+
+        if ((u8)(cat - 5) > 0x0A) {
+            help_give_up(1);
+            return;
+        }
+        help_pick(help_by_category[cat - 5]);
+    }
+}
+
+static void help_no_flag(u16 v)
+{
+    const u8 screen = REG8(0x11A16DUL);
+
+    if (screen == 0x13 || screen == 0x14 || screen == 0x38) {
+        screen_switch(screen, 0x04, 0x00);
+        return;
+    }
+    if (screen == 0x41) {
+        screen_switch(screen, 0x04, 0x00);
+        REG8(0x11B0A9UL) = 0x01;
+    }
+    help_by_pattern(v);
+}
+
+/* H'21548A. */
+void screen_action(u16 value, u16 index, u8 second)
+{
+    const u8 from = REG8(0x11A169UL);
+
+    REG8(0x11A16FUL) = 0x00;
+
+    /* The two screens that are themselves the help are not remembered, and
+     * a press on one of them does nothing at all. */
+    if (from != 0x08 && from != 0x3E) screen_remember(0x04);
+
+    if (hitbox_kind(index) == 0) message_show_held(index);
+
+    if (REG8(0x11A169UL) == 0x08 || REG8(0x11A169UL) == 0x3E) return;
+
+    screen_switch(0x08, 0x04, 0x00);
+
+    if (second == 0) {
+        help_no_flag(value);
+        return;
+    }
+
+    switch (REG8(0x11A16DUL)) {
+    case 0x25: case 0x26:
+        help_screen_25(value);
+        break;
+    case 0x13: case 0x14:
+        help_screen_13(value);
+        break;
+    case 0x41:
+        help_screen_41(value);
+        break;
+    case 0x38:
+        help_screen_38(value);
+        break;
+    case 0x24:
+        help_screen_24(value);
+        break;
+    case 0x23:
+        help_from(help_menu_35, 11, value, 0);
+        break;
+    case 0x15:
+        help_from(help_menu_21, 0x19, value, 0);
+        break;
+    case 0x16:
+        help_from(help_menu_22, 0x19, value, 0);
+        break;
+    case 0x37:
+        help_screen_37(value);
+        break;
+    case 0x02: case 0x03: case 0x04: case 0x07: case 0x09:
+    case 0x0A: case 0x0C: case 0x0D: case 0x2C: case 0x2D:
+    case 0x30: case 0x33: case 0x34: case 0x35: case 0x36:
+    case 0x3F: case 0x42: case 0x45: case 0x46: case 0x47:
+        if ((u16)(value - 1) > 0x0081) {
+            help_give_up(1);
+            break;
+        }
+        if (help_by_value[value - 1] == HELP_NONE) {
+            help_give_up(1);
+            break;
+        }
+        help_pick(help_by_value[value - 1]);
+        break;
+    default:
+        /* Everything else, and anything outside H'02 to H'47. */
+        screen_switch(REG8(0x11A16DUL), 0x04, 0x00);
+        break;
+    }
 }
 
 /* ---- SCI0, the embroidery module's link -------------------------------

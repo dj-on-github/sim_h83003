@@ -205,6 +205,34 @@ class Dmac {
   /// Total transfers performed, for display.
   int transferCount = 0;
 
+  /// One half-channel's state, packed.
+  static List<int> _halfState(DmacHalf h) =>
+      [h.mar, h.etcr, h.ioar, h.dtcr, h.marReload, h.etcrReload, h.transfers];
+
+  static void _restoreHalf(DmacHalf h, List<int> v) {
+    h.mar = v[0]; h.etcr = v[1]; h.ioar = v[2]; h.dtcr = v[3];
+    h.marReload = v[4]; h.etcrReload = v[5]; h.transfers = v[6];
+  }
+
+  /// The whole controller, packed, so a caller can put it back where it was.
+  List<int> saveState() {
+    final out = <int>[transferCount];
+    for (final c in channels) {
+      out..addAll(_halfState(c.a))..addAll(_halfState(c.b));
+    }
+    return out;
+  }
+
+  void restoreState(List<int> v) {
+    transferCount = v[0];
+    var i = 1;
+    for (final c in channels) {
+      _restoreHalf(c.a, v.sublist(i, i + 7)); i += 7;
+      _restoreHalf(c.b, v.sublist(i, i + 7)); i += 7;
+    }
+    syncToMemory();
+  }
+
   bool owns(int addr) => addr >= base && addr <= end;
 
   /// True when any channel is armed. Checked before doing any per-instruction

@@ -18,7 +18,6 @@
 // predict where. The application's own code region is excluded, since the
 // two images differ there by construction.
 
-import 'dart:typed_data';
 
 import 'h8300h.dart';
 
@@ -149,31 +148,21 @@ class RoutineComparer {
     return false;
   }
 
-  /// Snapshots every allocated byte, so the writes can be worked out
-  /// afterwards without having to guess where they will land.
-  Map<int, Uint8List> _snapshot(H8Cpu cpu) {
-    final out = <int, Uint8List>{};
-    for (final (from, to) in cpu.mem.regions()) {
-      for (var base = from; base < to; base += 0x10000) {
-        out[base] = Uint8List.fromList(
-            [for (var i = 0; i < 0x10000; i++) cpu.mem.peek(base + i)]);
-      }
-    }
-    return out;
-  }
-
-  Map<int, int> _writesSince(H8Cpu cpu, Map<int, Uint8List> before) {
+  /// What a run changed, from the memory's own undo log: every address it
+  /// wrote, against the value that was there before the first write. An
+  /// address written and then written back to what it held is not a change
+  /// and does not appear.
+  ///
+  /// This used to be done by copying every allocated byte before the run and
+  /// comparing every allocated byte after it -- four megabytes each way, for
+  /// a routine that usually touches a few dozen bytes. The log is exact and
+  /// costs nothing when nothing is written.
+  Map<int, int> _writesFromLog(H8Cpu cpu, Map<int, int> log) {
     final writes = <int, int>{};
-    for (final (from, to) in cpu.mem.regions()) {
-      for (var base = from; base < to; base += 0x10000) {
-        final old = before[base];
-        for (var i = 0; i < 0x10000; i++) {
-          final now = cpu.mem.peek(base + i);
-          final was = old == null ? 0 : old[i];
-          if (now != was && !_isExcluded(base + i)) writes[base + i] = now;
-        }
-      }
-    }
+    log.forEach((addr, was) {
+      final now = cpu.mem.peek(addr);
+      if (now != was && !_isExcluded(addr)) writes[addr] = now;
+    });
     return writes;
   }
 
@@ -204,7 +193,14 @@ class RoutineComparer {
     cpu.er[7] = stackPointer;
     cpu.pc = side.address;
 
-    final before = _snapshot(cpu);
+    // A caller may already be logging -- the comparer's tool keeps one
+    // running so it can put a borrowed machine back. Chain rather than
+    // clobber: this run gets a log of its own for the diff, and afterwards
+    // everything in it is folded into the outer one, keeping whichever old
+    // value was seen first.
+    final outer = cpu.mem.undoLog;
+    final log = <int, int>{};
+    cpu.mem.undoLog = log;
 
     var steps = 0;
     while (cpu.pc != sentinel && steps < stepLimit) {
@@ -212,6 +208,10 @@ class RoutineComparer {
       steps++;
     }
     final returned = cpu.pc == sentinel;
+    cpu.mem.undoLog = outer;
+    if (outer != null) {
+      log.forEach((addr, was) => outer.putIfAbsent(addr, () => was));
+    }
 
     return RoutineRun(
       steps: steps,
@@ -223,7 +223,7 @@ class RoutineComparer {
                   : side.resultWidth == 2
                       ? 0xFFFF
                       : 0xFFFFFF),
-      writes: returned ? _writesSince(cpu, before) : const {},
+      writes: returned ? _writesFromLog(cpu, log) : const {},
       returned: returned,
     );
   }

@@ -16,6 +16,7 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:sim_h83003/h8300h.dart';
 import 'package:sim_h83003/hex_files.dart';
@@ -90,14 +91,116 @@ RoutineSide buildSide(Map<String, dynamic> spec, Map<String, int> symbols) {
   );
 }
 
+/// One booted machine per (image, boot step), kept and handed back to case
+/// after case.
+///
+/// Booting is 1.9M instructions and every case used to do it twice; over a
+/// suite of a thousand cases that is five billion steps, and it is the same
+/// five billion every time. The machine is booted once, its state outside
+/// memory saved, and afterwards each case borrows it and puts it back: the
+/// memory from its own undo log, everything else from the saved state.
+///
+/// [_restoreBooted] is what makes that safe, and `--verify-restore` checks
+/// it the expensive way.
+class _Booted {
+  _Booted(this.cpu, this.state);
+  final H8Cpu cpu;
+  final List<int> state;
+  Map<int, int>? live;
+
+  /// Only filled in under --verify-restore: the whole of memory as the boot
+  /// left it, to check the undo log against.
+  Map<int, Uint8List>? pristine;
+}
+
+final Map<String, _Booted> _bootCache = {};
+
+/// --no-boot-cache boots afresh for every case, the way this worked before
+/// the cache existed. --verify-restore keeps the cache but checks after every
+/// case that the machine really did go back byte for byte.
+bool bootCache = true;
+bool verifyRestore = false;
+
+Map<int, Uint8List> _wholeMemory(H8Cpu cpu) {
+  final out = <int, Uint8List>{};
+  for (final (from, to) in cpu.mem.regions()) {
+    for (var base = from; base < to; base += 0x10000) {
+      final bank = Uint8List(0x10000);
+      for (var i = 0; i < 0x10000; i++) {
+        bank[i] = cpu.mem.peek(base + i);
+      }
+      out[base] = bank;
+    }
+  }
+  return out;
+}
+
+void _checkRestored(_Booted b) {
+  final want = b.pristine!;
+  final now = _wholeMemory(b.cpu);
+  for (final base in {...want.keys, ...now.keys}) {
+    final a = want[base], c = now[base];
+    for (var i = 0; i < 0x10000; i++) {
+      final x = a == null ? 0 : a[i];
+      final y = c == null ? 0 : c[i];
+      if (x != y) {
+        stderr.writeln('restore left H\'${(base + i).toRadixString(16)} at '
+            '${y.toRadixString(16)}, was ${x.toRadixString(16)}');
+        exit(3);
+      }
+    }
+  }
+}
+
 H8Cpu load(String path, int boot, Map<String, dynamic> analog,
     Map<String, dynamic> serial) {
+  final key = '$path|$boot';
+  final cached = bootCache ? _bootCache[key] : null;
+  if (cached != null) {
+    _restoreBooted(cached);
+    if (verifyRestore) _checkRestored(cached);
+    _prepare(cached.cpu, analog, serial);
+    cached.live = <int, int>{};
+    cached.cpu.mem.undoLog = cached.live;
+    return cached.cpu;
+  }
+
   final cpu = H8Cpu();
   loadRawBinary(File(path).readAsBytesSync(), 0, cpu.mem.poke);
   cpu.reset();
   for (var i = 0; i < boot; i++) {
     cpu.step();
   }
+  // The state that is cached is the machine *after* the interrupt mask, the
+  // timer enables and the counters have been dealt with, not before: with the
+  // timers still running, restoring would leave the counters to jump the
+  // moment anything read them.
+  _prepare(cpu, const {}, const {});
+  final entry = _Booted(cpu, cpu.saveState());
+  if (verifyRestore) entry.pristine = _wholeMemory(cpu);
+  if (bootCache) _bootCache[key] = entry;
+  _prepare(cpu, analog, serial);
+  entry.live = <int, int>{};
+  cpu.mem.undoLog = entry.live;
+  return cpu;
+}
+
+/// Puts a borrowed machine back the way the boot left it: every byte the
+/// last case wrote goes back to what it held, and the registers, flags and
+/// peripheral models go back to the saved state.
+void _restoreBooted(_Booted b) {
+  final live = b.live;
+  b.cpu.mem.undoLog = null;
+  if (live != null) {
+    live.forEach(b.cpu.mem.poke);
+    b.live = null;
+  }
+  b.cpu.restoreState(b.state);
+}
+
+/// What every case needs set before it runs, cached machine or fresh one.
+void _prepare(H8Cpu cpu, Map<String, dynamic> analog,
+    Map<String, dynamic> serial) {
   // Interrupts off before the routine runs. The two images are never at the
   // same point in the boot after the same number of steps -- the rebuild is
   // smaller and gets further -- so one of them may have its timers running
@@ -128,13 +231,16 @@ H8Cpu load(String path, int boot, Map<String, dynamic> analog,
   });
   // The serial receive registers are read-only to the CPU and the model
   // holds them, so a byte a routine is supposed to have received has to be
-  // put into the model rather than into memory.
+  // put into the model rather than into memory. A borrowed machine has
+  // already had its receive register put back to what the boot left, so only
+  // the cases that ask for a byte need to do anything here.
   serial.forEach((channel, value) {
     final ch = int.parse(channel) == 0 ? cpu.sci0 : cpu.sci1;
     ch.rdr = hex(value);
-    ch.syncToMemory();
   });
-  return cpu;
+  for (final ch in cpu.sci) {
+    ch.syncToMemory();
+  }
 }
 
 void main(List<String> args) {
@@ -145,7 +251,8 @@ void main(List<String> args) {
 
   if (args.isEmpty) {
     print('usage: compare_routines <spec.json> [--original IMAGE] '
-        '[--rebuilt IMAGE] [--symbols FILE] [--only NAME]');
+        '[--rebuilt IMAGE] [--symbols FILE] [--only NAME] '
+        '[--no-boot-cache] [--verify-restore]');
     exit(2);
   }
 
@@ -155,6 +262,8 @@ void main(List<String> args) {
   final rebuiltPath = opt('--rebuilt') ?? spec['rebuiltImage'] as String;
   final symbols = loadSymbols(opt('--symbols') ?? spec['symbols'] as String);
   final only = opt('--only');
+  bootCache = !args.contains('--no-boot-cache');
+  verifyRestore = args.contains('--verify-restore');
 
   var passed = 0, failed = 0, skipped = 0;
 
