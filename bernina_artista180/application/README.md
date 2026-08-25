@@ -1938,6 +1938,1253 @@ count is invisible to a comparison that looks at memory.
 
 **1,702 cases pass over 385 routines**, in twelve seconds.
 
+## Part 10, the embroidery panel
+
+Thirty-four routines under `H'235B0E`, the module's own eighteen-state
+machine, which is what `H'237E3C` waits on. The state machine itself is not
+written yet -- it and three others (`H'2417D4`, `H'2431EE`, and the
+dispatcher's `H'222AAC`) all end in computed jumps into inline blocks -- but
+almost everything beneath it now is.
+
+### What the panel is made of
+
+  * **the picture box** -- `H'24A432` puts a H'22 by H'22 box at one of four
+    places by `H'114D8E`, cleared, drawn from `H'34C148`, or filled; five of
+    the twelve states have no box at all. `H'21747E` is the same box nailed
+    to one place. `H'2498BE` blinks it, ten passes on and ten off, and a stop
+    key held freezes it wherever it is.
+  * **the progress bar** -- `H'217AEA`, a hundred and fifty-one pixels over
+    ninety-nine steps. The scale is a float constant, H'3FC33B7A, and the
+    zero point is forty less that, worked out at run time by the ROM and
+    folded by the compiler to H'4219E624 -- the same number either way.
+  * **five labels** -- `H'21759E`, `H'2175E8`, `H'21789C`, `H'217932` and
+    `H'21797E`, each one string in one fixed box, all centred. Three run down
+    the left edge and two along the top.
+  * **the numbers** -- how many millimetres across and down (`H'231C5E`), how
+    many stitches (`H'23202A`), how many minutes are left (`H'242FEA`), how
+    far through as a percentage (`H'23228A`), and which colour of how many
+    (`H'236B5A`, `H'23865A`).
+  * **the colour picture** -- `H'238D06` walks the record list at `H'104D4A`
+    and `H'238B62` paints the one it lands on, a one-bit stencil, most
+    significant bit first.
+
+### Three things worth writing down
+
+`H'249DE8` waits for the module to name itself and compares five bytes of its
+reply against `H'200103` -- inside the application's own identity block. The
+machine checks the module's firmware against its own version stamp.
+
+`H'238B62` keeps its running offset in sixteen bits, so a long enough record
+list wraps round past the end of the window at `H'114D49`. That is exactly
+what its one guard tests: reading past it sets bit H'2000 of `H'114D4C` and
+skips the byte. The test case for that had to be built by hand -- a first
+record whose two size words multiply out to H'FFE8, so the second lands at
+`H'114D3A` with its data straddling the edge.
+
+`H'242FEA` works the minutes out in floating point two different ways by
+`H'114D96`, and getting the operand order of the divide and the subtract
+wrong would have been easy. It was not: the eight cases passed first time,
+which pins `H'200530` as *er6 / er5* and `H'2005FE` as *er6 - er5*.
+
+### The same lesson, twice more
+
+Part 9d ended on a failing case that was an unpinned input rather than a
+wrong reconstruction. It happened twice more here.
+
+`H'2431C2` failed until `H'11A6C2` was pinned -- that was part 9d. Then five
+label cases failed because they use the *real* font tables in RAM at
+`H'119A66`, `H'11936E` and `H'1196EA`, and the two boots do not agree on
+every entry. A one-character string of "A" drew a glyph on the original side
+and nothing on the rebuilt one. The fix was to fill all three tables with a
+synthetic font of ten glyphs.
+
+Filling all three with the *same* font then hid a real error: the mutation
+that swapped one label's font for another's went unnoticed, because the two
+were now identical. They are filled with three different rotations of the
+glyph set now.
+
+A third: `H'21759E`'s box moved by a row and nothing changed, because the
+frame buffer was filled with nought and clearing a box writes nought. Filling
+it with H'55 instead made the mutation visible.
+
+Three separate ways for a case to be quietly empty, all found by mutation and
+none by the suite going green.
+
+### The mutations
+
+A hundred and forty-two planted errors over the thirty-four routines. Three
+survived and all three are provably so:
+
+  * `H'217AEA`'s scale constant off by one unit in the last place. Computed
+    for all ninety-nine inputs: the edge pixel never moves.
+  * `H'244A2A`'s quarter-second delay and `H'249DE8`'s H'9C4 tries -- the
+    same shape as part 9c's survivor, a count nothing can observe.
+  * `H'23865A`'s "drawn once" flag. With it wrong the picture is drawn twice
+    instead of once, from the same record, into the same place.
+  * `H'23228A` copies six bytes out of `H'25077C` into its buffer and writes
+    straight over them with the number. Nothing reads past the terminator, so
+    the copy cannot be seen. Reproduced because it is there.
+
+`H'23BB18` is here too: the hoop check that runs before a pattern is
+sewn, four steps deep, asking the module which hoop is fitted and comparing
+the answer against the three stitch-record bytes it last asked about.
+
+**1,964 cases pass over 420 routines.**
+
+## Part 10b, casing what was already written
+
+Two routines from part 8's dispatcher front had been written and never
+compared: `H'21F87A`, which decides whether the screen being left goes on the
+stack, and `H'21F940`, which decides what to do about the one being asked
+for.
+
+`H'21F940` was wrong. The reconstruction had
+
+    if (to == 0x007B) return 0x02;
+
+where the ROM's `BEQ H'21F992` jumps to the *write*, not to the refusal:
+
+    H'21F96E  CMP.W #H'007B,R6
+    H'21F972  BEQ H'21F992        <- the write
+    ...
+    H'21F992  MOV.L @ER7,ER6
+              MOV.W @H'11B10E:24,R5
+              MOV.W R5,@ER6
+              MOV.B #H'03,R6L
+
+Screen H'7B and a forced move both *skip the "already there" test* rather
+than answering "do nothing". The comment above the routine described the
+behaviour correctly; the code under it did the opposite. Thirty-six cases
+found it in one run.
+
+That is the argument for casing code that is already written, rather than
+only casing what is new: eighty-three of the routines in `app.c` still have
+no head-to-head case, and at least one of them was wrong.
+
+Three of the mutations against these two needed the cases sharpening before
+they were caught, all for the same reason -- the mutant and the original
+happened to agree on the inputs chosen:
+
+  * screen H'7B needed `H'11A17E` to *hold* H'7B, or both readings write.
+  * a forced move needed the screen to be the one already up, or both
+    readings write.
+  * the message number needed a message the fill actually has a table entry
+    for; two absent ones draw the same nothing.
+
+Three more went the same way: `H'21DFCA`, which resets the user pattern list,
+and `H'2104E2`, the byte fill that lets the service hook run between bytes.
+One mutation against the fill survives -- swapping the hook to *after* the
+store instead of before it -- because in every fill the hook's guard is false
+and it does nothing at all. Making it observable means letting `service_tick`
+run, and that path's own inputs are not pinned yet: the case built to try it
+failed on the unmutated build, which is the "unpinned input" story a third
+time. It is dropped rather than left failing.
+
+**2,003 cases pass over 424 routines**, in thirteen seconds.
+
+## Part 11, the state machine cluster
+
+Three state machines call each other and call back into the first through
+H'244DE0, so none of them compiles without the rest: `H'235B0E` is the
+module's own eighteen states, `H'2417D4` the nine that fetch a run of
+patterns, and `H'2431EE` the twelve that start and stop the sewing. Walking
+the closure out from them gives eighteen routines and about 3,900
+instructions, and nothing beyond it except the compiler's own float library.
+
+Seventeen of them are written now. What is left is `H'244F14` and the two
+machines that call it.
+
+### The ROM has its own libm
+
+`H'24ABFE`, `H'24ABEE`, `H'24ADDC` and `H'24ABC4` are a square root, a sine,
+a cosine and an arc tangent, with `H'24AF80`, `H'24AE5A`, `H'24AD22` and
+`H'24AD62` -- a `frexp` and a `modf` -- underneath them. The application is
+linked `-nostdlib`, so there is no `libm` to fall back on and they have to be
+right to the last bit.
+
+They are. Every constant is written as the decimal that encodes to the ROM's
+exact pattern (H'3F490FDB is `0.7853982f`, H'3FB504F3 is `1.4142135f`, and so
+on), every operation is in the order the ROM does it, and the three places
+that take a float apart -- halving an exponent, clearing a sign, forcing a
+mantissa -- do it on the bit pattern, which is what `ADD.W` and `AND.W` on the
+top half of a register amount to.
+
+**A hundred and twenty cases over twenty arguments each, and they passed on
+the first run.** That is the strongest evidence yet that the float library at
+`H'200530` and its neighbours is the same code GCC ships: if it were not, the
+last bit of a rational approximation would not survive twenty inputs, six
+routines deep.
+
+The sine and cosine share `H'24AF80`, which reduces the angle by quarter
+turns. Above 65532 of them it stops trusting `(float)(int)` and reduces with
+two calls to `modf` instead.
+
+### H'2417D4, the fetch
+
+Nine states, and the jump table's shared-tail trick again: states nought and
+one enter the *same* body, four bytes apart, with nought only setting the
+counter to H'FF on the way in. The pattern records arrive sixteen bytes at a
+time from H'11F316 into H'11A25A, one per slot, each followed by a message
+H'02 out to the module.
+
+Under it, `H'241FA0` takes the whole run of patterns together and moves the
+current slot's centre to the middle of the box that holds them all;
+`H'24217A` gives one pattern's reach along each axis once its scale and
+rotation are applied, out of the four corners of the rotated rectangle; and
+`H'241228` walks the block stream at H'10C27A to find the header.
+
+### Two errors, and one that was not
+
+`H'23E510`'s step three does not wait for the link. Every refusal in it still
+moves the sequence on -- all the branches land on the same `11A63E = n + 1`
+-- and the reconstruction had them returning instead. One case found it.
+
+`H'2417D4` state one compares "how many patterns, less one" against "which
+slot we are on", and the reconstruction read a *word* at H'11A640 where the
+ROM reads a byte. The high half of that word is H'11A641, so the comparison
+never matched and the machine never left state one.
+
+The third looked like an error and was not. Several cases failed on H'FFFFB4
+alone, "original 84, rebuild 80" -- and H'FFFFB4 is SCI0's status register,
+not RAM. Bit 2 is TEND, which the model sets when a transmission finishes,
+so the two runs disagreed only because the rebuild got there in fewer cycles.
+The cases exclude it.
+
+`H'23DE04` cannot be compared at all: it busy-waits for a send to complete,
+and the harness runs with interrupts masked, so both images spin for ever.
+It is written from the disassembly and left uncased, which is said here
+rather than papered over.
+
+**2,244 cases pass over 439 routines**, in fourteen seconds.
+
+## Part 11b, the cluster closed, and the module key with it
+
+`H'244F14`, `H'2431EE` and `H'235B0E` are written, and with them the
+`H'244DE0` -> `H'23182A` -> `H'2315A4` chain that closes the knot: the state
+machine calls the screen step, which calls the link-lost handler, which calls
+the wait pass, which calls the state machine. Four routines, one cycle, and
+none of them compiles without the other three.
+
+`H'237E3C` -- the module key handler that started this whole thread -- is
+written too, along with `H'231B32` underneath it.
+
+### H'244F14, the hoop check
+
+The same four rotated corners as `H'24217A`, with the hoop's own middle and
+the pattern's placement added in, then each corner tested against the hoop's
+width and height. Any corner past an edge, or behind the origin, and the
+answer is no.
+
+The comparisons go through `H'20074A`, which compares two floats by their bit
+patterns and gets it right -- including both-negative, where it masks the
+signs and compares the other way round -- so plain C comparison does the same
+thing.
+
+The mutation that swaps the two arms of its "which way round is the pattern"
+test survives, and provably: the four corners are the same multiset either
+way, and the test asks only whether *any* of them is outside.
+
+### Three registers the ROM never initialises
+
+`H'235B0E` uses R1 as a H'C8 spin count in state H'0A and R3L as a delay
+counter in states H'0D and H'0E, and initialises neither. Both are saved and
+restored by the prologue, so neither survives a call -- the spin count never
+reaches H'C8 in the original any more than it does here. They are written as
+locals starting at nought, and the H'C8 branch is unreachable in both.
+
+`H'24217A` and `H'244F14` have the same shape: the angle to the corner is
+never worked out when the scaled width is nought, and the ROM uses whatever
+the stack held. Started at nought here, and no case goes there.
+
+### Two blocks that look the same and are not
+
+`H'235B0E` and `H'244DE0` both write out a "give up on the module" block, and
+they are nearly identical: everything cleared, the hardware released, message
+H'03/H'04 sent. The reconstruction shared one routine between them and the
+cases caught it. `H'244DE0`'s clears H'114D83 rather than H'114D65, does not
+raise bit 5 of H'FFFEC4, and does not ask for a screen afterwards.
+
+### A case set that was quietly running the wrong slot
+
+Every `H'235B0E` case had `H'11A660` set to one and then zeroed again, because
+a fill inherited four routines back had `11A660:C0` in it -- a range fill,
+landing later in the dictionary than the single byte that set it. So all
+fifty cases ran with slot nought, and state five's "how many turns" scale was
+never exercised: two mutations against it went unnoticed until the byte was
+re-appended at the end of the fill.
+
+That is the fourth distinct way a case set has been quietly empty in this
+project, and the second caused by fill ordering rather than by a missing
+value.
+
+### The mutations
+
+Fifty-six planted errors across the cluster. All were caught except the
+corner-swap above.
+
+Three cases had to be dropped as untestable rather than left failing: two
+routines busy-wait for a send to finish, which needs the transmit interrupt
+the harness masks, and one input to `H'231B32` sends the ROM into an infinite
+loop of its own. All three spin identically in both images.
+
+**2,400 cases pass over 447 routines**, in nineteen seconds. The application
+now has 91,352 bytes of reconstructed code in it.
+
+## Part 12, the screen bodies -- measured, and begun
+
+`H'22382A`'s dispatch table at `H'2238B0` has **seventy-nine entries** over
+fifty-five distinct targets, covering screen numbers H'00 to H'4E. The bodies
+are inline blocks running from `H'2239EC` to about `H'2283xx`: **5,022
+instructions**, none of them a callable routine.
+
+Between them they call 113 routines, of which 86 were not written. Those 86
+come to **10,520 instructions** at the first level alone, before their own
+closure. So the screen bodies are roughly three times the size of everything
+reconstructed in parts 10 and 11 put together, and they are the last large
+piece of the application.
+
+### The first five helpers
+
+Ranked by how many bodies call them:
+
+  * `H'213882` (20 callers) -- the eleven boxes of the stitch-width strip,
+    from a table of four words each at `H'11524E`, with the one `H'FFFEEA`
+    names drawn over the top. `H'11B2D0` remembers which was lit, so a move
+    repaints two boxes rather than twelve.
+  * `H'21348C` (12) -- the two arrows beside a list, lit or dim by where the
+    window sits in it. The end of the window is *entry one's* value plus the
+    span, which is an odd place to keep it; the length of the list is the
+    first word the list points at.
+  * `H'21B34C` (10) -- the number in `H'FFFECD` drawn top right, and only
+    when it moves.
+  * `H'213ABC` -- the needle-stop picture, one of two by bit 5 of
+    `H'FFFEF6`. The bit is rotated down to the bottom of the byte three times
+    rather than shifted, which comes to the same thing.
+  * `H'21752E` -- the sewing screen's picture box, cleared in frame B and
+    drawn into frame A.
+
+Twenty-one planted errors, all caught but one, and that one provably: in
+
+    if (v == 1) { ... } else if (v > 1) { ... }
+
+the else-if can never see v equal to one, so `>` and `>=` agree on every
+value that reaches it.
+
+Five of the twenty-one needed the cases sharpening first. The back arrow's
+whole half was never exercised because no case gave the box a value of one,
+and the window comparison was never at its boundary; both were fixed by
+choosing the span so the window ends exactly on the list's length.
+
+**2,431 cases pass over 452 routines.**
+
+### Four more, and the shape they share
+
+`H'21EF02` and `H'21C672` are the same screen written twice: one flash byte,
+two boxes that are the yes and the no of it, H'19 to save and H'1A to leave
+without saving. The first owns `H'57EFC6` and the second `H'57EFC7`, and the
+second also drives bit 6 of `H'FFFEC1` from what it saved. The working copy
+lives in RAM and is what the single-byte flash write is given the address of.
+
+`H'21BDD6` is the demonstration screen: five pictures a second apart, with
+`H'11B362` counting round them modulo five, and picture nought coming out of
+the configuration block rather than the table. `H'2224E8` puts the pattern
+strip back from the second store.
+
+Twelve of the twenty-eight mutations against these needed the cases fixing
+first, and the reasons are worth listing because they are the same few every
+time:
+
+  * every picture in the table pointed at the *same* image, so which entry
+    the code chose could not be seen. Ten distinct run-length pictures had to
+    be built by hand -- a word count and then runs of length and colour --
+    because the two real images to hand were the only ones that loaded.
+  * the box the touch landed on had a value none of the four branches
+    matched, so the save and leave paths never ran at all. Six mutations
+    were sitting behind that one.
+  * the case fill unioned the touch-test fill *under* the screen-switch fill,
+    and the second one's `H'11A160` range put the hit test's own state back
+    to nought. Reversing the two made the presses work.
+  * `H'114DE0`, the millisecond count, is not the same in the two boots, and
+    the leave path writes it.
+
+Two mutations survive. One is the `>` in an else-if that can never see the
+value the branch above it caught. The other swaps two `hitbox_set_state`
+calls on different boxes, which is invisible while the boxes do not overlap
+-- true of every real hit-box table, but not a property of the code.
+
+**2,463 cases pass over 456 routines.** Nine of the eighty-six callees are
+written.
+
+### The fully closed ones
+
+Of the seventy-seven left, twenty-one call nothing that is missing and have
+no jump table of their own -- 2,340 instructions between them. **All
+twenty-one are now written.** The first eight:
+
+  * `H'222FD2` -- where the page holding a position starts. The first fifteen
+    are one page; after that they are five long.
+  * `H'21B9CE` -- a screen with one way out, key H'77 for screen H'17.
+  * `H'21B6C6` -- the byte in `H'FFFED8` as a number, right-aligned.
+  * `H'21C466` and `H'229F7E` -- two more yes-and-no screens, but these save
+    nothing: a RAM byte and straight back to the slot-four screen.
+  * `H'23033A`, `H'2180C8`, `H'21C3B8` -- three menu screens. The middle one
+    sets `H'11B108` to the first item of whichever category was pressed.
+
+`H'21B6C6` gives its number two bytes of stack, which is one short of what
+three digits need. The field never holds three, and the reconstruction gives
+it four with a note rather than reproducing an overflow that would land in a
+different place on each side.
+
+`H'222FD2` has a boundary that cannot be told apart: at fifteen, both the
+early return and the loop that follows it arrive at one.
+
+Thirty-one more mutations, and the pattern from the batch before repeated
+almost exactly. Nine needed the cases fixing first, and every one of the nine
+was a case that never reached the code it was supposed to test:
+
+  * a box whose value matched none of the branches (four times);
+  * a box marked absent in the fill, so the press never landed on it;
+  * a box with a *list* behind it, so its value came from the list rather
+    than from the field the case had set;
+  * a descriptor table where every category answered "position one", which is
+    also what the routine returns when it finds nothing;
+  * a screen stack that was already empty, so popping it did nothing;
+  * `H'114DE0` again -- the millisecond count, which the two boots disagree
+    about and the leave path writes.
+
+### Three more menus, and a tool to stop hand-cutting hit boxes
+
+`H'218292`, `H'218188` and `H'217DE0` are three menu screens of the same
+shape as `H'2180C8`: a press, a screen change, and the first item of a
+category into `H'11B108`.
+
+Nine of the failures in the batch before came from hand-written hit-box
+offsets in the case fills, so `tool_boxfill.py` now generates them: a row of
+boxes H'20 apart and H'18 wide, eight to a row, with a `touch()` that aims
+the panel reading at the middle of one. The row spacing is what lets a whole
+row sit inside the single byte the panel leaves in `H'FFFED9`; screens with
+more than eight boxes get a second row H'30 lower.
+
+### The last ten
+
+  * `H'219CC8` -- twelve boxes, ten of them a choice. The lit one is
+    remembered in `H'11A1AA` so the next press can put it back, and the
+    choice is written to `H'11B0FF` as the value plus H'9C.
+  * `H'21BBE6` -- the display test: three full-screen fills, one press apart.
+  * `H'2227E6` -- the input trim, a step at a time, with one byte written
+    back to flash on accept and read back out of it on cancel.
+  * `H'21B7DA` -- the pedal test: a number and two lamps, each redrawn only
+    when it has moved.
+  * `H'21BA0E` -- which machine this is, H'AA or H'B4, written to `H'57FF80`.
+  * `H'22253E` -- calibrating the touch panel. Two crosses give a straight
+    line each way; the four floats go to `H'57FFA0`.
+  * `H'211E9C` -- `H'211C38` with a panel drawn round each picture.
+  * `H'21CB2C` -- the top sewing speed, in steps of ten.
+  * `H'2303EE` -- the module's own menu: two boxes and eleven ways the second
+    can go.
+  * `H'2144CA` -- the strip along the top of the sewing screen, redrawn only
+    where something has moved.
+
+Three of these needed the harness stretched a little.
+
+**A local read before it is written.** `H'21BA0E` hands `H'211A9E` its
+second local on the way out, and on that path nothing has written it: what it
+gets is the box index the hit test below leaves there, from whichever pass
+last went that way. GCC puts its own second local at the same offset -- four
+bytes of saved register then `SUBS #4`, the same frame the original builds --
+so pinning the word below the harness's stack pointer pins it on both sides,
+and the mutation that replaces the read with a constant dies. The
+reconstruction leaves the local uninitialised deliberately, with a note.
+
+**Colour 1 does not exist.** `H'20E826` fills a run with H'00 for colour 0,
+H'AA for colour 2 and H'FF for colour 3, and has no case for colour 1 -- so a
+full-width fill in colour 1 lays down zeros exactly like colour 0. The
+mutation that changes the display test's second fill from 0 to 1 is
+equivalent and cannot be killed; 2 and 3 both kill it.
+
+**`EXTS.L` on a byte.** `H'2144CA` scales a foot number into a table with
+`SHLL` three times and then `EXTS.L`. The input is a byte, so the sign bit
+can never be reached and the sign extension can never bite: replacing it with
+a zero extension is a second equivalent mutation. Both are transcribed as the
+original has them.
+
+Two things could not be driven from these screens and are recorded rather
+than tested:
+
+  * `H'21BA0E`'s flash branch calls `H'21DDC4`, and from this screen's boot
+    state that call never returns -- on *both* images, so it is the state and
+    not the reconstruction. `H'21DDC4` and `H'250AEC` have their own cases;
+    what is untested here is only that this screen reaches them.
+  * `H'2303EE`'s long branch ends with two sends and two waits for the link
+    to go quiet. With interrupts masked a send never completes, which is the
+    same wall the state-machine cluster hit. Every case for that branch
+    leaves the link busy so it stops short of the sends.
+
+Ninety-nine mutations across the ten, all but the two equivalent ones killed.
+Six needed the cases fixing first, and the by-now-familiar list grew two new
+entries:
+
+  * a wide fill written *after* the bytes it covers, so the value the case
+    thought it was setting was zeroed again -- three times, once for a word
+    and twice for a whole list. `routines.json` fills apply in dictionary
+    order, and `dict.update` keeps an existing key where it already was;
+  * a font table copied by address prefix rather than by address range, so
+    the glyph pointers were left at zero and the text drawing ran off the end
+    of the frame buffer;
+  * a screen number that the same kind of wide fill had zeroed, so the push
+    at the top of `H'21CB2C` found the screen already on the stack and did
+    nothing.
+
+**2,640 cases pass over 477 routines.** Twenty-seven of the eighty-six
+callees are written; app.bin is 99,812 bytes.
+
+### Counting again, properly
+
+The census that said "twenty-one closed" was done with a linear scan for
+`JSR` and `BSR` opcodes. That scan reads data and instruction operands as
+though they were instructions, so it invents calls: `H'21B3DE` came out
+"one routine away" because of four bytes in the middle of a `MOV.W` that
+happen to look like a `BSR`. Redoing the census through the decompiler --
+which follows the control-flow graph and knows where instructions start --
+gives a different and correct list, and also says which routines end in a
+jump table of their own.
+
+Of the fifty-seven, four were genuinely closed and table-free. All four are
+now written, along with three of the routines they and their neighbours wait
+on:
+
+  * `H'20E126` -- one display buffer filled with a byte, H'4B00 of them.
+    Sixty-one of the bodies call it, which makes it the most-called thing
+    left. It takes its buffer back off the stack rather than out of the
+    register it arrived in, and throws the saved copy away with the
+    arguments rather than popping it.
+  * `H'21B726` -- the needle position, in steps of four between zero and
+    H'10.
+  * `H'21BD1E` -- the application's version, drawn once. The string is the
+    identity block from its fourth byte, past the "NMM".
+  * `H'219978` -- four boxes, three of which go somewhere and one of which
+    comes back off the stack to whatever `H'11B0A6` names.
+  * `H'22298C` -- the version again with the module's beside it, drawn only
+    when the module answered something other than the empty string.
+  * `H'24AAA2` -- the ROM's strcpy, beside the strcat that was already
+    there. Same idiom: the loop ends on the flags the *store* left, because
+    the `ADDS` between does not touch them.
+  * `H'222DF4` -- three runs of screen numbers that want repainting.
+  * `H'212E78` -- a run of boxes drawn again from whatever list each one
+    already points at, rather than from a list handed in. It copies the
+    whole H'12-byte entry into a local first and works from the copy.
+
+`H'2104E2` had to stop being `static`. It is a routine in its own right in
+the original and has its own cases, but once `H'20E126` started calling it
+the compiler inlined every copy and left no symbol for the harness to find.
+
+Fifty-one mutations, all killed. Four cases needed sharpening, and three of
+the four were the same thing in different clothes: a font table whose glyph
+pointers were identical to another font's, a rectangle cleared to the colour
+the buffer already held, and a screen that was already blank. Drawing that
+changes nothing is invisible to a comparison of what changed, which is the
+drawing-code equivalent of writing zero over zero.
+
+**2,694 cases pass over 485 routines.** app.bin is 100,988 bytes.
+
+### Fifteen more, from the level below
+
+The corrected census also says how shallow the waiting is. Nine of the
+thirty-six unclosed helpers are one routine away, and the routines they wait
+on are mostly small. Written next, in rough order of what they unlock:
+
+  * `H'21CF7C` and `H'21CF86` -- how deep the screen stack is, and what is at
+    a given depth. Entry zero of the stack is the depth itself, which is why
+    both read from the same address.
+  * `H'24AAD2` -- the ROM's strncpy, beside the strcpy and strcat. The count
+    is tested before it is decremented, so a count of zero copies nothing.
+  * `H'246D7E` -- the other half of `H'246D8C`: the same byte, set instead of
+    cleared.
+  * `H'2220DC` -- the drawing areas cleared and the queue position taken
+    away.
+  * `H'210544` and `H'21056C` -- the help pictures. Two tables of H'24-byte
+    records, nine longwords each, one per machine; `H'219DE0` picks the
+    second when the configuration byte says H'AA, so the first is the
+    machine without the module. The record number is multiplied out as a
+    longword and the field number added to the *low half* of it, so the
+    index is a signed word however far the multiplication carried.
+  * `H'21C150` -- the version string drawn where `H'21BD1E` draws it. Like
+    `H'20E126` it takes its argument back off the stack.
+  * `H'218C1A` -- a cursor that blinks: one pass in ten flips it.
+  * `H'24A374` -- whether the thing that owns the link is still waiting.
+    Six owners have an answer and everything else says no. `H'114DB9` is
+    re-read before each of the six tests rather than kept.
+  * `H'217CCE` -- one third of a box marked: the box cleared and a narrow
+    rectangle drawn inside it at +2, +H'0E or +H'1A. Any other third does
+    nothing at all, not even the clear.
+  * `H'212FF0` -- a run of boxes moved along, values and lists carried over
+    and the state carried with `H'211518` where it differs. Which way the
+    copy runs depends on which way the run moves, so a source and
+    destination that overlap do not eat themselves.
+  * `H'21CFB0` -- the bar beside the balance setting, drawn from the middle
+    of its track outwards. The far end is the value times minus three and an
+    eighth plus a hundred and six and a half, so eight lands exactly on the
+    middle.
+
+Fifty-two mutations. Three survived and all three are provably equivalent:
+
+  * `H'212FF0`'s two direction tests, `>` and `<`, at the point where the
+    source and the destination are the same box. Copying a box onto itself
+    writes nothing and cannot change its state, so it does not matter which
+    way the loop is entered -- or whether it is entered at all.
+  * `H'21CFB0`'s `<=` against the middle of the track, at the one value that
+    lands exactly on it. Both branches then draw the same two rectangles:
+    `top..end-1` and `mid+1..bot` on one side, `top..mid-1` and `end+1..bot`
+    on the other, and with `end == mid` those are the same two.
+
+**2,758 cases pass over 498 routines.** app.bin is 102,508 bytes.
+
+### And seven more, as the cascade ran
+
+Each of those opened others. `H'218378` closed `H'218780`, which closed two
+more; `H'212FF0` closed `H'213274` and `H'213356`, and those two closed
+`H'219A52`. Written next:
+
+  * `H'218378` -- two strokes of a preview drawn or rubbed out, from two
+    tables of H'10-byte entries in RAM, four entries each: two line segments
+    per entry, offset H'8C across and H'64 down. The original spells all four
+    branches out in full, sixteen table reads apiece.
+  * `H'213274` and `H'213356` -- a run of boxes scrolled through its list, on
+    and back. Both move the run with `H'212FF0` and then patch up the boxes
+    left over at the far end. The un-greying writes the state byte straight
+    rather than going through `H'211518`, but the greying does not, so that
+    the picture is drawn.
+  * `H'21AC2E` -- one box, and it goes back to whatever the screen stack has
+    on top: the depth read first and used as the index into the stack, which
+    is the same address read again as a number.
+  * `H'216E6C` -- a message that goes away either when its box is pressed or
+    when the thing that put it up stops waiting. A clear bit *and* a waiter
+    that has stopped both fall into the hit test, which the pseudocode does
+    not show: the two tests branch to the same place.
+  * `H'21D104` -- the presser-foot pressure on the balance bar. Accepting
+    leaves the screen before it writes the flash.
+  * `H'218780` -- the two boxes at H'1C and H'1D and the stroke that goes
+    with them. The record index here is widened *without* sign, unlike every
+    other use of the stitch descriptor table.
+
+`H'216E6C` reads its first local before writing it, exactly as `H'21BA0E`
+does, and this time the compiler put its own first local somewhere else in
+the frame. Both slots are pinned in the fill instead of one.
+
+Forty-eight mutations, all killed. Two needed a case adding rather than
+fixing: a run extended by one box only shows when the extra box is in a
+state the call would change, so the greyed-boxes case had to exist before
+extending the run from H'1D to H'1E could be caught.
+
+`H'219A52` came with them: a list of twelve boxes with arrows either side
+and a choice remembered in `H'11B328`. Scrolling puts the lit box out and
+lights whichever box the choice has moved to *afterwards*, found by value
+rather than by index because the boxes have shifted underneath it. That
+routine is the first user of both scrollers and of `H'211B26`, and it is what
+the whole cascade was for.
+
+**2,823 cases pass over 506 routines.** app.bin is 104,420 bytes.
+
+### The last three closed ones
+
+  * `H'219DE0` -- the help page for whatever `H'11B0FE` and `H'11B0FF` name.
+    Which of the two picture tables, and how long a record is, both follow
+    the configuration byte: the machine with the module has nine parts to a
+    record and the one without has ten, though both tables are laid out the
+    same way. A record whose first part is there and whose second is not is
+    one picture for the whole page: it goes into the scratch buffer and is
+    copied across from there, which is what stops it appearing a strip at a
+    time. Otherwise the nine parts go into the nine boxes, the ninth placed
+    by its own width and height so its bottom right corner lands at
+    H'0112, H'00EA.
+  * `H'21C846` -- the beep settings: eight of them, each a pair of bytes,
+    copied out of flash to be edited and written back on accept. Boxes 9 and
+    H'0A check `H'11A1B6` before following it; box H'0B does not.
+  * `H'221B6E` -- the pattern strip put back when one of seven screens is
+    returned to. Four shapes, all ending the same way, and anything but
+    those seven screens does nothing at all -- not even the tail. The strip
+    is the same four rectangles every time; what changes is which run
+    carries the list, which run is handed over, and where the arrows are.
+    Two of the four slide a run of boxes along first, which is what makes
+    room for the wider strip.
+
+Forty-six mutations, all killed. Twelve needed the cases sharpening, and
+they were all one thought: **a mutation can only die if the code it changes
+had something to change.** A run extended by one box needs that box to be in
+a state the call would alter; a shift moved by one box needs the boxes to
+hold different values; `fresh` on the arrows needs them already drawn the
+way they should be; `force` on the leave hook needs the pattern number to
+match the one it would write. Each of those started out invisible because
+every box in the fill was identical.
+
+Two of the twelve were the fill-ordering trap again -- `H'11A1BB` was left
+at whatever the boot had put there because the key that set it did not match
+the prefix the case builder filtered on, and `H'11A169` was zeroed by a wide
+key written after it.
+
+Writing `H'218780` had already closed two more of the fifty-seven, and they
+turned out to be one routine twice over: `H'2189A6` and `H'218ADE` step the
+stroke number in H'FFFEFD, one per stroke table, wrapping at three and at
+H'0F. Entering either calls `H'218780` twice, once as a press and once as a
+release, which is what puts the two boxes and the stroke up to start with; a
+press on a greyed box is dropped before the message, so a screen whose
+pattern is in the wrong category says nothing at all.
+
+Their fourteen mutations found five more cases that reached the code without
+being able to see it. Two are worth naming because they are new shapes:
+
+  * `hitbox_kind` was read *after* `H'218780` had already un-greyed the box,
+    so by the time the test ran the box was in state 0 and no comparison
+    against it could matter. It takes a screen where the category is wrong
+    -- so the un-greying never happens -- for the test to bite.
+  * The down box carried the up box's value. The case pressed the box it
+    meant to and the routine took the other branch, and every mutation of
+    the down branch lived.
+
+**2,881 cases pass over 511 routines.** app.bin is 107,044 bytes.
+
+### What a mutation needs before it can die
+
+Three of `H'219A52`'s fifteen mutations survived their first run, and all
+three for the same underlying reason: the case reached the code but the code
+had nothing to change.
+
+  * Swapping the `second` argument to `H'211B26` picks a different box, but
+    both boxes were already in the state the call sets, so the call did
+    nothing either way. It takes a screen where the boxes are lit before the
+    difference is visible.
+  * Swapping the slot in a `screen_switch` matters only on the short path,
+    which needs `H'11B0A8` up and the slot already holding that screen.
+  * Storing the index instead of the value is invisible while the list is
+    built so that a box's value equals its index. Making the list hold
+    `k + 5` fixed it.
+
+The first of those also needed `H'11A169` moved to the end of the fill: a
+wide `H'11A160:40` zeroing sits later in the dictionary than the byte it
+covers, so setting the screen number early set nothing at all. That is the
+fill-ordering trap for the fourth time this part, and by now the rule is
+worth stating plainly: **in a `routines.json` fill, a wide key overwrites
+every narrow key written before it, and `dict.update` does not move a key
+that already exists.**
+
+### What the rest of it looks like
+
+Fifty-seven helpers are left. They are the same shape as these -- small
+drawing routines with a handful of callers each -- with a few larger ones
+underneath: `H'21AC9E` at 496 instructions, `H'221B6E` at 441, `H'2299A6` at
+432. Three of them (`H'21F9D0`, `H'21FF3C` and the bodies themselves) are
+further jump tables with their own inline blocks, so the count above is a
+floor rather than a total.
+
+Fourteen of the fifty-seven are written and forty-three are left. Twenty of
+those end in a jump table of their own -- a handful of instructions plus a
+table of inline blocks that has to be measured before it can even be
+counted -- and twenty-three are plain routines waiting on between one and
+eleven others. **None of the twenty-three is closed**: every one waits on
+something. The two that would open the most, `H'24610A` with five and
+`H'214DD4` with four, are themselves dispatchers with inline blocks, so each
+has to be measured before it can be started: `H'214DD4` is twenty keys and
+twenty handlers over 1,652 bytes, `H'24610A` twelve handlers over 766.
+
+So the part that could be done by following the call graph downwards is
+done. What is left needs the tables opened, which is the same job as the
+screen bodies themselves.
+
+## 13. The first table opened: the hoop
+
+Eleven of the forty-three are blocked by nothing but their own jump table.
+The smallest of them, `H'230D4E`, turned out to be the whole of one screen
+and to close cleanly, so it went first: a nine-way table whose handlers are
+eight instructions each, nine routines behind those, and one shared helper.
+About 460 instructions for a complete screen body.
+
+The screen moves the embroidery hoop. `H'104C7A` and `H'104C7B` are how far
+it has been moved from where the module thinks it is, kept as signed bytes in
+half-millimetre steps. `H'248FF0` draws them: each is halved, its sign thrown
+away, turned into decimal, given "mm" and put into one of the labels down the
+left edge. The eight nudge handlers are one routine with two constants
+changed -- the direction code sent to the module in `H'11A615`, and which
+offset moves -- and the codes run clockwise from north: 1 N, 2 NE, 3 E, 4 SE,
+5 S, 6 SW, 7 W, 8 NW. All eight refuse in the same three ways: the link never
+went quiet, or either offset is already further than H'64 from home. The
+limit is tested against the offset *before* the step, so a nudge that would
+take it past H'64 is allowed and the next one is not. The ninth box sends the
+hoop home and leaves for screen H'1F.
+
+The eight return 0 for the two that only move north and 1 for the rest, which
+looks like nothing more than the order the handlers were written in.
+
+### The address list that was in the wrong order
+
+`H'248FF0` draws its two labels through `H'21759E` and `H'2175E8`, and the
+first reconstruction called `text_left_94` and `text_left_BC` for them --
+from a comment in part 8 that listed five addresses and five names in what
+looked like matching order. It was not matching: `H'21759E` draws at y H'D9,
+not y H'94. The comparison caught it at once, and the comment now carries the
+pairing as a table rather than as two lists the reader has to line up.
+
+### What could not be reached
+
+`hoop_reset` sends the module message H'0D, waits two seconds, and only then
+zeroes the slot's two stored positions and sends message H'02. Nothing past
+that first send can be reached in the harness, and the reason is structural
+rather than a gap in the cases: `link_send_start` sets `H'11F29E`, only the
+transmit interrupt clears it, and the comparer masks interrupts on both sides
+on purpose -- otherwise the two images, which are never at the same point in
+the boot after the same number of steps, take different interrupts and every
+counter the handler touches shows up as a difference. So four mutations in
+that tail survive and always will. They are recorded here rather than papered
+over.
+
+One other survivor is genuinely equivalent: in `hoop_offset_label` the test
+`raw < 0` can be widened to `raw <= 0` with no effect, because the two
+branches differ only by the absolute value and H'24ADC8 leaves zero alone.
+
+Twenty-nine mutations over the three routines, twenty-four killed, four
+unreachable for the reason above and one equivalent.
+
+**2,905 cases pass over 513 routines.** app.bin is 107,668 bytes.
+
+### The second one: ten categories
+
+`H'217F04` was the next up and cost nothing at all beyond reading it: its
+eleven handlers call one routine, and that routine is `H'212994` --
+`first_item_of_category`, written back in part 4. So the table opened without
+adding a single new callee.
+
+Ten of the eleven boxes are one category each, H'05 to H'0E in box order, and
+the eleventh only takes the screen change. Every handler is the same four
+instructions with one constant changed, which means the whole table would
+collapse to "category equals value plus four". It is left as the table it is:
+that is what the original holds, and a category out of place should show up
+as a difference rather than as an off-by-one nobody notices. The eighteen
+mutations bear that out -- each of the ten constants dies on its own.
+
+Both the message and the screen change happen *before* the table is reached,
+so a value the table does not cover still leaves for screen H'02. That is
+what the "value 0C", "value 00" and "value FFFF" cases are for.
+
+**2,920 cases pass over 514 routines.** app.bin is 107,864 bytes.
+
+### Measuring five together, and writing four
+
+The five at sixty-odd instructions were measured as a batch before any was
+started, and the measurement changed the plan. Four of them -- `H'21A320`,
+`H'21A56C`, `H'21A7F6` and `H'21AA42` -- call nothing that is not already
+written: `touch_hit`, `hitbox_set_state`, `hitbox_kind`, `message_show_held`,
+`screen_stack_push` and `pop`, `screen_switch`, `screen_remember`, and
+nothing else. Two hundred and fifty-four dispatcher instructions and 1,254
+bytes of inline bodies between them, and not one new callee. The fifth,
+`H'2195F2`, is blocked by `H'214DD4` and has the largest bodies of the five,
+so it was left where it was.
+
+The four are one screen written four times: pick one of a list of longwords
+out of the record at `H'11B2AA`, light the box that was pressed, put the last
+one out, and on accept carry the pick across to `H'1161B8` and leave for
+screen H'3A. The remembered box lives at `H'11B32A`, `H'11B330`, `H'11B336`
+and `H'11B33C` -- six bytes apart, one per screen, in the order the routines
+appear. Byte-level similarity between pairs runs 40 to 60 per cent: variants,
+not copies.
+
+Only the lighting is shared here, as `pick_box_light`. Everything else is
+written out four times, because what differs between them is exactly the sort
+of thing a shared skeleton would hide:
+
+  * the guard on which boxes light -- two name H'04 and their last box,
+    `H'21A56C` takes a range instead (everything below H'0B);
+  * what the table is indexed by -- three by the value less one, `H'21A320`
+    by the value less *two*, so its box 1 is not in the table at all;
+  * where "back" goes -- H'39 for three of them, H'0E for `H'21A320`;
+  * whether accept remembers the screen -- three do, `H'21A320` does not.
+
+`H'21A320` is the odd one throughout. Two of its ten table entries point at
+the shared tail, so boxes 5 and 7 are in the table and do nothing -- and
+those same two boxes are named by its accept, which is a four-way branch on
+which box is lit rather than a single screen change. Boxes 1, 5 and 7 have
+screens of their own, nothing lit does nothing, everything else goes to H'3A.
+
+Between them the four tile a table of longwords: `H'21A56C` takes H'04 to
+H'24, `H'21A320` H'30, H'34, H'5C, H'78 to H'80, `H'21A7F6` H'38 to H'58 and
+`H'21AA42` H'60 to H'74. `H'21A56C`'s tenth pick is the only one that depends
+on the machine: H'2C with the module and H'28 without.
+
+Fifty-one mutations, fifty killed. The one survivor is equivalent and worth
+naming, because it is a shape that will recur: the original guards its
+computed jump with a bounds test, and widening that test by one lets a value
+through that the table does not cover. The reconstruction is a `switch`,
+which has no such hazard -- the extra value falls to `default` and returns
+the same 0. The bound is real in the original and cannot be observed in the
+rebuild, so the mutant lives.
+
+**2,990 cases pass over 518 routines.** app.bin is 109,280 bytes.
+
+### The two menus
+
+`H'21B3DE` was closed already and `H'21C19C` wanted one routine, `H'216DE0`,
+which turned out to be fifty-two instructions and closed. Both are menus, and
+between them they are most of what the machine's front page offers.
+
+`H'21B3DE` is the main menu: fifteen boxes, and three things that happen
+before the hit test is even reached. Two keys held together with a third
+input low clears the pattern queue out to flash and says so -- the only place
+in the application that offers it. Leaving for screen H'77 clears the panel
+code. And the panel code is set from the low byte of the box value *before*
+the table is reached, so it is set even for a value the table does not cover.
+Most handlers are three instructions, but the two leading to H'1F and H'22
+pass 0 for "remember" where the rest pass 1, and box H'0C is the odd one: no
+message at all, and it toggles bit 7 of H'FFFEC1 with the box's own light.
+Its release is what puts that box back down.
+
+`H'21C19C` is the settings menu. H'11A17A is the "something was changed"
+flag: finding it set writes the whole settings block out to flash and raises
+H'11A1B4, so that box H'0D knows to go back to the screen the change came
+from rather than to the remembered one. Box H'0C has no screen number of its
+own -- the value left in the register from the slot argument is used, which
+makes it screen 1. That is an omission rather than a choice, but it is what
+the machine does and it is reproduced.
+
+`H'216DE0` puts up the three "are you sure" screens, held off the same four
+ways H'216D6C holds off a message. Two of them remember the screen being left
+in slot 4; the third does not, and is the only one that cannot be answered.
+
+### Three fills that measured nothing
+
+Between them these three routines produced nine surviving mutations on the
+first pass, and every one was the fill rather than the code. Three of the
+causes have been seen before; two are new, and both are the same underlying
+mistake seen from different angles -- **a key written into the fill is only
+worth what its position makes it worth.**
+
+  * `H'11A169` was set to H'10 and then zeroed by the wide `11A160:40` that
+    the base fill applies later, so the screen number `screen_switch` copies
+    into its slot was 0 and remembering it wrote 0 over 0. Three mutations
+    on "remember" and one on the slot number lived on that.
+  * `H'11B213` was set to H'14 and then zeroed by a wide `11B11E:200` --
+    a range added *for a different purpose entirely*, two hundred bytes long,
+    which happens to reach H'11B212. `list_page_start` therefore always took
+    its early return and answered 1, and replacing the whole call with the
+    constant 1 could not be told apart.
+
+The other four were the familiar shapes: a message number with no entry in
+the table, a box whose value equalled its own index so the two could not be
+distinguished, a screen that H'222DF4 does not act on, and a bit that was
+never set.
+
+Fifty mutations over the three routines, all fifty killed once the fills
+said what they were meant to say.
+
+`H'21C19C`'s "something was changed" branch has no case: `settings_save`
+cannot be driven from a screen's boot state, for the reason part 12 records.
+The guard itself is still covered -- flipping the test makes every other case
+run `settings_save` and hang, which the comparer reports as a failure.
+
+**3,042 cases pass over 521 routines.** app.bin is 110,208 bytes.
+
+### The panel, top to bottom
+
+`H'2135FE` and `H'21F9D0` took eight routines between them and turned out to
+be the whole of the strip of little readouts along the top of the screen.
+From the bottom up:
+
+  * `H'200EA4` -- one byte out of a ten-byte record in the settings block.
+  * `H'214D24` -- the picture box at the top left and the "F" beside it, the
+    letter read as a string constant out of the code region.
+  * `H'214990` -- fourteen fields, each a few bits of a port latched into its
+    own word, redrawn only when the bits change.
+  * `H'214DD4` -- twenty **panel switches**, reached by key: cleared, stepped
+    on, or read, with `clear` winning over `step`. Six are one bit toggled in
+    place; the rest each have their own arithmetic. Key H'14 is the joke of
+    the set -- its table entry points straight at the "not found" tail, so a
+    key that exists answers H'FFFF exactly like one that does not.
+  * `H'213B16` -- the drawing counterpart, twenty handlers in four shapes:
+    a lamp, a picture patched into the icon table at the slot the box's own
+    list entry names, a box greyed out, or one of each with an extra test.
+  * `H'2136A6` -- whether anything in a box's list is away from its default,
+    walked in two halves, with the indicator box lit or put out to say so.
+  * `H'2135FE` -- the run of boxes brought up to date, one call per box.
+  * `H'21F9D0` -- which of six lists the strip is filled from, chosen by the
+    pattern's category less three through a twenty-three entry table.
+
+Two hundred and thirty-two mutations over the eight, of which 225 died. The
+seven that lived are all equivalent, and five of them are the same shape as
+the one part 13 named: **the original guards a computed jump with a bounds
+test, and the reconstruction is a `switch`, which has no such hazard.** The
+other two are a dead argument and a dead copy: `H'2135FE` copies the whole
+H'12-byte hitbox entry into a frame and reads three fields out of it, and
+passes a key that the callee ignores on that path. Both are reproduced
+because they are what the original holds, and neither can be observed.
+
+### What the fills kept hiding
+
+Nine of the eight routines' first mutation runs failed for want of a better
+fill rather than better code, and two causes are worth adding to the list:
+
+  * **The six picture tables abut and overlap** -- index 10 of one is index 0
+    of the next. Building them separately, each with its own wide zero, had
+    them wiping one another, so half the table mutations could not be seen.
+    They are filled as one region now, one distinct picture per slot, on a
+    seven-slot cycle chosen because the gaps between the tables are 4, 8, 9,
+    10 and 13 slots and none of those is a multiple of seven.
+  * **A picture that draws nothing.** One case selected a bitmap that leaves
+    the test frame exactly as it found it, so a branch that skipped the draw
+    and one that took it wrote the same bytes. The case now picks the other
+    picture.
+
+`H'11A169` was zeroed by a wide key applied after it for the third and fourth
+time. It is worth saying plainly: **a key is only worth what its position
+makes it worth**, and every wide fill in this suite is a hazard to every
+narrow one written before it.
+
+**3,364 cases pass over 529 routines.** app.bin is 115,108 bytes.
+
+### One key search covering two questions
+
+`H'2195F2` came free once `H'214DD4` was written. It is seven pictures to
+choose between and four keys that are not pictures at all, and its neat
+trick is that it answers a press *or* a screen change asked for elsewhere
+with one search: `H'21F940` writes its answer into the same local the hit
+test uses, so the key it looks up is whichever of the two arrived.
+
+The seven picture keys, H'88 to H'8E, each blit their own bitmap into one box
+and leave their own number in the bottom three bits of H'FFFEFA. The first of
+them ands those bits away and ors nothing back, which is the only reason it
+is a separate case rather than "or with zero". Four more keys hand straight
+to H'214DD4 as a step, and **the low byte of the box value is the panel key**
+-- the same word is the box's value here and a key over there.
+
+Its handlers are stored back to front behind H'2196B6: the reversed-table
+idiom again, thirteen word keys searched rather than indexed.
+
+Sixteen mutations, all sixteen killed -- but the last one only after the
+cases were fixed. The three "leaving for" cases were reaching
+`screen_leave_check` and being told no, because `H'21F87A` answers "no" while
+the screen stack flag is up, so the whole second half of the search was
+never entered and removing it changed nothing. Putting H'11A17C down let
+those cases through.
+
+**3,387 cases pass over 530 routines.** app.bin is 115,544 bytes.
+
+### The queue's own record
+
+`H'210AB2` and `H'228A92` needed nineteen routines under them, and all
+nineteen turned out to be the queue: a thousand records of H'0D bytes at
+H'11BBAA, the block `settings_save` writes out to flash in one go.
+
+Thirteen of the nineteen each put one field of one record. Five take a plain
+byte and store it whole; the rest each have their own mask and their own
+shift, and `H'228C90` takes a word and splits it across two bytes -- the
+ten-bit number whose sentinel values H'3FF and H'3FE mean "nothing here" and
+"the end of a group". Above them, `H'229198` fills a whole record from the
+machine's current state, `H'229100` copies six of a pattern's parameters
+into it, and `H'21DD6A` opens a slot in a counted list of words by shifting
+the tail up and taking the count with it.
+
+`H'210AB2` makes room in three lists at once for a run of entries -- the
+entry asked for plus every category-1 entry after it -- and refuses when the
+run would take the total past H'3C. `H'228A92` adds one entry: the queue is
+full at H'3E8 and says so with message H'20, and below that the records
+above the cursor are shifted up by one with the ROM's memmove, because
+source and destination overlap by exactly one record.
+
+Ninety-one mutations over the nineteen, all ninety-one killed. Six needed
+the fills sharpening first, and one of those is worth naming because it is
+the trap in its purest form: a wide `11BBA0:200` zero landed *after* the
+byte values it was meant to precede, so the whole record area was zero --
+and moving thirteen zero bytes onto thirteen zero bytes changes nothing, so
+the length of the move could not be told from any other length.
+
+**3,605 cases pass over 553 routines.** app.bin is 116,896 bytes.
+
+### `H'21FF3C` measured properly
+
+The last table-blocked routine was mis-measured in part 13 and the figure
+was repeated twice: "2,340 bytes with two key-searched tables". That came
+from scanning to H'220860, where the second key search ends. It does not end
+there -- it goes on to H'221B6E.
+
+The true figure is **7,218 bytes and six computed jumps**, with a dependency
+tree of eighteen routines and 1,216 instructions beneath it. That tree is
+closed and none of it holds a table of its own, so it is tractable; but it
+is a job of the same size as the whole panel-strip chain in part 13, not the
+afternoon the earlier number implied.
+
+### The last four of the tree, and a fill that reached too far
+
+`H'229368`, `H'229468`, `H'228B80` and `H'222F00` finished the eighteen. All
+four passed first time and then survived their first mutations, which is
+always the same story: the cases were vacuous and the fills said so.
+
+Three traps, all the same trap. A `11BBAA:3300` zero -- the queue, thirteen
+thousand bytes of it -- reaches to `H'11EEAA`, which is ten entries into the
+range table at `H'11EE80`, and it was landing *after* the entries had been
+written. A pair of `11A1D0:2` and `11A1D2:2` zeros at the end of the
+queue-delete fills wiped the first and last positions the cases were built
+around, which is why "at the first" and "before the first" had identical
+step counts and neither could tell `<=` from `<`. And the catalogue pointer
+`H'114DD2` was being seeded to the same address as the hit-box table, so a
+routine reading a pattern's parameters was reading box coordinates.
+
+The rule this batch settles: **sort every fill so that no key covers a range
+a later key writes into.** The builder now puts every key longer than two
+bytes at the front, in its original order, and the narrow writes after.
+
+`queue_delete_entry` also has a branch that cannot be reached with a
+well-formed list -- emptying the queue needs a one-entry list deleted at
+position two, and that wraps the length of the move. The case was dropped
+rather than fabricated.
+
+Fifty-one mutations over the four; all fifty-one killed.
+
+### The soft-float five
+
+The dependency scan under the last four routines listed five more that are
+not in `app.c`: `H'20046C`, `H'2005DA`, `H'2005E6`, `H'2006C8` and
+`H'20070C`. They are the H8 single-precision library the original's compiler
+emitted -- add, subtract, float-to-int, int-to-float. The reconstruction
+writes `float` and lets GCC link its own; `speed_scale` and
+`sew_speed_limit_scale` already compare clean through them. Nothing to
+reconstruct.
+
+### The working record, both ways
+
+`H'200EC0` and `H'2010EC` move one pattern's nine settings between the
+ten-byte record at `H'57C6D6` and the sixteen-byte working copy at
+`H'0E4010`, and they do not move them in order:
+
+    record  +1 +2 +3 +4 +5 +6 +7 +8 +9
+    work    +1 +2 +7 +3 +8 +4 +5 +6 +9
+
+The load also republishes four of them into the panel's own bytes, choosing
+between record +2/+3 and +4/+5 on bit 6 of `H'11A7BD`. The save goes back a
+byte at a time through the boot rom's flash writer with bit 5 of `H'114DC7`
+held up, and writes 1 into byte 0, which is the flag `H'200E46` clears.
+Thirteen mutations, all killed.
+
+### `H'213164`, and a mutant that cannot be killed
+
+A run of boxes scrolled on by one: `H'212FF0` slides the run down over its
+first box, the last box moves to the next entry of its list, and the whole
+run is drawn again. The wrap point is the count at the head of the *first*
+box's list, read before the slide -- from the box that is about to be
+overwritten.
+
+The new entry's kind byte decides what it looks like. Nine kinds are drawn
+unlit; everything else asks `H'214DD4` what the field is set to and lights
+the box if the answer is positive. Getting the boundaries of that test
+killed took a fill where `H'FFFEF5`, `H'FFFEF6`, `H'FFFEF8` and `H'FFFEF9`
+all answer *yes* for the keys either side of each edge -- kind 9 reads
+`H'FFFEF5` bit 3, kind H'0A reads bit 7, kind 4 reads the low nibble of
+`H'FFFEF9`, and kind H'44 answers 1 only when `H'FFFEF5` bit 2 is down.
+
+One edge stays open. `kind < H'0D` widened to `kind < H'0E` only moves kind
+H'0D, and `H'214DD4` has no entry for key H'0D: it answers H'FFFF, the box
+goes unlit, and that is exactly what the other side of the branch does. The
+mutant is equivalent, not surviving.
+
+### `H'2220F0`, and boxes that had to be handed over first
+
+Backing out of a sub-screen: four screens know how to, the rest do nothing.
+Each names the screen it returns to -- H'07 and H'45 to H'02 or H'30, H'34
+and H'36 to H'35 or H'33, H'04 to H'03, H'47 to H'46 -- repaints the two
+panels the sub-screen covered, and puts its strip of boxes back into their
+menu states. `H'11A169` is written before `H'21F1DE` is called, so what is
+put away is the screen being *returned to*.
+
+Twenty-two mutations. Two needed the fill sharpening in ways worth naming.
+`hitbox_set_state(..., 3, ...)` -- "handed back" -- does nothing to a box
+already in style 3, so a case where every box is style 3 cannot tell one
+range of boxes from another; the ranges that get state 3 now start in style
+4. And the second rectangle of each screen is drawn in colour 0 on a frame
+filled with 0, which writes nothing; the frame is now filled H'55. All
+twenty-two killed.
+
+### `H'21FF3C`
+
+The biggest routine in the application, and the one everything else on the
+panel hangs off: 7,218 bytes, 2,470 instructions, six computed jumps.
+
+It is three dispatches deep. The screen picks a prelude out of a table of
+twelve keys and six bodies, and six of the twelve screens take the press as
+a *pattern* -- the boxes of the pattern strip -- and are finished with it.
+Anything a prelude does not claim falls through to a common body, where a
+second table of fifteen keys and ten bodies picks another range of boxes to
+hit-test. That hit yields a message number, and the message number indexes a
+straight table of a hundred and twenty-four entries with twenty-five
+distinct targets. Eighty-one of the hundred and twenty-four do nothing at
+all. Three of the twenty-five open tables of their own -- the six screen
+bodies under messages H'17, H'18 and H'6D -- which is where the other three
+computed jumps are.
+
+Two words of local are threaded through all of it: the value the box
+carries, which becomes the message, and the box's own index. Message H'7A
+takes a message out of `H'57EFC4` and puts it through the same table, and
+message H'6D can turn itself into message H'18; both are written as a loop
+round the message switch rather than as a jump back into it, which is what
+the original does. Every one of the sixty-two exits returns zero.
+
+Nineteen of the twenty-five targets are one line: the message is a field of
+`H'214DD4`, stepped on by the press. The rest are the queue, the picker, the
+screens that lead somewhere, and the strip.
+
+**764 cases and 136 mutations.** The fills took longer than the code.
+Four things had to be got right before any of it measured anything:
+
+* Boxes past `H'0F` must have **no list**, or the value the press yields is
+  read out of a list that is not there and every message comes out zero.
+  Boxes at `H'0F` and below must **have** one, because that is how the strip
+  works. The cases that need a message from a low box use a hundred-and-
+  twenty-eight-entry identity list instead, so a box's value is its own.
+* `114DC0:14` covers `H'114DD2`, which is the catalogue pointer. Twenty
+  bytes instead of eighteen and the catalogue is at `H'00005000`.
+* The catalogue must not be seeded on top of the hit-box table. It was, and
+  a queue record was being filled from box coordinates.
+* **The two sides do not boot to the same RAM.** Each side boots its own
+  image, and the images differ. Anything the routine reads that the fill
+  does not pin can differ between them, and three separate "failures" --
+  `H'11B0A8`, `H'11A1BA`, `H'114DE0` -- were exactly that. This is the one
+  that is easy to mistake for a bug in the reconstruction.
+
+A hundred and thirty of the 136 are killed, and the six that are not are
+equivalent -- there is no case left to write for any of them:
+
+* `s != H'30` in the H'07/H'45 prelude. The original tests it in a handler
+  that only ever runs on H'07 and H'45, so it can only go one way. Dead in
+  the original -- and `s != H'44` beside it is *not*, because H'45 is one of
+  the two screens the handler serves, which is what says the pair is a copy
+  of the H'02/H'18/H'30/H'44 handler rather than a test that means
+  something here.
+* `s <= H'04` widened to `s <= H'05` under message H'15. Screen H'05 is not
+  in the second key table, so it never reaches the message switch.
+* `t <= cap ? t : cap` narrowed to `t < cap`. The same function.
+* The `second` flag of the three `hitbox_find` calls under message H'6D.
+  `H'211B26` looks at that flag only on screen H'44 and only for a box
+  flagged as one of a pair; each of the three bodies has just written H'07,
+  H'45, H'36, H'34 or H'04 into `H'11A169`, so the flag cannot be reached
+  from any of them.
+
+### Closing the four that were open
+
+The four `hitbox_find` bounds under message H'6D were reported as a gap in
+the cases, and they were -- but not for the reason given. The run of boxes
+the search walks is *not* rewritten before it: `pattern_strip_restore`
+changes those boxes' style and copies them elsewhere, and `queue_reload`
+rebuilds the picker, but neither touches the values the search reads. The
+cases that were supposed to put the match on a boundary set **every** box's
+value, including the box being pressed -- so the press stopped carrying
+message H'6D and none of those cases ever reached the body at all. That is
+why a sweep of forty-seven pattern numbers moved nothing: nothing was
+running.
+
+Setting only the run the search walks, and leaving the pressed box alone,
+puts the match where it is wanted. Three cases per screen -- the match at
+the first box, at the last, and nowhere -- and all four bounds fall, along
+with the two on the H'33/H'35 body beside them. The "nowhere" case is worth
+having on its own: it is the only one that takes the H'6D body's other
+branch, and it runs 210,000 steps shorter, which is what says the branch is
+being taken.
+
+**4,457 cases pass over 572 routines.** app.bin is 124,728 bytes.
+
 ## The parts, in order
 
 Ordered to reach a drawing screen as early as possible: until the display

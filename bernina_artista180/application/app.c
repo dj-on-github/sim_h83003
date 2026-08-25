@@ -387,8 +387,12 @@ static void service_hook(void)
     }
 }
 
-/* H'2104E2. A byte fill that lets the service hook run between bytes. */
-static void mem_fill(u32 dest, u8 value, u32 count)
+/* H'2104E2. A byte fill that lets the service hook run between bytes.
+ *
+ * Not static: it is a routine in its own right in the original and has its
+ * own comparison cases, and once H'20E126 below started calling it the
+ * compiler was inlining every copy and leaving no symbol to name. */
+void mem_fill(u32 dest, u8 value, u32 count)
 {
     volatile u8 *p = (volatile u8 *)dest;
 
@@ -397,6 +401,18 @@ static void mem_fill(u32 dest, u8 value, u32 count)
         service_hook();
         *p++ = value;
     }
+}
+
+/* H'20E126. One display buffer filled with a byte: H'4B00 of them, which is
+ * 320 by 240 at two bits a pixel. Sixty-one of the screen bodies call it.
+ *
+ * The argument it fills from comes back off the stack rather than out of the
+ * register it arrived in, because by then the pushes have moved the frame --
+ * and the saved copy of that register is thrown away with the arguments
+ * rather than popped, so the caller does not get it back. */
+void lcd_buffer_fill(u32 buffer, u8 value)
+{
+    mem_fill(buffer, value, 0x4B00);
 }
 
 /* H'20E126. One display buffer's worth. */
@@ -6784,10 +6800,15 @@ u8 *copy_overlapped(u8 *dst, const u8 *src, u32 n)
     return out;
 }
 
-/* H'246D8C. */
+/* H'246D8C, and H'246D7E just above it, which sets the same byte. */
 void message_state_clear(void)
 {
     REG8(0x114DA4UL) = 0;
+}
+
+void message_state_set(void)
+{
+    REG8(0x114DA4UL) = 0x01;
 }
 
 /* H'21F40E. Remembers which screen is showing, in one of four slots, and
@@ -11268,8 +11289,12 @@ u8 screen_leave_stacks(void)
 
 /* H'21F940. What to do about the screen the panel is asking for: 2 means
  * nothing, 3 means go there, and the number is left where the caller asked
- * for it. H'7B is the one screen that can be asked for again while it is
- * already up. */
+ * for it.
+ *
+ * Being asked for the screen that is already up is refused -- except for
+ * H'7B, which is allowed round again, and except when the caller forces it.
+ * Both of those jump straight to the write, which is why they skip the
+ * "already there" test rather than answering 2. */
 u8 screen_leave_check(u16 *out, u8 forced)
 {
     const u16 to = REG16(0x11B10EUL);
@@ -11277,15 +11302,11 @@ u8 screen_leave_check(u16 *out, u8 forced)
     if (to == 0xFFFF) return 0x02;
     if (screen_leave_stacks() != 0) return 0x02;
 
-    if (forced != 0) {
-        *out = REG16(0x11B10EUL);
-        return 0x03;
+    if (forced == 0 && to != 0x007B) {
+        if (REG16(0x11A17EUL) == to) return 0x02;
     }
 
-    if (to == 0x007B) return 0x02;
-    if (REG16(0x11A17EUL) == to) return 0x02;
-
-    *out = to;
+    *out = REG16(0x11B10EUL);
     return 0x03;
 }
 
@@ -11301,9 +11322,33 @@ u8 link_claim(u8 owner)
     return 0x01;
 }
 
-/* H'24AB62. The ROM's own strcat. The copy loop ends on the flags the store
- * left, not on the increment -- ADDS does not touch them -- so it stops on
- * the terminator having copied it. */
+/* H'24AAD2. The ROM's own strncpy: at most [n] bytes, and the rest of the
+ * [n] filled with zeros once the terminator has been copied. The count is
+ * tested before it is decremented, so [n] of zero copies nothing. */
+char *str_copy_n(char *dst, const char *src, u32 n)
+{
+    char *p = dst;
+
+    while (n-- != 0) {
+        if ((*p++ = *src++) == 0) {
+            while (n-- != 0) *p++ = 0;
+            break;
+        }
+    }
+    return dst;
+}
+
+/* H'24AAA2. The ROM's own strcpy, and H'24AB62 below it its strcat. Both
+ * copy loops end on the flags the store left, not on the increment -- ADDS
+ * does not touch them -- so they stop on the terminator having copied it. */
+char *str_copy(char *dst, const char *src)
+{
+    char *p = dst;
+
+    while ((*p = *src++) != 0) p++;
+    return dst;
+}
+
 char *str_append(char *dst, const char *src)
 {
     char *p = dst;
@@ -11444,6 +11489,72 @@ void hitbox_set_state(u16 first, u16 last, u8 what, u32 picture)
     }
 }
 
+/* H'211E9C. The same again, with a box drawn round each picture.
+ *
+ * H'211C38 above blits the picture on its own; this one fills the box out
+ * two pixels beyond the rectangle in colour 2 first, so the picture sits in
+ * a panel. The two pattern lists take their picture out of the stitch
+ * descriptor and everything else indexes the icon table, the same split as
+ * H'211C38 makes -- but with only two of the five lists counted as
+ * patterns, not all five.
+ *
+ * A value of zero, and a run longer than the list, both leave the box in
+ * state 2. There is no wrapping here.
+ *
+ * The origin is read once at the top rather than per box, which matters
+ * only if something moved it half way through -- nothing does. */
+u16 hitbox_fill_boxed_from_list(u16 first, u16 last, u16 value, u32 list)
+{
+    const u16 ox = HITBOX_X0;
+    const u16 oy = HITBOX_Y0;
+    const u16 length = REG16(list);
+    short i = (short)first;
+    short v = (short)value;
+
+    for (; i <= (short)last; i++, v++) {
+        const u32 e = HITBOX_TABLE +
+            (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+        u16 slot;
+
+        REG32(e + 0x0C) = list;
+        REG16(e + 0x08) = (u16)v;
+
+        slot = REG16(list + (u32)(long)(short)(u16)((u16)v << 1));
+        if (slot == 0 || v > (short)length) {
+            hitbox_set_state((u16)i, (u16)i, 0x02, 0);
+            continue;
+        }
+
+        if (REG8(e + 0x11) != 0x04) {
+            u32 picture;
+
+            draw_rect((u16)(REG16(e + 0x00) + ox - 2),
+                      (u16)(REG16(e + 0x02) + oy - 2),
+                      (u16)(REG16(e + 0x04) + ox + 2),
+                      (u16)(REG16(e + 0x06) + oy + 2),
+                      LCD_FRAME_A, 0x02, 0x01);
+
+            slot = REG16(list + (u32)(long)(short)(u16)((u16)v << 1));
+            if (list == 0x0011A88EUL || list == REG32(0x11B096UL)) {
+                picture = REG32(ITEM_TABLE +
+                    (u32)(long)(short)(u16)(ITEM_STRIDE * slot) + 0x08);
+            } else {
+                picture = REG32(0x001158CEUL +
+                    (u32)(long)(short)(u16)((u16)(slot << 2)));
+            }
+
+            bitmap_draw((u16)(REG16(e + 0x00) + ox),
+                        (u16)(REG16(e + 0x02) + oy),
+                        (u16)(REG16(e + 0x04) + ox),
+                        (u16)(REG16(e + 0x06) + oy),
+                        (const u8 *)picture, LCD_FRAME_A);
+        }
+        hitbox_set_state((u16)i, (u16)i, 0x00, 0);
+    }
+
+    return (u16)(v + 1);
+}
+
 /* H'211A9E. A message put up and held for H'96 ticks. */
 void message_show_held(u16 msg)
 {
@@ -11561,6 +11672,58 @@ u16 hitbox_fill_from_list(u16 first, u16 last, u16 value, u32 list)
         }
     }
     return (u16)(v + 1);
+}
+
+/* H'212E78. A run of boxes drawn again from whatever list each one already
+ * points at.
+ *
+ * H'211C38 and H'211E9C above put a list *into* a run; this one takes each
+ * box as it stands. It copies the whole H'12-byte entry into a local first
+ * and works from the copy, which is why the fields below are read out of an
+ * array rather than out of the table.
+ *
+ * A box in state 2 is left alone, and so is one not drawn in style 3. A
+ * slot of zero puts the box into state 2; anything else is blitted at the
+ * box's own coordinates with no origin added, from the stitch descriptor for
+ * the five pattern lists and from the icon table for everything else. */
+void hitbox_redraw_run(u16 first, u16 last)
+{
+    short i;
+
+    for (i = (short)first; i <= (short)last; i++) {
+        const u32 e = HITBOX_TABLE +
+            (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+        u16 box[9];
+        u32 list;
+        u16 slot;
+        int n;
+
+        for (n = 0; n < 9; n++) box[n] = REG16(e + (u32)(2 * n));
+
+        list = ((u32)box[6] << 16) | (u32)box[7];
+
+        if ((u8)(box[8] >> 8) == 0x02) continue;   /* +H'10, the state */
+        if ((u8)box[8] != 0x03) continue;          /* +H'11, the style */
+
+        slot = REG16(list + (u32)(long)(short)(u16)((u16)(box[4] << 1)));
+        if (slot == 0) {
+            hitbox_set_state((u16)i, (u16)i, 0x02, 0);
+            continue;
+        }
+
+        slot = REG16(list + (u32)(long)(short)(u16)((u16)(box[4] << 1)));
+        if (hitbox_list_is_patterns(list)) {
+            bitmap_draw(box[0], box[1], box[2], box[3],
+                        (const u8 *)REG32(ITEM_TABLE +
+                            (u32)(long)(short)(u16)(ITEM_STRIDE * slot) + 0x08),
+                        LCD_FRAME_A);
+        } else {
+            bitmap_draw(box[0], box[1], box[2], box[3],
+                        (const u8 *)REG32(0x001158CEUL +
+                            (u32)(long)(short)(u16)((u16)(slot << 2))),
+                        LCD_FRAME_A);
+        }
+    }
 }
 
 /* ---- five that most of the screens lean on ----------------------------- */
@@ -11917,6 +12080,4628 @@ void module_buffers_clear(void)
     module_state_clear();
     REG8(0x00104040UL) = 0x00;
     REG8(0x001040B5UL) = 0x00;
+}
+
+void link_send_start(void);
+
+/* ---- the module panel's five labels ------------------------------------
+ * Five routines, each drawing one string into one fixed little box, all
+ * centred, all with a gap of one. Three run down the left edge and two sit
+ * along the top. They are *not* in address order -- H'21789C is the topmost
+ * of the three down the left and H'21759E the lowest:
+ *
+ *   H'21789C  text_left_94    H'217932  text_top_CB
+ *   H'2175E8  text_left_BC    H'21797E  text_top_102
+ *   H'21759E  text_left_D9
+ */
+void text_left_94(const char *str)
+{
+    text_draw(str, 0x0000, 0x0094, 0x0023, 0x009C, 0x0001, 0x02,
+              (const u8 *)0x00119A66UL);
+}
+
+void text_left_BC(const char *str)
+{
+    text_draw(str, 0x0000, 0x00BC, 0x0023, 0x00C4, 0x0001, 0x02,
+              (const u8 *)0x00119A66UL);
+}
+
+void text_left_D9(const char *str)
+{
+    text_draw(str, 0x0000, 0x00D9, 0x0023, 0x00E1, 0x0001, 0x02,
+              (const u8 *)0x00119A66UL);
+}
+
+void text_top_CB(const char *str)
+{
+    text_draw(str, 0x00CB, 0x0012, 0x00E2, 0x0023, 0x0001, 0x02,
+              (const u8 *)0x0011936EUL);
+}
+
+void text_top_102(const char *str)
+{
+    text_draw(str, 0x0102, 0x001A, 0x010D, 0x0023, 0x0001, 0x02,
+              (const u8 *)0x001196EAUL);
+}
+
+/* H'21747E. The same three-way box as H'24A432 but at a fixed place, the
+ * one state four uses. */
+void module_fixed_box(u8 mode)
+{
+    if (mode == 0x00)
+        draw_rect(0x00F1, 0x002C, 0x0113, 0x004E, LCD_FRAME_A, 0x00, 0x01);
+    else if (mode == 0x01)
+        bitmap_draw(0x00F1, 0x002C, 0x0113, 0x004E,
+                    (const u8 *)0x0034C148UL, LCD_FRAME_A);
+    else if (mode == 0x02)
+        draw_rect(0x00F1, 0x002C, 0x0113, 0x004E, LCD_FRAME_A, 0x02, 0x01);
+}
+
+/* H'2179CA. Box five lit or not, the same shape as H'24A2DA. */
+void box5_draw(u8 lit)
+{
+    if (lit != 0) {
+        if (hitbox_kind(0x0005) == 0x01) hitbox_set_state(0x0005, 0x0005, 0x00, 0);
+        hitbox_set_state(0x0005, 0x0005, 0x01, 0);
+        return;
+    }
+    hitbox_set_state(0x0005, 0x0005, 0x00, 0);
+}
+
+/* H'231DD2. A number with "min" after it, in the third left-hand label. The
+ * string is built in the RAM buffer at H'11F2D6 and the word itself is
+ * spelled out into H'11F294 a byte at a time. */
+void label_minutes(short value)
+{
+    int_to_decimal(value, (char *)0x0011F2D6UL);
+    REG8(0x0011F294UL) = 0x6D;   /* 'm' */
+    REG8(0x0011F295UL) = 0x69;   /* 'i' */
+    REG8(0x0011F296UL) = 0x6E;   /* 'n' */
+    REG8(0x0011F297UL) = 0x00;
+    str_append((char *)0x0011F2D6UL, (const char *)0x0011F294UL);
+    text_left_94((const char *)0x0011F2D6UL);
+}
+
+/* H'236B5A. The two numbers along the top: which colour is being sewn and
+ * how many there are. Nothing is drawn unless H'114D91 says so, and a colour
+ * number past H'1B is not a number at all -- it sets bit H'0400 of H'114D4C
+ * and leaves the labels alone.
+ *
+ * Both numbers are cut to two digits by dropping a nought over the third
+ * byte of the buffer, which is four bytes of stack. */
+void label_colours(void)
+{
+    char buf[4];
+
+    if (REG8(0x00114D91UL) == 0) return;
+
+    if (REG8(0x00114D89UL) > 0x1B) {
+        REG16(0x00114D4CUL) |= 0x0400;
+        return;
+    }
+
+    if (REG8(0x00114D89UL) < REG8(0x00114D8DUL)) {
+        int_to_decimal((short)(u16)(REG8(0x00114D89UL) + 1), buf);
+        buf[2] = 0x00;
+        text_top_CB(buf);
+    }
+
+    if (REG8(0x00114D8DUL) != 0) {
+        int_to_decimal((short)(u16)REG8(0x00114D8DUL), buf);
+        buf[2] = 0x00;
+        text_top_102(buf);
+    }
+}
+
+/* ---- under the module's state machine ---------------------------------
+ * H'235B0E is the module's own state machine, eighteen states deep, and it
+ * is what H'237E3C waits on. These are the routines beneath it: the panel it
+ * draws, the arrows, the progress bar, and the small tests it asks.
+ */
+
+/* Pictures for the two arrows, the same four H'229714 uses. */
+#define ARROW_BACK_LIT  0x0034E390UL
+#define ARROW_BACK_DIM  0x0034E3C7UL
+#define ARROW_FWD_LIT   0x0034E3FEUL
+#define ARROW_FWD_DIM   0x0034E435UL
+
+/* H'244CF6. Either of the two stop keys down: bit 2 or bit 6 of H'FFFEDB,
+ * which H'21F68C knows as keys H'77 and H'7A. */
+u8 stop_key_down(void)
+{
+    const u8 keys = REG8(0x00FFFEDBUL);
+
+    if (keys & 0x04) return 0x01;
+    if (keys & 0x40) return 0x01;
+    return 0x00;
+}
+
+/* H'244D4E. The module's hardware state is one of the two that mean it is
+ * running. */
+u8 module_running(void)
+{
+    const u8 state = REG8(0x00FFFEC0UL);
+
+    if (state == 0x04 || state == 0x06) return 0x01;
+    return 0x00;
+}
+
+/* H'244D10. Two edges left by the interrupt in H'FFFEF7, each handed to the
+ * link as an owner and then cleared. H'01 means neither was waiting. */
+u8 module_edge_service(void)
+{
+    const u8 edges = REG8(0x00FFFEF7UL);
+
+    if (edges & 0x02) {
+        link_claim(0x09);
+        REG8(0x00FFFEF7UL) &= (u8)~0x02;
+        return 0x00;
+    }
+    if (edges & 0x04) {
+        link_claim(0x1C);
+        REG8(0x00FFFEF7UL) &= (u8)~0x04;
+        return 0x00;
+    }
+    return 0x01;
+}
+
+/* H'24A2DA. The pause button in box seven drawn lit or not. Lit is two
+ * calls, the first only when the box was already in kind one. */
+void pause_button_draw(u8 lit)
+{
+    if (lit != 0) {
+        if (hitbox_kind(0x0007) == 0x01) hitbox_set_state(0x0007, 0x0007, 0x00, 0);
+        hitbox_set_state(0x0007, 0x0007, 0x01, 0);
+        return;
+    }
+    hitbox_set_state(0x0007, 0x0007, 0x00, 0);
+}
+
+/* H'23E366. The pause button pressed: the module told to hold or to carry on,
+ * depending on H'11F30E, and the button redrawn to match. Nothing happens
+ * unless the hardware is at rest and the link is quiet. */
+void module_pause_toggle(void)
+{
+    if (REG8(0x00FFFEC6UL) != 0) return;
+
+    if (module_running() == 0) { link_claim(0x03); return; }
+
+    if (REG8(0x00114DBAUL) != 0) return;
+
+    if (REG8(0x0011F30EUL) == 0x00) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        REG8(0x0011F30EUL) = 0x01;
+        pause_button_draw(0x01);
+        REG8(0x0011F2A1UL) = 0x03;
+        REG8(0x0011A61AUL) = 0x20;
+        link_send_start();
+        return;
+    }
+
+    if (REG8(0x0011F30EUL) == 0x01) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        REG8(0x0011F30EUL) = 0x00;
+        pause_button_draw(0x00);
+        REG8(0x0011F2A1UL) = 0x03;
+        REG8(0x0011A61AUL) = 0x21;
+        link_send_start();
+        return;
+    }
+
+    REG8(0x0011F30EUL) = 0x00;
+}
+
+/* H'244DA0. The lid: bit 4 of H'FFFEC4 open. Opening it either releases the
+ * pause or claims the link, and closing it sets H'114D98. H'114D86 holding
+ * anything at all stops the lot. */
+u8 module_lid_check(void)
+{
+    if (REG8(0x00114D86UL) == 0) {
+        if (REG8(0x00FFFEC4UL) & 0x10) {
+            REG8(0x00114D98UL) = 0x00;
+            if (REG8(0x0011F30EUL) != 0) { module_pause_toggle(); return 0x01; }
+            link_claim(0x01);
+            return 0x01;
+        }
+        REG8(0x00114D98UL) = 0x01;
+    }
+    return 0x00;
+}
+
+/* H'24A432. The little picture box beside the module panel, in one of three
+ * ways: cleared, drawn from H'34C148, or filled with colour two. Where it
+ * goes depends on H'114D8E, and five of the twelve states have no box. */
+void module_panel_box(u8 mode)
+{
+    u16 x, y;
+
+    if (REG8(0x00114DB9UL) != 0) return;
+    if (REG8(0x0011B0A8UL) != 0) return;
+
+    switch (REG8(0x00114D8EUL)) {
+    case 0x07:                            x = 0x00F1; y = 0x00C8; break;
+    case 0x02: case 0x03:                 x = 0x00F0; y = 0x0029; break;
+    case 0x06:                            x = 0x00EF; y = 0x002C; break;
+    case 0x04: case 0x05: case 0x08:
+    case 0x09:                            x = 0x00F1; y = 0x002C; break;
+    default:                              return;
+    }
+
+    if (mode == 0x00)
+        draw_rect(x, y, (u16)(x + 0x22), (u16)(y + 0x22),
+                  LCD_FRAME_A, 0x00, 0x01);
+    else if (mode == 0x01)
+        bitmap_draw(x, y, (u16)(x + 0x22), (u16)(y + 0x22),
+                    (const u8 *)0x0034C148UL, LCD_FRAME_A);
+    else if (mode == 0x02)
+        draw_rect(x, y, (u16)(x + 0x22), (u16)(y + 0x22),
+                  LCD_FRAME_A, 0x02, 0x01);
+}
+
+/* H'24A572 and H'24A5D0. A run of dots plotted from a table of offsets at
+ * H'11A1F0 -- pairs of bytes, x then y, added to the origin given. The first
+ * lays down twenty-six of them and the second forty-three, out of the same
+ * table. */
+static void module_dots(u16 x0, u16 y0, short n)
+{
+    short i;
+
+    for (i = 0; i < n; i += 2)
+        plot_pixel((u16)(x0 + REG8(0x0011A1F0UL + (u32)(long)i)),
+                   (u16)(y0 + REG8(0x0011A1F1UL + (u32)(long)i)),
+                   LCD_FRAME_A, 0x03);
+}
+
+void module_dots_small(u16 x0, u16 y0) { module_dots(x0, y0, 0x0034); }
+void module_dots_large(u16 x0, u16 y0) { module_dots(x0, y0, 0x0056); }
+
+/* H'2499BE, H'249A0A, H'249A56, H'249AA2. Four arrows, each a box and a
+ * picture: the forward arrow in boxes three and two, the back arrow in boxes
+ * two and one. */
+void module_arrow_fwd_3(u8 lit)
+{
+    hitbox_blit(0x0003, LCD_FRAME_A, lit ? ARROW_FWD_LIT : ARROW_FWD_DIM);
+}
+
+void module_arrow_back_2(u8 lit)
+{
+    hitbox_blit(0x0002, LCD_FRAME_A, lit ? ARROW_BACK_LIT : ARROW_BACK_DIM);
+}
+
+void module_arrow_fwd_2(u8 lit)
+{
+    hitbox_blit(0x0002, LCD_FRAME_A, lit ? ARROW_FWD_LIT : ARROW_FWD_DIM);
+}
+
+void module_arrow_back_1(u8 lit)
+{
+    hitbox_blit(0x0001, LCD_FRAME_A, lit ? ARROW_BACK_LIT : ARROW_BACK_DIM);
+}
+
+/* H'217AEA. The progress bar across the module panel, drawn into frame B
+ * between H'28 and H'BF at rows H'2E to H'4C. The scale is worked out in
+ * floating point: a hundred and fifty-one pixels over ninety-nine steps, so
+ * one per cent is H'1.5252526 and the zero point is H'28 less that.
+ *
+ * A value outside nought to a hundred draws nothing at all. */
+void module_progress_bar(u16 percent)
+{
+    const float step = 1.5252526f;
+    const float base = 40.0f - step;
+
+    if ((short)percent < 0) return;
+    if ((short)percent > 0x0064) return;
+
+    if (percent == 0x0064) {
+        draw_rect(0x0028, 0x002E, 0x00BF, 0x004C, LCD_FRAME_B, 0x02, 0x01);
+        return;
+    }
+    if (percent == 0x0000) {
+        draw_rect(0x0028, 0x002E, 0x00BF, 0x004C, LCD_FRAME_B, 0x00, 0x01);
+        return;
+    }
+
+    {
+        const u16 edge = (u16)(int)((float)(long)(short)percent * step
+                                    + base + 0.5f);
+
+        draw_rect(0x0028, 0x002E, edge, 0x004C, LCD_FRAME_B, 0x02, 0x01);
+        draw_rect((u16)(edge + 1), 0x002E, 0x00BF, 0x004C,
+                  LCD_FRAME_B, 0x00, 0x01);
+    }
+}
+
+/* H'2498BE. The panel box blinked while the module is working: on for ten
+ * passes, off for ten more, and the counter reset when it runs past twenty.
+ * A stop key held freezes it wherever it is. */
+void module_panel_blink(u8 on)
+{
+    const u16 period = 0x000A;
+
+    if (on == 0) {
+        module_panel_box(0x02);
+        REG16(0x0011F5A2UL) = 0x0000;
+        return;
+    }
+
+    if (stop_key_down() != 0) return;
+
+    REG16(0x0011F5A2UL) = (u16)(REG16(0x0011F5A2UL) + 1);
+
+    if (REG16(0x0011F5A2UL) != 0 && period > REG16(0x0011F5A2UL)) {
+        module_panel_box(0x01);
+        return;
+    }
+
+    module_panel_box(0x00);
+    if ((u16)(period << 1) >= REG16(0x0011F5A2UL)) return;
+    REG16(0x0011F5A2UL) = 0x0000;
+}
+
+/* H'24992E. The progress bar kept up to date, but only in state seven and
+ * only while the link is unclaimed. Anything over a hundred is pinned to a
+ * hundred unless it is exactly H'C8, which means finished. H'11F5A4 holds
+ * what was last drawn so a repeat costs nothing.
+ *
+ * The second argument is defaulted to H'0A and then never used again. The
+ * original writes the default back into the caller's own stack slot, which
+ * is a store the reconstruction has no way to make; the cases leave that
+ * address out.
+ */
+void module_speed_show(u16 value, u16 hold)
+{
+    if (REG8(0x00114DB9UL) != 0) return;
+    if (REG8(0x00114D8EUL) != 0x07) return;
+
+    if ((short)value > 0x0064 && value != 0x00C8) value = 0x0064;
+    if (hold == 0) hold = 0x000A;
+    (void)hold;
+
+    if (value == 0x0000) {
+        REG16(0x0011F5A4UL) = 0x0000;
+        module_progress_bar(0x0000);
+        return;
+    }
+    if (value == 0x00C8) {
+        REG16(0x0011F5A4UL) = 0x0000;
+        module_progress_bar(0x0064);
+        return;
+    }
+
+    if (stop_key_down() != 0) return;
+
+    if (REG16(0x0011F5A4UL) != value) {
+        module_progress_bar(value);
+        REG16(0x0011F5A4UL) = value;
+    }
+}
+
+/* H'23E1A0. A countdown in H'11F572 driving bit 0 of H'114D58 -- the thing
+ * that flashes while the module is doing something. What arrives says what
+ * to do: H'00 is a tick, H'01 starts it, H'02 stops it, H'03 stops it only
+ * when the hardware is at rest, and H'04 starts it unless H'114D96 says not.
+ *
+ * A tick answers H'01 on the last one and H'05 on the one before, which is
+ * how the caller knows the run is ending. */
+u8 module_flash_step(u8 what)
+{
+    if (what == 0x00) {
+        const u8 n = REG8(0x0011F572UL);
+
+        if (n != 0) {
+            if (n == 0x01) {
+                REG8(0x0011F572UL) = 0x00;
+                REG8(0x00114D58UL) &= (u8)~0x01;
+                return 0x01;
+            }
+            if (n == 0x02) {
+                REG8(0x0011F572UL) = (u8)(n - 1);
+                return 0x05;
+            }
+            REG8(0x0011F572UL) = (u8)(n - 1);
+        }
+        return 0x00;
+    }
+
+    if (what == 0x01) {
+        REG8(0x00114D58UL) |= 0x01;
+        REG8(0x0011F572UL) = 0x07;
+    } else if (what == 0x04) {
+        if (REG8(0x00114D96UL) == 0) {
+            REG8(0x00114D58UL) |= 0x01;
+            REG8(0x0011F572UL) = 0x07;
+        }
+    } else if (what == 0x02) {
+        REG8(0x00114D58UL) &= (u8)~0x01;
+        REG8(0x0011F572UL) = 0x00;
+    } else if (what == 0x03) {
+        const u8 state = REG8(0x00FFFEC6UL);
+
+        if (state == 0x00 || state == 0x05) REG8(0x0011F572UL) = 0x00;
+    }
+    return 0x00;
+}
+
+/* H'242FEA. How many minutes are left, worked out in floating point and
+ * drawn in the third left-hand label only when the number changes.
+ *
+ * Two ways round, by H'114D96. One divides the stitches done by the total;
+ * the other scales by a second pair of counters first. Either way the answer
+ * is the pattern's own rate times what is left to do, plus one.
+ *
+ * [mode] H'00 forgets the last number and draws nothing, H'01 refuses to say
+ * nought, H'02 always says nought.
+ *
+ * The ROM leaves its working slot alone when H'114D96 is neither nought nor
+ * one, and converts whatever the stack happened to hold. That cannot be
+ * written down, so this starts the slot at nought; no case goes there.
+ */
+void module_minutes_left(u8 mode)
+{
+    float left = 0.0f;
+    u16 rate;
+
+    if (mode == 0) { REG16(0x0011F592UL) = 0x0000; return; }
+
+    REG32(0x0011A654UL) = REG32(0x0011A654UL) + 2;
+    REG32(0x0011A65CUL) = REG32(0x0011A65CUL) + 2;
+
+    rate = REG16(0x00104C96UL +
+                 (u32)(long)(short)(u16)((u16)REG8(PAT_B(0x00)) << 1));
+
+    if (REG8(0x00114D96UL) == 0x01) {
+        left = (float)(u32)rate
+             * (1.0f - (float)(u32)REG32(0x0011A654UL)
+                     / (float)(u32)REG32(0x0011A650UL))
+             + 1.0f;
+    } else if (REG8(0x00114D96UL) == 0x00) {
+        const float part = (float)(u32)rate
+                         * (float)(u32)REG32(0x0011A658UL)
+                         / (float)(u32)REG32(0x0011A650UL);
+
+        left = part * (1.0f - (float)(u32)REG32(0x0011A65CUL)
+                            / (float)(u32)REG32(0x0011A658UL))
+             + 1.0f;
+    }
+
+    REG16(0x0011F4E4UL) = (u16)(int)left;
+
+    if (mode == 0x02) REG16(0x0011F4E4UL) = 0x0000;
+    else if (mode == 0x01) {
+        if (REG16(0x0011F4E4UL) == 0) REG16(0x0011F4E4UL) = 0x0001;
+    }
+
+    if (REG16(0x0011F4E4UL) != REG16(0x0011F592UL)) {
+        label_minutes((short)REG16(0x0011F4E4UL));
+        REG16(0x0011F592UL) = REG16(0x0011F4E4UL);
+    }
+}
+
+/* H'242F26. Message H'04/H'0E sent and then, on the next pass, the estimate
+ * forgotten and the caller's step counter moved on. Both halves wait for the
+ * link to be quiet. */
+void module_ask_time(u8 *step)
+{
+    if (REG8(0x0011F590UL) == 0x00) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+
+        REG8(0x0011F2A1UL) = 0x04;
+        REG8(0x0011F2A2UL) = 0x0E;
+        link_send_start();
+        REG8(0x0011F590UL) = (u8)(REG8(0x0011F590UL) + 1);
+        return;
+    }
+
+    if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+    if (REG8(0x0011F29EUL) != 0) return;
+    if (REG8(0x0011F2B6UL) != 0) return;
+    if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+    if (REG8(0x0011F29EUL) != 0) return;
+    if (REG8(0x0011F2B6UL) != 0) return;
+
+    module_minutes_left(0x00);
+    REG8(0x0011F590UL) = 0x00;
+    *step = (u8)(*step + 1);
+}
+
+/* ---- the colour picture ------------------------------------------------
+ * The module's pattern data at H'104D4A is a run of records, each two words
+ * of size followed by that many bytes, and H'238B62 draws the one belonging
+ * to a colour as a one-bit-per-pixel stencil.
+ */
+
+/* H'238D06. Walks [index] records forward from H'104D4A and reads the four
+ * words at the head of the one it lands on, handing back the address just
+ * past them. Every word is big-endian and put together a byte at a time.
+ *
+ * The record's length is its first two words multiplied together plus eight,
+ * and the running offset is kept in sixteen bits, so a long enough list
+ * wraps -- which is what the caller's limit check is there to catch. */
+const u8 *module_colour_record(u16 *w, u16 *h, u16 *px, u16 *py, u8 index)
+{
+    const u8 *p = (const u8 *)0x00104D4AUL;
+    u16 offset = 0;
+    u16 i;
+
+    for (i = 0; (u16)index > i; i++) {
+        const u16 a = (u16)(((u16)p[0] << 8) | (u16)p[1]);
+        const u16 b = (u16)(((u16)p[2] << 8) | (u16)p[3]);
+
+        offset = (u16)(offset + (u16)((u16)(b * a) + 8));
+        p = (const u8 *)(0x00104D4AUL + (u32)offset);
+    }
+
+    *w  = (u16)(((u16)p[0] << 8) | (u16)p[1]);
+    *h  = (u16)(((u16)p[2] << 8) | (u16)p[3]);
+    *px = (u16)(((u16)p[4] << 8) | (u16)p[5]);
+    *py = (u16)(((u16)p[6] << 8) | (u16)p[7]);
+    return p + 8;
+}
+
+/* H'238B62. The colour's outline drawn over the panel. The panel is fetched
+ * back from the third store first, so what was there is rubbed out, and then
+ * the record's bytes are walked bit by bit -- most significant first -- with
+ * a pixel put down wherever a bit is set.
+ *
+ * Where it goes is the record's own two words, shifted by the hoop offset in
+ * H'1040BE and H'1040BF: eight times the first less four times the hoop's x,
+ * plus H'88, and the second less half the hoop's y, plus H'8B.
+ *
+ * Reading past H'114D49 sets bit H'2000 of H'114D4C and skips the byte. That
+ * is the only guard: the record itself is trusted. */
+void module_colour_bitmap(u8 index)
+{
+    const u16 vx = (u16)((short)(u16)((u16)REG8(0x001040BEUL) << 3) / (short)2);
+    const u16 vy = (u16)((u16)REG8(0x001040BFUL) / 2);
+    u16 w = 0, h = 0, px = 0, py = 0;
+    const u8 *data;
+    u16 x0, y0, row, col;
+
+    REG16(0x0011F4DCUL) = 0x0000;
+    REG16(0x0011F4DEUL) = 0x0000;
+
+    data = module_colour_record(&w, &h, &px, &py, index);
+
+    x0 = (u16)((u16)((u16)(px << 1) << 2) - vx + 0x0088);
+    y0 = (u16)(py - vy + 0x008B);
+
+    region_copy(0x0026, 0x002C, 0x00EA, 0x00EA, 0x002C,
+                0x000F1610UL, LCD_FRAME_A);
+
+    for (row = 0; row < h; row++) {
+        u16 xbit = 0;
+
+        for (col = 0; col < w; col++) {
+            const u32 at = (u32)data + (u32)(u16)((u16)(w * row) + col);
+            u8 bits, mask;
+            u16 k;
+
+            if (at > 0x00114D49UL) {
+                REG16(0x00114D4CUL) |= 0x2000;
+                continue;
+            }
+
+            bits = REG8(at);
+            mask = 0x80;
+            for (k = 0; k < 8; k++) {
+                if ((u8)(mask & bits) == mask)
+                    plot_pixel((u16)(x0 + xbit), (u16)(y0 + row),
+                               LCD_FRAME_A, 0x03);
+                mask = (u8)(mask >> 1);
+                xbit++;
+            }
+        }
+    }
+}
+
+/* H'23865A. The same two numbers as H'236B5A, with the colour's picture
+ * drawn under them and the cursor forgotten. The limit here is H'3C rather
+ * than H'1B, and the numbers are only drawn when H'114D91 says so -- but the
+ * picture is drawn either way, once, whichever of the two halves gets to it
+ * first. */
+void label_colours_picture(void)
+{
+    char buf[4];
+    u8 drawn = 0;
+
+    if (REG8(0x00114D89UL) > 0x3C) {
+        REG16(0x00114D4CUL) |= 0x0400;
+        return;
+    }
+
+    REG16(0x0011F4DCUL) = 0x0000;
+    REG16(0x0011F4DEUL) = 0x0000;
+
+    if (REG8(0x00114D89UL) < REG8(0x00114D8DUL)) {
+        int_to_decimal((short)(u16)(REG8(0x00114D89UL) + 1), buf);
+        buf[2] = 0x00;
+        if (REG8(0x00114D91UL) != 0) text_top_CB(buf);
+        module_colour_bitmap(REG8(0x00114D89UL));
+        drawn = 0x01;
+    }
+
+    if (REG8(0x00114D8DUL) != 0) {
+        int_to_decimal((short)(u16)REG8(0x00114D8DUL), buf);
+        buf[2] = 0x00;
+        if (REG8(0x00114D91UL) != 0) text_top_102(buf);
+        if (drawn == 0) module_colour_bitmap(REG8(0x00114D89UL));
+    }
+}
+
+/* ---- the module panel's numbers ----------------------------------------
+ * Three routines that put numbers on the embroidery panel. All of them
+ * build their string in the RAM buffer at H'11F2D6 and spell the units out
+ * into H'11F294 a byte at a time.
+ */
+
+/* H'23202A. How many stitches, drawn at one of two places depending on
+ * H'114D8E, with a run of dots under it. The number is the pattern's own
+ * count plus H'1B for every whole turn in the sixth byte of its record, and
+ * when bit 1 of H'114D51 is set the count past H'114DBC is taken off and the
+ * longer run of dots drawn instead.
+ *
+ * A record of kind three has no number at all. */
+void module_count_label(void)
+{
+    u8 n, over = 0x00;
+    u8 where;
+
+    if (REG8(PAT_B(0x03)) == 0x03) return;
+
+    REG8(0x0011F2DBUL) = 0x00;
+
+    n = (u8)(REG8(PAT_B(0x00))
+             + (u8)(u16)((u16)REG8(PAT_B(0x05)) * 0x1B));
+
+    if (REG8(0x00114D51UL) & 0x02) {
+        if (REG8(PAT_B(0x03)) != 0x01) {
+            const u8 limit = REG8(0x00114DBCUL);
+
+            if (n > limit) { n = (u8)(n - limit); over = 0x01; }
+        }
+    }
+
+    int_to_decimal((short)(u16)n, (char *)0x0011F2D6UL);
+
+    where = REG8(0x00114D8EUL);
+
+    if (where >= 0x08 && where <= 0x09) {
+        text_draw((const char *)0x0011F2D6UL, 0x000F, 0x0098, 0x001E, 0x00A0,
+                  0x0001, 0x02, (const u8 *)0x001196EAUL);
+        if (over == 0x01) module_dots_large(0x0002, 0x0098);
+        else              module_dots_small(0x0008, 0x0098);
+        return;
+    }
+
+    if (where >= 0x04 && where <= 0x05) {
+        text_draw((const char *)0x0011F2D6UL, 0x000F, 0x004A, 0x001E, 0x0052,
+                  0x0001, 0x02, (const u8 *)0x001196EAUL);
+        if (over == 0x01) module_dots_large(0x0002, 0x004A);
+        else              module_dots_small(0x0008, 0x004A);
+    }
+}
+
+/* H'231C5E. How wide and how tall, in millimetres, in the first two
+ * left-hand labels. The two numbers arrive in stitches and are scaled by the
+ * first two bytes of the stitch record: twice the count times the byte, over
+ * a hundred, in floating point and in that order. */
+void module_size_labels(short across, short down)
+{
+    const int w = (int)((float)(long)across * 2.0f
+                        * (float)(u32)REG8(PAT_A(0x00)) / 100.0f);
+    const int h = (int)((float)(long)down * 2.0f
+                        * (float)(u32)REG8(PAT_A(0x01)) / 100.0f);
+
+    int_to_decimal((short)w, (char *)0x0011F2D6UL);
+    REG8(0x0011F294UL) = 0x6D;   /* 'm' */
+    REG8(0x0011F295UL) = 0x6D;   /* 'm' */
+    REG8(0x0011F296UL) = 0x00;
+    str_append((char *)0x0011F2D6UL, (const char *)0x0011F294UL);
+    text_left_D9((const char *)0x0011F2D6UL);
+
+    int_to_decimal((short)h, (char *)0x0011F2D6UL);
+    REG8(0x0011F294UL) = 0x6D;
+    REG8(0x0011F295UL) = 0x6D;
+    REG8(0x0011F296UL) = 0x00;
+    str_append((char *)0x0011F2D6UL, (const char *)0x0011F294UL);
+    text_left_BC((const char *)0x0011F2D6UL);
+
+    module_count_label();
+}
+
+/* H'23228A. How far through, as a percentage with a "%" after it, drawn low
+ * on the right. The sum is H'114DBE tenths plus H'114DBF, and the answer is
+ * five thousand seven hundred and eighty over that -- H'57.8 times a hundred,
+ * multiplied out at run time rather than folded.
+ *
+ * Six bytes are copied out of H'25077C into the buffer first and then
+ * written straight over by the number. Reproduced because it is there. */
+void label_percent(void)
+{
+    char buf[18];
+    float sum;
+
+    REG16((u32)(unsigned long)&buf[0]) = REG16(0x0025077CUL);
+    REG16((u32)(unsigned long)&buf[2]) = REG16(0x0025077EUL);
+    REG16((u32)(unsigned long)&buf[4]) = REG16(0x00250780UL);
+
+    sum = (float)(u32)REG8(0x00114DBEUL) / 10.0f
+        + (float)(u32)REG8(0x00114DBFUL);
+
+    int_to_decimal((short)(int)(57.8f * 100.0f / sum), buf);
+
+    REG8(0x0011F294UL) = 0x25;   /* '%' */
+    REG8(0x0011F295UL) = 0x00;
+    str_append(buf, (const char *)0x0011F294UL);
+
+    text_draw(buf, 0x00F2, 0x00A3, 0x0112, 0x00AE, 0x0001, 0x02,
+              (const u8 *)0x00119A66UL);
+}
+
+/* H'23BB18. The check before a pattern is sewn: the module is asked for its
+ * hoop, and the answer compared against the three stitch-record bytes it was
+ * last asked about. Nothing happens at all unless the pattern's attribute
+ * bit says it needs one.
+ *
+ * H'11F565 walks the four steps -- ask, wait, take the answer, done -- and
+ * H'104043 is the once-only reset that starts it. Step nought short-circuits
+ * the lot when the three bytes have not moved since last time.
+ *
+ * The blinking box is driven from here too: on while the link is busy, off
+ * once the answer is in, and never in state seven.
+ */
+void module_hoop_check(u8 *step)
+{
+    u8 n;
+
+    if (pattern_attr_bit3() == 0) { *step = (u8)(*step + 1); return; }
+
+    if (REG8(0x00104043UL) == 0) {
+        REG8(0x0011F4D6UL) = 0x00;
+        REG8(0x0011F4D7UL) = 0x00;
+        REG8(0x0011F4D8UL) = 0x00;
+        REG8(0x0011F565UL) = 0x00;
+        REG8(0x00104043UL) = 0x01;
+    }
+
+    n = REG8(0x0011F565UL);
+
+    if (n == 0x00 || n == 0x01) {
+        if (n == 0x00) {
+            if (REG8(PAT_A(0x00)) == REG8(0x0011F4D6UL) &&
+                REG8(PAT_A(0x01)) == REG8(0x0011F4D7UL) &&
+                REG8(PAT_A(0x06)) == REG8(0x0011F4D8UL)) {
+                *step = (u8)(*step + 1);
+                return;
+            }
+            REG8(0x0011F565UL) = (u8)(REG8(0x0011F565UL) + 1);
+        }
+
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+
+        REG8(0x0011F2A1UL) = 0x03;
+        REG8(0x0011A61BUL) = 0x05;
+        link_send_start();
+        REG8(0x0011F565UL) = (u8)(REG8(0x0011F565UL) + 1);
+        return;
+    }
+
+    if (n == 0x02) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0 ||
+            REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) {
+            if (REG8(0x00114D8EUL) != 0x07) module_panel_blink(0x01);
+            return;
+        }
+
+        REG8(0x0011F565UL) = (u8)(REG8(0x0011F565UL) + 1);
+        REG8(0x0011F4D6UL) = REG8(PAT_A(0x00));
+        REG8(0x0011F4D7UL) = REG8(PAT_A(0x01));
+        REG8(0x0011F4D8UL) = REG8(PAT_A(0x06));
+        REG8(0x00114D8DUL) = REG8(0x00104045UL);
+
+        if (REG8(0x00104041UL) != REG8(0x00114D8DUL)) {
+            REG8(0x00104041UL) = REG8(0x00114D8DUL);
+            REG8(0x00114D92UL) = 0xFF;
+        }
+
+        if (REG8(0x00114D8EUL) != 0x07) module_panel_blink(0x00);
+        return;
+    }
+
+    if (n == 0x03) {
+        if (REG8(0x00114D8DUL) < REG8(0x00104044UL)) {
+            module_panel_blink(0x00);
+            link_claim(0x19);
+        }
+        REG8(0x0011F565UL) = (u8)(REG8(0x0011F565UL) + 1);
+        return;
+    }
+
+    if (REG8(0x00114DB9UL) == 0) {
+        REG8(0x0011F565UL) = 0x00;
+        *step = (u8)(*step + 1);
+    }
+}
+
+/* ---- the module's floating point ---------------------------------------
+ * The embroidery maths needs a square root, a sine, a cosine and an arc
+ * tangent, and the ROM carries its own: H'24ABFE, H'24ABEE, H'24ADDC and
+ * H'24ABC4, with H'24AF80, H'24AE5A, H'24AD22 and H'24AD62 under them.
+ *
+ * Every constant is written here as the decimal that encodes to the ROM's
+ * exact bit pattern, and every operation is in the order the ROM does it,
+ * so the answers agree to the last bit. The three routines that take a
+ * float apart do it on the bit pattern, which is what the H8 does with
+ * ADD.W and AND.W on the top half of a register.
+ */
+typedef union { float f; u32 u; } f32bits;
+
+static u32 f2u(float f) { f32bits b; b.f = f; return b.u; }
+static float u2f(u32 u) { f32bits b; b.u = u; return b.f; }
+
+/* H'24AD22. Splits a float into a fraction in [H'0.5, 1) and a power of two,
+ * the C library's frexp. The exponent is worked out a byte at a time and
+ * comes back sign extended from eight bits. */
+float float_frexp(float x, short *power)
+{
+    const u32 u = f2u(x);
+    u16 hi;
+    u8 e;
+
+    if (u == 0) { *power = 0; return u2f(0); }
+
+    hi = (u16)(u >> 16);
+    e  = (u8)((u16)((u16)(hi << 1)) >> 8);
+    e  = (u8)(e + 0x82);
+    *power = (short)(signed char)e;
+
+    return u2f((u & 0x0000FFFFUL)
+               | ((u32)(u16)(((u16)(hi & 0x807F)) | 0x3F00) << 16));
+}
+
+/* H'24AD62. The whole part out into [ip] and the fraction back, the C
+ * library's modf. Anything H'1E7 or bigger is all whole part. */
+float float_modf(float x, float *ip)
+{
+    if ((long)(f2u(x) & 0x7FFFFFFFUL) >= (long)0x4B189680UL) {
+        *ip = x;
+        return u2f(0);
+    }
+    *ip = (float)(long)(int)x;
+    return x - *ip;
+}
+
+/* H'24AE5A. The arc tangent of the size of a number, by a rational fit.
+ * Above one the argument is folded to (a-1)/(a+1) and a quarter pi added
+ * back at the end. */
+float float_atan_core(float x)
+{
+    float a = u2f(f2u(x) & 0x7FFFFFFFUL);
+    float hi, t, n, d;
+
+    if ((long)f2u(a) <= (long)0x3F800000UL) {
+        if (f2u(a) == 0x3F800000UL) return 0.7853982f;
+        hi = 0.0f;
+    } else {
+        hi = 0.7853982f;
+        a = (a + -1.0f) / (a + 1.0f);
+    }
+
+    t = a * a;
+    n = ((t * -0.010497842f + 0.3247416f) * t + 2.9960995f) * t + 3.640485f;
+    d = (t + 4.209584f) * t + 3.6404853f;
+
+    return hi + a * (n / d);
+}
+
+/* H'24ABC4. The arc tangent proper: the size, and then the sign put back
+ * unless the answer came out as a positive zero. */
+float float_atan(float x)
+{
+    const float r = float_atan_core(x);
+
+    if ((long)f2u(x) >= 0) return r;
+    if ((u16)(f2u(r) >> 16) == 0) return r;
+    return u2f(f2u(r) ^ 0x80000000UL);
+}
+
+/* H'24AF80. Sine and cosine share one routine: the argument is scaled by
+ * two over pi, the whole quarter-turns taken off, and what is left run
+ * through a five-term fit of sin(pi/2 x). [quad] is 0 for sine and 1 for
+ * cosine, and a negative argument adds two more quarter turns.
+ *
+ * Above 65532 quarter-turns the reduction is done the long way, with two
+ * calls to H'24AD62, because (float)(int) would have nothing left to say. */
+float float_sincos(float x, u8 quad)
+{
+    u8 n = (u8)(quad + (((long)f2u(x) < 0) ? 0x02 : 0x00));
+    float y = u2f(f2u(x) & 0x7FFFFFFFUL) * 0.63661975f;
+    float f, t, p;
+
+    if ((long)f2u(y) > (long)0x477FFC00UL) {
+        float whole, quarters;
+
+        f = float_modf(y, &whole);
+        whole = whole + (float)(u32)n;
+        float_modf(whole * 0.25f, &quarters);
+        n = (u8)(int)(whole - quarters * 4.0f);
+    } else {
+        const int k = (int)y;
+
+        f = y - (float)(u32)k;
+        n = (u8)((u8)(n + (u8)k) & 0x03);
+    }
+
+    if (n & 0x01) f = 1.0f - f;
+    if (n > 0x01) { if ((u16)(f2u(f) >> 16) != 0) f = u2f(f2u(f) ^ 0x80000000UL); }
+
+    t = f * f;
+    p = (((t * 0.00015148513f + -0.0046737664f) * t + 0.07968968f) * t
+         + -0.6459637f) * t + 1.5707964f;
+
+    return f * p;
+}
+
+/* H'24ABEE and H'24ADDC. Sine, and cosine of the size -- cosine is even, so
+ * dropping the sign first costs nothing. */
+float float_sin(float x) { return float_sincos(x, 0x00); }
+
+float float_cos(float x)
+{
+    return float_sincos(u2f(f2u(x) & 0x7FFFFFFFUL), 0x01);
+}
+
+/* H'24ABFE. The square root: a first guess out of the mantissa, one
+ * Newton step, the exponent halved by adding to the top half of the float,
+ * and one more step. Nought comes back as nought; anything below it sets
+ * H'11F5A6 to H'21 and comes back as the largest float there is. */
+float float_sqrt(float x)
+{
+    short power;
+    float m, e;
+
+    if ((long)f2u(x) <= 0) {
+        if (f2u(x) == 0) return u2f(0);
+        REG16(0x0011F5A6UL) = 0x0021;
+        return 3.4028235e+38f;
+    }
+
+    m = float_frexp(x, &power);
+    e = (m + 0.75787f) * 0.57155f;
+    e = e + m / e;
+
+    /* the exponent is read back as a single byte, halved as a signed byte,
+     * and the result shifted into the top half of the float */
+    if (power & 0x0001) {
+        const short q = (short)((short)(signed char)(u8)(power - 1) / 2);
+
+        e = e * 1.4142135f;
+        e = u2f((f2u(e) & 0x0000FFFFUL)
+                | ((u32)(u16)((u16)(f2u(e) >> 16) + (u16)(short)(q << 7))
+                   << 16));
+    } else {
+        const short q = (short)((short)(signed char)(u8)power / 2);
+
+        e = u2f((f2u(e) & 0x0000FFFFUL)
+                | ((u32)(u16)((u16)(f2u(e) >> 16) + (u16)(short)(q << 7))
+                   << 16));
+    }
+
+    return x / e + e * 0.25f;
+}
+
+/* H'241228. Finds one pattern's header in the stream at H'10C27A and copies
+ * it into the H'15-byte record the caller hands over.
+ *
+ * The stream is a run of blocks, each three bytes of kind, count and size
+ * followed by its data: kind H'01 is count * size bytes and kind H'02 is
+ * eight. Anything else, or running past H'1137AA, sets bit 1 of H'11A641
+ * and gives up. The step of H'0C between blocks is byte H'14 of the record,
+ * which this routine sets to H'0F itself and nothing else touches.
+ *
+ * The index is decremented in the caller's own stack slot, a store the
+ * reconstruction cannot make; the cases leave that address out. */
+u8 pattern_record_at(u8 *rec, u8 index)
+{
+    const u32 limit = 0x001137AAUL;
+    u32 p = 0x0010C27AUL;
+    u8 i;
+
+    rec[0x14] = 0x0F;
+    if (index != 0) index = (u8)(index - 1);
+
+    for (i = 0; i < index; i++) {
+        const u8 kind = REG8(p);
+        const u8 count = REG8(p + 1);
+        const u8 size = REG8(p + 2);
+
+        p += 3;
+        p = (u32)(p + (u32)(long)(short)(u16)((u16)rec[0x14] - 3));
+
+        if (kind == 0x01)      p = (u32)(p + (u32)(u16)((u16)count * (u16)size));
+        else if (kind == 0x02) p = p + 8;
+        else { REG8(0x0011A641UL) |= 0x02; return 0x00; }
+
+        if (p >= limit) { REG8(0x0011A641UL) |= 0x02; return 0x00; }
+    }
+
+    REG32((u32)(unsigned long)(rec + 0x10)) = p;
+
+    rec[0] = REG8(p);
+    rec[1] = REG8(p + 1);
+    rec[2] = REG8(p + 2);
+    rec[3] = REG8(p + 3);
+    rec[4] = REG8(p + 4);
+
+    REG16((u32)(unsigned long)(rec + 0x06)) =
+        (u16)(((u16)REG8(p + 5) << 8) | (u16)REG8(p + 6));
+    REG16((u32)(unsigned long)(rec + 0x08)) =
+        (u16)(((u16)REG8(p + 7) << 8) | (u16)REG8(p + 8));
+    REG16((u32)(unsigned long)(rec + 0x0A)) =
+        (u16)(((u16)REG8(p + 9) << 8) | (u16)REG8(p + 10));
+    REG16((u32)(unsigned long)(rec + 0x0C)) =
+        (u16)(((u16)REG8(p + 11) << 8) | (u16)REG8(p + 12));
+    REG16((u32)(unsigned long)(rec + 0x0E)) =
+        (u16)(((u16)REG8(p + 13) << 8) | (u16)REG8(p + 14));
+
+    return 0x01;
+}
+
+/* H'24217A. How far one pattern reaches from its own centre, along each
+ * axis, once its own scale and rotation are applied.
+ *
+ * The pattern's header gives a width and a height in fifths of a
+ * millimetre; H'11A24A and H'11A24B scale them (twice the byte, over a
+ * hundred), H'11A250 turns them (five degrees a step, minus a hundred and
+ * eighty, into radians) and H'11A24F says which way round.
+ *
+ * The four corners are worked out from the half-diagonal and the angle to
+ * it, and the largest size along each axis is what comes back.
+ *
+ * When the scaled width is nought the angle to the corner is never worked
+ * out and the ROM uses whatever the stack held; this starts it at nought,
+ * and no case goes there. */
+void pattern_half_extent(u16 *half_w, u16 *half_h, u8 slot)
+{
+    u8 rec[0x18];
+    const u32 base = 0x0011A25AUL + (u32)(long)(short)(u16)((u16)slot << 4);
+    const float sx = (float)(u32)REG8(base - 0x10) * 2.0f / 100.0f;
+    const float sy = (float)(u32)REG8(base - 0x0F) * 2.0f / 100.0f;
+    float hw, hh, angle, theta = 0.0f, r;
+    float cx[4], cy[4];
+    const u8 flip = REG8(base - 0x0B);
+    short i;
+
+    pattern_record_at(rec, slot);
+
+    hw = (float)(long)(short)REG16((u32)(unsigned long)(rec + 0x0A)) / 5.0f;
+    hh = (float)(long)(short)REG16((u32)(unsigned long)(rec + 0x0C)) / 5.0f;
+    hw = hw * sx;
+    hh = hh * sy;
+
+    angle = ((float)(u32)REG8(0x0011A250UL) * 5.0f + -180.0f) * 0.017453277f;
+
+    if (f2u(hw) != 0) theta = float_atan(hh / hw);
+
+    r = float_sqrt(hh * hh + hw * hw) / 2.0f;
+
+    {
+        const float nr = ((u16)(f2u(r) >> 16) != 0)
+                         ? u2f(f2u(r) ^ 0x80000000UL) : r;
+        const float a  = theta - angle;
+        const float b  = (((u16)(f2u(theta) >> 16) != 0)
+                          ? u2f(f2u(theta) ^ 0x80000000UL) : theta) - angle;
+
+        if (flip == 0) {
+            cx[0] = float_cos(a) * r;   cy[0] = float_sin(a) * r;
+            cx[1] = float_cos(b) * r;   cy[1] = float_sin(b) * r;
+            cx[2] = nr * float_cos(a);  cy[2] = nr * float_sin(a);
+            cx[3] = nr * float_cos(b);  cy[3] = nr * float_sin(b);
+        } else {
+            cx[0] = nr * float_cos(a);  cy[0] = float_sin(a) * r;
+            cx[1] = nr * float_cos(b);  cy[1] = float_sin(b) * r;
+            cx[2] = float_cos(a) * r;   cy[2] = nr * float_sin(a);
+            cx[3] = float_cos(b) * r;   cy[3] = nr * float_sin(b);
+        }
+    }
+
+    *half_w = (u16)(int)u2f(f2u(cx[0]) & 0x7FFFFFFFUL);
+    *half_h = (u16)(int)u2f(f2u(cy[0]) & 0x7FFFFFFFUL);
+
+    for (i = 1; i < 4; i++) {
+        const u16 x = (u16)(int)u2f(f2u(cx[i]) & 0x7FFFFFFFUL);
+        const u16 y = (u16)(int)u2f(f2u(cy[i]) & 0x7FFFFFFFUL);
+
+        if ((short)*half_w < (short)x) *half_w = x;
+        if ((short)*half_h < (short)y) *half_h = y;
+    }
+}
+
+/* H'241FA0. Every pattern in the run taken together, and the current slot's
+ * centre moved to the middle of the box that holds them all. Each pattern is
+ * asked for its own reach around the centre it is pinned to, and the centres
+ * live sixteen bytes apart at H'11A266 and H'11A268. */
+void pattern_run_extent(void)
+{
+    u16 hw = 0, hh = 0;
+    short minx, maxx, miny, maxy;
+    u8 i;
+
+    pattern_half_extent(&hw, &hh, 0x01);
+
+    minx = (short)(REG16(0x0011A266UL) - hw);
+    maxx = (short)(REG16(0x0011A266UL) + hw);
+    miny = (short)(REG16(0x0011A268UL) - hh);
+    maxy = (short)(REG16(0x0011A268UL) + hh);
+
+    for (i = 0; (short)(u16)REG8(0x0011A640UL) > (short)(signed char)i; i++) {
+        const u32 at = 0x0011A266UL
+                     + (u32)(long)(short)((short)(signed char)i << 4);
+
+        pattern_half_extent(&hw, &hh, (u8)(i + 1));
+
+        if ((short)(REG16(at) - hw) < minx) minx = (short)(REG16(at) - hw);
+        if ((short)(REG16(at) + hw) > maxx) maxx = (short)(REG16(at) + hw);
+        if ((short)(REG16(at + 2) - hh) < miny) miny = (short)(REG16(at + 2) - hh);
+        if ((short)(REG16(at + 2) + hh) > maxy) maxy = (short)(REG16(at + 2) + hh);
+    }
+
+    {
+        const u32 slot = 0x0011A266UL
+                       + (u32)(long)(short)(u16)((u16)REG8(0x0011A660UL) << 4);
+
+        REG16(slot)     = (u16)(short)(minx + (short)((short)(maxx - minx) / 2));
+        REG16(slot + 2) = (u16)(short)(miny + (short)((short)(maxy - miny) / 2));
+    }
+}
+
+u8 module_run_control(u8 what);
+u8 module_can_talk(void);
+void module_talk_end(void);
+void label_percent_left(u8 value);
+void module_stop_sequence(u8 *step);
+
+/* The link-quiet test the machines make over and over: the two masks on
+ * H'114D50 with the send and receive flags between them, six reads in a
+ * fixed order. The ROM writes it out in full at every site. */
+static u8 module_link_quiet(void)
+{
+    if ((REG8(0x00114D50UL) & 0x21) != 0) return 0x00;
+    if (REG8(0x0011F29EUL) != 0) return 0x00;
+    if (REG8(0x0011F2B6UL) != 0) return 0x00;
+    if ((REG8(0x00114D50UL) & 0x22) != 0) return 0x00;
+    if (REG8(0x0011F29EUL) != 0) return 0x00;
+    if (REG8(0x0011F2B6UL) != 0) return 0x00;
+    return 0x01;
+}
+
+/* H'2417D4. Nine states that fetch the run of patterns out of the module and
+ * set the machine up to sew them. H'11A63D walks the states and H'11A640 is
+ * how many patterns there are.
+ *
+ * Nothing happens at all unless there is something to fetch: no patterns and
+ * a record that is not kind three moves the caller's step on and leaves.
+ *
+ * States nought and one share a body -- nought only sets the counter to
+ * H'FF first -- which is the same shared-tail trick the jump table itself
+ * uses. Every state but the two early exits finishes by blinking the box.
+ */
+void module_fetch_step(u8 *step)
+{
+    u8 n;
+
+    if (REG8(0x0011A640UL) == 0 && REG8(PAT_B(0x03)) != 0x03) {
+        *step = (u8)(*step + 1);
+        return;
+    }
+
+    n = REG8(0x0011A63DUL);
+    if (n > 0x08) n = 0xFF;              /* anything past eight is the default */
+
+    switch (n) {
+    case 0x00:
+        if (REG8(0x00114D51UL) & 0x40) { *step = (u8)(*step + 1); return; }
+        if (!(REG8(0x0011A63CUL) & 0x02)) { *step = (u8)(*step + 1); return; }
+        REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        REG8(0x0011F58BUL) = 0xFF;
+        /* fall through -- states nought and one share a body */
+        __attribute__((fallthrough));
+    case 0x01:
+        if (REG8(0x0011A640UL) == 0) {
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+            break;
+        }
+        if (!module_link_quiet()) break;
+        {
+            u8 slot = (u8)(REG8(0x0011F58BUL) + 1);
+            u32 to, from;
+            short k;
+
+            REG8(0x0011F58BUL) = slot;
+            REG8(0x0011A660UL) = slot;
+            to   = 0x0011A25AUL + (u32)(long)(short)(u16)((u16)slot << 4);
+            from = 0x0011F316UL + (u32)(long)(short)(u16)((u16)slot << 4);
+            for (k = 0; k < 4; k++) REG32(to + (u32)k * 4) = REG32(from + (u32)k * 4);
+
+            REG8(0x0011F2A1UL) = 0x02;
+            link_send_start();
+
+            /* the ROM compares a word whose high byte is whatever the
+             * send left behind; it is nought on every path there is */
+            if ((u16)((u16)REG8(0x0011A640UL) - 1) == (u16)REG8(0x0011A660UL))
+                REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        }
+        break;
+
+    case 0x02:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A61CUL) = 0x07;
+            module_run_control(0x01);
+            link_send_start();
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        }
+        break;
+
+    case 0x03:
+        REG8(0x0011A660UL) = REG8(0x0011A640UL);
+        stitch_reset_current();
+        pattern_run_extent();
+        REG8(PAT_B(0x00)) = 0x1C;
+        REG8(PAT_B(0x04)) = REG8(0x0011A640UL);
+        REG8(PAT_B(0x03)) = 0x03;
+        {
+            const u32 w = (u32)(long)(short)(u16)((u16)REG8(PAT_B(0x00)) << 1);
+            const u32 b = (u32)REG8(PAT_B(0x00));
+
+            REG16(0x00104CCEUL + w) = 0x0000;
+            REG16(0x00104D06UL + w) = 0x0000;
+            REG16(0x00104C96UL + w) = 0x0000;
+            REG8(0x000FFE9CUL + b) = 0x00;
+            REG8(0x000FFEB8UL + b) = 0x00;
+        }
+        REG8(0x001040BCUL) = 0x00;
+        REG8(0x001040BDUL) = 0x00;
+        REG8(0x0011F58BUL) = 0x00;
+
+        if (REG8(0x00114D8EUL) == 0x04) {
+            int_to_decimal((short)((short)(signed char)REG8(0x0011F58BUL) + 1),
+                           (char *)0x0011F2D6UL);
+            REG8(0x0011F2D8UL) = 0x00;
+            text_top_CB((const char *)0x0011F2D6UL);
+            int_to_decimal((short)(u16)REG8(0x0011A640UL),
+                           (char *)0x0011F2D6UL);
+            REG8(0x0011F2D8UL) = 0x00;
+            text_top_102((const char *)0x0011F2D6UL);
+            label_percent_left(REG8(0x0011F530UL));
+        } else if (REG8(0x00114D8EUL) == 0x07) {
+            label_percent_left(REG8(0x0011F530UL));
+            module_speed_show(0x0000, 0x0001);
+        }
+        REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        break;
+
+    case 0x04:
+        if (module_link_quiet()) {
+            if (REG16(0x00114D4CUL) & 0x0002) REG8(0x0011F535UL) = 0x0E;
+            module_run_control(0x00);
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+
+            if (REG8(0x00114D8EUL) == 0x04) {
+                int_to_decimal((short)(u16)REG8(0x0011A640UL),
+                               (char *)0x0011F2D6UL);
+                REG8(0x0011F2D8UL) = 0x00;
+                text_top_CB((const char *)0x0011F2D6UL);
+                text_top_102((const char *)0x0011F2D6UL);
+                label_percent_left(0x64);
+            } else if (REG8(0x00114D8EUL) == 0x07) {
+                label_percent_left(0x64);
+            }
+            break;
+        }
+
+        if (REG8(0x00114D52UL) & 0x04) {
+            const u8 v = (u8)(REG8(0x0011F58BUL) + 1);
+            float pct;
+
+            REG8(0x00114D52UL) &= (u8)~0x04;
+            REG8(0x0011F530UL) = 0x01;
+            REG8(0x0011F58BUL) = v;
+
+            pct = (float)(long)(short)(signed char)v * 100.0f
+                / (float)(u32)REG8(0x0011A640UL);
+            if ((int)pct == 0) pct = pct + 1.0f;
+            label_percent_left((u8)(int)pct);
+
+            if (REG8(0x00114D8EUL) == 0x04) {
+                if ((short)(u16)REG8(0x0011A640UL)
+                    > (short)(signed char)REG8(0x0011F58BUL))
+                    int_to_decimal((short)((short)(signed char)v + 1),
+                                   (char *)0x0011F2D6UL);
+                else
+                    int_to_decimal((short)(signed char)v,
+                                   (char *)0x0011F2D6UL);
+                REG8(0x0011F2D8UL) = 0x00;
+                text_top_CB((const char *)0x0011F2D6UL);
+            }
+        }
+        {
+            float done = ((float)(u32)REG8(0x0011F530UL)
+                          + (float)(long)(short)(signed char)REG8(0x0011F58BUL)
+                            * 100.0f)
+                       / (float)(u32)REG8(0x0011A640UL);
+
+            if ((int)done == 0) done = done + 1.0f;
+            module_speed_show((u16)(int)done, 0x0001);
+        }
+        break;
+
+    case 0x05:
+        module_stop_sequence((u8 *)0x0011A63DUL);
+        module_speed_show(0x0064, 0x0001);
+        break;
+
+    case 0x06:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A61CUL) = 0x08;
+            link_send_start();
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        }
+        module_speed_show(0x0064, 0x0001);
+        break;
+
+    case 0x07:
+        if (module_link_quiet()) {
+            REG8(0x00114D8DUL) = REG8(0x000FFE9CUL + (u32)REG8(PAT_B(0x00)));
+            REG8(0x00114D96UL) = pattern_attr_bit3() != 0 ? 0x01 : 0x00;
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        }
+        module_speed_show(0x0064, 0x0001);
+        break;
+
+    case 0x08:
+        if (module_link_quiet()) {
+            REG8(0x00114D92UL) = 0xFF;
+            REG8(0x0011A63DUL) = (u8)(REG8(0x0011A63DUL) + 1);
+        }
+        module_speed_show(0x0064, 0x0001);
+        break;
+
+    default:
+        if (REG8(0x0011F52CUL) == 0) REG8(0x00114D73UL) = 0x01;
+        else                         REG8(0x00114D66UL) = 0x00;
+        REG8(0x0011A63CUL) &= (u8)~0x02;
+        *step = (u8)(*step + 1);
+        REG8(0x0011A63DUL) = 0x00;
+        module_speed_show(0x00C8, 0x0001);
+        break;
+    }
+
+    module_panel_blink(0x01);
+}
+
+/* H'244F14. Whether the pattern, where it is placed and turned, still fits
+ * inside the hoop.
+ *
+ * The same four corners as H'24217A, but this time with the hoop's own
+ * middle and the pattern's placement added in, and each corner tested
+ * against the hoop's width and height in H'11A626 and H'11A628. Any corner
+ * past an edge, or behind the origin, and the answer is no.
+ *
+ * The corner comparisons go through H'20074A, which compares two floats by
+ * their bit patterns -- and gets it right, including both-negative, so
+ * ordinary C comparison does the same thing. */
+u8 module_hoop_fits(void)
+{
+    const u32 a16 = 0x0011A25AUL
+                  + (u32)(long)(short)(u16)((u16)REG8(0x0011A660UL) << 4);
+    const u32 b18 = 0x0011A41AUL
+                  + (u32)(long)(short)(u16)(0x12 * (u16)REG8(0x0011A660UL));
+    const u32 pat = (u32)(long)(short)(u16)((u16)REG8(b18) << 1);
+    const float sx = (float)(u32)REG8(a16) * 2.0f / 100.0f;
+    const float sy = (float)(u32)REG8(a16 + 1) * 2.0f / 100.0f;
+    const float w  = (float)(u32)REG16(0x00104CCEUL + pat) * sx;
+    const float h  = (float)(u32)REG16(0x00104D06UL + pat) * sy;
+    const float angle = ((float)(u32)REG8(a16 + 6) * 5.0f + -180.0f)
+                      * 0.017453277f;
+    const u8 flip = REG8(a16 + 5);
+    const float hoopx = (float)(u32)REG16(0x0011A626UL);
+    const float hoopy = (float)(u32)REG16(0x0011A628UL);
+    const float ox = hoopx / 2.0f
+                   + (float)(long)(short)REG16(0x0011A266UL
+                       + (u32)(long)(short)(u16)((u16)REG8(0x0011A660UL) << 4))
+                     * 5.0f;
+    const float oy = hoopy / 2.0f
+                   + (float)(long)(short)REG16(0x0011A268UL
+                       + (u32)(long)(short)(u16)((u16)REG8(0x0011A660UL) << 4))
+                     * 5.0f;
+    float theta = 0.0f, r;
+    float cx[4], cy[4];
+    short i;
+
+    if (f2u(w) != 0) theta = float_atan(h / w);
+
+    r = float_sqrt(h * h + w * w) / 2.0f;
+
+    {
+        const float nr = ((u16)(f2u(r) >> 16) != 0)
+                         ? u2f(f2u(r) ^ 0x80000000UL) : r;
+        const float p  = theta - angle;
+        const float q  = (((u16)(f2u(theta) >> 16) != 0)
+                          ? u2f(f2u(theta) ^ 0x80000000UL) : theta) - angle;
+
+        if (flip == 0) {
+            cx[0] = float_cos(p) * r  + ox;  cy[0] = float_sin(p) * r  + oy;
+            cx[1] = float_cos(q) * r  + ox;  cy[1] = float_sin(q) * r  + oy;
+            cx[2] = nr * float_cos(p) + ox;  cy[2] = nr * float_sin(p) + oy;
+            cx[3] = nr * float_cos(q) + ox;  cy[3] = nr * float_sin(q) + oy;
+        } else {
+            cx[0] = nr * float_cos(p) + ox;  cy[0] = float_sin(p) * r  + oy;
+            cx[1] = nr * float_cos(q) + ox;  cy[1] = float_sin(q) * r  + oy;
+            cx[2] = float_cos(p) * r  + ox;  cy[2] = nr * float_sin(p) + oy;
+            cx[3] = float_cos(q) * r  + ox;  cy[3] = nr * float_sin(q) + oy;
+        }
+    }
+
+    for (i = 0; i < 4; i++) {
+        if (cx[i] > hoopx) return 0x00;
+        if (cy[i] > hoopy) return 0x00;
+        if ((long)f2u(cx[i]) < 0) return 0x00;
+        if ((long)f2u(cy[i]) < 0) return 0x00;
+    }
+    return 0x01;
+}
+
+/* H'2431EE. Twelve states that start the module sewing and stop it again,
+ * walked by H'11F595 through a reversed key table at H'24329C: the keys
+ * H'01 to H'05 and H'0A to H'10 are read forwards while the index counts
+ * down, so the handlers sit back to front behind them.
+ *
+ * Which state it starts in is decided before the dispatch: H'0A when the
+ * module is already talking or H'114D4E is clear, H'01 otherwise, and
+ * H'114DBB at five puts it back to one. Every state that is waiting for the
+ * link blinks the panel box while it waits.
+ */
+void module_run_step(u8 *step)
+{
+    u8 n;
+
+    if (REG8(0x0011F595UL) == 0) {
+        if (REG8(0x00114DBAUL) != 0) REG8(0x0011F595UL) = 0x0A;
+        else                         REG8(0x0011F595UL) = 0x01;
+
+        if (REG8(0x00114D4EUL) == 0) REG8(0x0011F595UL) = 0x0A;
+
+        if (REG8(0x00114D51UL) & 0x10) {
+            if (REG8(0x00114DBBUL) == 0) REG8(0x00114DBBUL) = 0x01;
+        }
+        if (!(REG8(0x00114D51UL) & 0x10)) REG8(0x00114DBBUL) = 0x00;
+
+        if (REG8(0x00114DBBUL) == 0x05) REG8(0x0011F595UL) = 0x01;
+    }
+
+    n = REG8(0x0011F595UL);
+
+    switch (n) {
+    case 0x01:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A617UL) = 0x01;
+            REG8(0x00114D7DUL) = 0x01;
+            module_run_control(0x01);
+            link_send_start();
+            REG8(0x0011F594UL) = 0x00;
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x02:
+        if (!module_link_quiet()) { module_panel_blink(0x01); return; }
+
+        if (REG8(0x00114D52UL) & 0x08) {
+            REG8(0x00114D52UL) &= (u8)~0x08;
+            if (REG8(0x0011F531UL) == 0) REG8(0x0011F534UL) = 0x01;
+            REG8(0x0011F531UL) = 0x00;
+        }
+        module_run_control(0x00);
+        if (REG8(0x0011F594UL) == 0) {
+            module_fixed_box(0x01);
+            REG8(0x0011F594UL) = 0x01;
+        }
+        if (REG8(0x0011F530UL) > 0x32) {
+            while (REG8(0x0011F530UL) <= 0x64) {
+                label_percent_left(REG8(0x0011F530UL));
+                REG8(0x0011F530UL) = (u8)(REG8(0x0011F530UL) + 1);
+            }
+        }
+        REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        return;
+
+    case 0x03:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x04;
+            REG8(0x0011F2A2UL) = 0x02;
+            link_send_start();
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x04:
+        if (!module_link_quiet()) return;
+        if (REG8(0x00114DB9UL) != 0) return;
+
+        if (module_hoop_fits() != 0) {
+            if (REG8(0x00114DBBUL) == 0x01) {
+                if (module_can_talk() != 0) {
+                    REG8(0x0011F2A1UL) = 0x03;
+                    REG8(0x0011A613UL) = 0x02;
+                    link_send_start();
+                    REG8(0x00114DBAUL) = 0x01;
+                    REG8(0x00114DBBUL) = 0x05;
+                    REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+                }
+                return;
+            }
+
+            if (REG8(0x00114DBAUL) != 0) {
+                if (module_can_talk() != 0) {
+                    REG8(0x0011F2A1UL) = 0x03;
+                    REG8(0x0011A614UL) = 0x03;
+                    REG8(0x00114DBAUL) = 0x00;
+                    link_send_start();
+                    REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+                }
+                return;
+            }
+
+            if (module_running() != 0) {
+                REG8(0x0011F2A1UL) = 0x03;
+                REG8(0x0011A614UL) = 0x03;
+                REG8(0x00114DBAUL) = 0x00;
+                link_send_start();
+                REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+            } else {
+                link_claim(0x03);
+            }
+            return;
+        }
+
+        if (module_can_talk() != 0) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A613UL) = 0x02;
+            link_send_start();
+            REG8(0x00114DBAUL) = 0x01;
+            REG8(0x00114D55UL) |= 0x01;
+            if (REG8(0x00114DBBUL) == 0x01) REG8(0x00114DBBUL) = 0x05;
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        }
+        return;
+
+    case 0x0A:
+        if (REG8(0x00114DB9UL) == 0) {
+            REG8(0x00114D7DUL) = 0x01;
+            if (module_can_talk() != 0) {
+                if (REG8(0x00114DA0UL) == 0) module_talk_end();
+                REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+            }
+        }
+        return;
+
+    case 0x0B:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A612UL) = 0x01;
+            link_send_start();
+            REG8(0x0011F594UL) = 0x00;
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x0C:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A617UL) = 0x01;
+            link_send_start();
+            module_run_control(0x01);
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x0D:
+        if (!module_link_quiet()) { module_panel_blink(0x01); return; }
+
+        module_run_control(0x00);
+        REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        if (REG8(0x0011F594UL) == 0) {
+            module_fixed_box(0x01);
+            REG8(0x0011F594UL) = 0x01;
+        }
+        if (REG8(0x0011F530UL) > 0x32) {
+            while (REG8(0x0011F530UL) <= 0x64) {
+                label_percent_left(REG8(0x0011F530UL));
+                REG8(0x0011F530UL) = (u8)(REG8(0x0011F530UL) + 1);
+            }
+        }
+        return;
+
+    case 0x0E:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x04;
+            REG8(0x0011F2A2UL) = 0x02;
+            link_send_start();
+            REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x0F:
+        if (REG8(0x00114DB9UL) == 0) {
+            if (module_can_talk() != 0)
+                REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        }
+        return;
+
+    case 0x10:
+        if (!module_link_quiet()) { module_panel_blink(0x01); return; }
+
+        if (module_hoop_fits() != 0) {
+            if (REG8(0x00114DBBUL) == 0x01) {
+                REG8(0x0011F2A1UL) = 0x03;
+                REG8(0x0011A613UL) = 0x02;
+                link_send_start();
+                REG8(0x00114DBAUL) = 0x01;
+                REG8(0x00114DBBUL) = 0x05;
+            } else {
+                REG8(0x0011F2A1UL) = 0x03;
+                REG8(0x0011A614UL) = 0x03;
+                link_send_start();
+                REG8(0x00114DBAUL) = 0x00;
+            }
+        } else {
+            REG8(0x0011F2A1UL) = 0x03;
+            REG8(0x0011A613UL) = 0x02;
+            link_send_start();
+            REG8(0x00114DBAUL) = 0x01;
+            REG8(0x00114D55UL) |= 0x01;
+        }
+        REG8(0x0011F595UL) = (u8)(REG8(0x0011F595UL) + 1);
+        return;
+
+    case 0x05:
+    default:
+        if (module_link_quiet()) {
+            *step = (u8)(*step + 1);
+            REG8(0x00114D7DUL) = 0x00;
+            REG8(0x0011F595UL) = 0x00;
+            if (REG8(0x0011F52CUL) != 0) REG8(0x00114D66UL) = 0x00;
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+    }
+}
+
+u8 touch_hit(u16 first, u16 last, u16 *out_value, u16 *out_index);
+u8 module_home_request(void);
+void module_restart(void);
+void screen_store1_clear(void);
+void embroidery_panel_save(void);
+u8 module_identify(void);
+void stitch_reset_current(void);
+void module_reset_wait(void);
+void module_unpark(void);
+void link_delay(u16 units);
+void module_screen_step(void);
+void pattern_mark_ready(void);
+void module_link_lost(void);
+void module_wait_pass(void);
+void module_state_machine(void);
+void module_fetch_step(u8 *step);
+void module_run_step(u8 *step);
+void module_hoop_check(u8 *step);
+void module_ask_time(u8 *step);
+void module_buffers_clear(void);
+void module_cursor_erase(void);
+void module_fixed_box(u8 mode);
+void box5_draw(u8 lit);
+void label_colours(void);
+void label_percent(void);
+void label_colours_picture(void);
+void label_minutes(short value);
+void module_size_labels(short across, short down);
+void module_minutes_left(u8 mode);
+u8 module_flash_step(u8 what);
+u8 module_edge_service(void);
+u8 module_lid_check(void);
+void module_arrow_fwd_2(u8 lit);
+void module_arrow_back_1(u8 lit);
+void module_arrow_fwd_3(u8 lit);
+void module_arrow_back_2(u8 lit);
+void module_colour_bitmap(u8 index);
+void module_panel_blink(u8 on);
+void pedal_service(void);
+void main_motor_service(void);
+
+static void module_give_up(void);
+static void module_wait_reset(void);
+static void module_lost_home(void);
+static void module_state_0D(u8 *wait);
+static void module_state_0E(u8 *wait);
+
+/* State H'0D of H'235B0E, written out because it is a third of the routine.
+ * The module is running: the lid, the stop button and the hardware state are
+ * all watched, and when the hardware settles at five the speed is worked out
+ * in floating point and written to H'FFFECB.
+ *
+ * The speed is sixty over four thousandths of the reading, held down to
+ * H'114DC0, less one. Two ways to the reading, by whether H'57FF80 says this
+ * is a H'B4 machine: the other kind adds three to the tenths and takes five
+ * off at the end. */
+static void module_state_0D(u8 *wait)
+{
+    *wait = 0;
+
+    if (!(REG8(0x00FFFEC1UL) & 0x08)) {
+        REG8(0x00114D93UL) = 0x01;
+        module_home_request();
+    }
+
+    {
+        const u8 s = REG8(0x00FFFEC6UL);
+
+        if (s == 0x00 || s == 0x05) {
+            module_flash_step(0x03);
+            if (REG8(0x00FFFEC7UL) & 0x01) {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                REG8(0x00114D62UL) = 0x0A;
+                link_claim(0x1A);
+            }
+        }
+    }
+
+    {
+        const u8 s = REG8(0x00FFFEC6UL);
+
+        if (s == 0x00 || s == 0x05) { REG8(0x00FFFECBUL) = 0x1E; return; }
+    }
+
+    REG8(0x00114D9AUL) = 0x01;
+    REG8(0x00114D98UL) = 0x01;
+
+    if (module_edge_service() == 0) {
+        REG8(0x00114D93UL) = 0x01;
+        module_home_request();
+        module_flash_step(0x01);
+    }
+
+    if (REG8(0x00FFFEC0UL) == 0x01) { module_lost_home(); return; }
+
+    if ((REG8(0x00FFFEC4UL) & 0x10) && (REG8(0x00FFFEC7UL) & 0x01)) {
+        if (REG8(0x00FFFEC3UL) == 0) REG8(0x00FFFEC7UL) |= 0x40;
+        if (REG8(0x00FFFEC1UL) & 0x02) {
+            REG8(0x00FFFEC7UL) |= 0x40;
+            REG8(0x00FFFEC3UL) = 0x00;
+        }
+    }
+
+    if (REG8(0x00FFFEC0UL) != 0x05) return;
+
+    if (REG8(0x0011F54BUL) == 0x01) {
+        REG8(0x0011F54BUL) = 0x00;
+        REG8(0x00114D62UL) = 0x0A;
+        REG8(0x00FFFEC7UL) |= 0x40;
+        REG8(0x00FFFEC3UL) = 0x00;
+        REG8(0x00FFFEC4UL) |= 0x20;
+        REG8(0x00114D50UL) &= (u8)~0x02;
+        REG8(0x00114D50UL) &= (u8)~0x01;
+        return;
+    }
+
+    while (REG8(0x00FFFEC0UL) != 0x01) {
+        if (*wait == 0xFF) { *wait = 0x00; break; }
+        link_delay(0x0001);
+        *wait = (u8)(*wait + 1);
+    }
+
+    if (REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) {
+        module_lost_home();
+        return;
+    }
+
+    REG16(0x0011A662UL) = 0x1FFF;
+    REG8(0x0011F2A1UL) = 0x03;
+    REG8(0x0011A616UL) = 0x01;
+    link_send_start();
+    link_delay(0x0008);
+
+    if (REG16(0x0011A662UL) == 0x1FFF) { module_lost_home(); return; }
+
+    if (REG8(0x00114D5CUL) == 0x02) {
+        REG8(0x00114D93UL) = 0x00;
+        module_home_request();
+        REG8(0x00FFFEC4UL) |= 0x20;
+        link_claim(0x10);
+        return;
+    }
+
+    REG8(0x00FFFEC1UL) &= (u8)~0x20;
+
+    if (REG8(0x00114D5CUL) == 0x04) {
+        REG8(0x00FFFECBUL) = 0x1E;
+        REG8(0x0011F54CUL) = REG8(0x00FFFED1UL);
+        REG8(0x00FFFED1UL) = 0x28;
+        REG8(0x00114D62UL) = 0x0F;
+        return;
+    }
+
+    if (REG8(0x00114D5CUL) == 0x05) REG8(0x00FFFEC1UL) |= 0x20;
+
+    if (REG8(0x00114D5CUL) == 0x01) {
+        if (REG8(0x00114D96UL) == 0) {
+            REG8(0x00114D7CUL) = 0x01;
+            link_delay(0x0032);
+            REG8(0x00FFFEC7UL) |= 0x40;
+            REG8(0x00FFFEC3UL) = 0x00;
+            REG8(0x0011F54EUL) = 0x01;
+            module_flash_step(0x01);
+        }
+        if (REG8(0x00114D7CUL) == 0) {
+            REG8(0x00114D4FUL) &= (u8)~0x01;
+            REG8(0x00114D89UL) = (u8)(REG8(0x00114D89UL) + 1);
+            REG8(0x00FFFEC1UL) |= 0x20;
+            label_colours_picture();
+        }
+        REG8(0x00114D62UL) = 0x0E;
+        return;
+    }
+
+    {
+        float v;
+
+        if (REG8(0x0057FF80UL) < 0xB4)
+            v = (float)(long)(short)(u16)((u16)REG8(0x00114DBEUL) + 3) / 10.0f
+                  * (float)(u32)REG16(0x0011A662UL)
+                + (float)(u32)REG8(0x00114DBFUL) + -5.0f;
+        else
+            v = (float)(u32)REG8(0x00114DBEUL) / 10.0f
+                  * (float)(u32)REG16(0x0011A662UL)
+                + (float)(u32)REG8(0x00114DBFUL);
+
+        v = 60.0f / (v / 1000.0f * 4.0f);
+        if (!((float)(u32)REG8(0x00114DC0UL) >= v))
+            v = (float)(u32)REG8(0x00114DC0UL);
+
+        REG8(0x00FFFECBUL) = (u8)((u8)(int)v - 1);
+    }
+
+    if (REG16(0x0011A662UL) == 0x01FF) REG8(0x00FFFECBUL) = 0x1E;
+    if (REG8(0x0011F54BUL) != 0) REG8(0x00FFFECBUL) = 0x1E;
+    REG8(0x00114D62UL) = 0x0E;
+    REG8(0x0011F54BUL) = module_flash_step(0x00);
+}
+
+/* State H'0E. Waits for the hardware to reach the state that means one
+ * stitch is done -- seven on this machine, three on a H'B4 one -- turning
+ * the delay over up to H'FF times, then sends message H'03/H'02 and goes
+ * back to H'0D. H'11F54E says this was the last one. */
+static void module_state_0E(u8 *wait)
+{
+    const u8 want = (REG8(0x0057FF80UL) < 0xB4) ? 0x07 : 0x03;
+
+    {
+        const u8 s = REG8(0x00FFFEC6UL);
+
+        if (s == 0x00 || s == 0x05) return;
+    }
+
+    for (;;) {
+        if (REG8(0x00FFFEC0UL) == want) break;
+        if (*wait == 0xFF) break;
+        link_delay(0x0001);
+        *wait = (u8)(*wait + 1);
+        if (REG8(0x00FFFEC0UL) == want) break;
+        if (REG8(0x00FFFEC0UL) == 0x01) break;
+        if (REG8(0x00FFFEC0UL) == 0x00) break;
+    }
+
+    if (REG8(0x00FFFEC0UL) != want) return;
+
+    if (REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) {
+        module_lost_home();
+        return;
+    }
+
+    REG8(0x0011F2A1UL) = 0x03;
+    REG8(0x0011A616UL) = 0x02;
+    link_send_start();
+    REG8(0x00114D62UL) = 0x0D;
+
+    if (REG8(0x0011F54EUL) != 0) {
+        module_minutes_left(0x02);
+        REG8(0x0011F54EUL) = 0x00;
+        REG8(0x00114D62UL) = 0x0A;
+    } else {
+        module_minutes_left(0x01);
+    }
+}
+
+/* H'244DE0's own reset: everything cleared and message H'03/H'04 sent. */
+static void module_wait_reset(void)
+{
+    REG8(0x00114D83UL) = 0x00;
+    REG8(0x00114D66UL) = 0x00;
+    REG8(0x00114D62UL) = 0x00;
+    REG8(0x00114D95UL) = 0x00;
+    REG8(0x00114D50UL) &= (u8)~0x01;
+    REG8(0x00114D50UL) &= (u8)~0x02;
+    REG8(0x0011F2A1UL) = 0x03;
+    REG8(0x0011A61AUL) = 0x04;
+    link_send_start();
+}
+
+/* The block H'235B0E writes out to give up on the module:
+ * everything cleared, the hardware released, message H'03/H'04 sent, and the
+ * screen asked for again if a homing was pending. */
+static void module_give_up(void)
+{
+    REG8(0x00114D65UL) = 0x00;
+    REG8(0x00114D66UL) = 0x00;
+    REG8(0x00114D62UL) = 0x00;
+    REG8(0x00114D95UL) = 0x00;
+    REG8(0x00FFFEC4UL) |= 0x20;
+    REG8(0x00114D50UL) &= (u8)~0x01;
+    REG8(0x00114D50UL) &= (u8)~0x02;
+    REG8(0x0011F2A1UL) = 0x03;
+    REG8(0x0011A61AUL) = 0x04;
+    link_send_start();
+
+    if (REG8(0x00114D93UL) != 0) {
+        REG8(0x00114D66UL) = 0x01;
+        REG8(0x00114D62UL) = 0x08;
+    }
+    module_screen_step();
+}
+
+/* The failure every state of H'235B0E shares: bit H'0200 of H'114D4C up,
+ * and the module asked to go home. */
+static void module_lost_home(void)
+{
+    REG16(0x00114D4CUL) |= 0x0200;
+    REG8(0x00114D94UL) = 0x01;
+    REG8(0x00114D93UL) = 0x01;
+    module_home_request();
+}
+
+/* H'235B0E. The module's own state machine: eighteen states in H'114D62,
+ * with a four-step settling sub-machine in H'114D65 in front of them that
+ * only runs once the main states are past seven.
+ *
+ * H'244DE0 turns this over in a loop and this calls H'2315A4, which calls
+ * H'23182A, which calls H'244DE0 -- the four of them are one knot and are
+ * written together.
+ *
+ * Two registers the ROM never initialises are reproduced as locals starting
+ * at nought: R1, the H'C8 spin count in state H'0A, and R3L, the delay
+ * counter states H'0D and H'0E share. Neither survives a call, so neither
+ * ever counts in the original either.
+ */
+void module_state_machine(void)
+{
+    u16 spin = 0;
+    u8 wait = 0;
+
+    if (REG8(0x00114D65UL) != 0 && REG8(0x00114D62UL) > 0x07) {
+        const u8 k = REG8(0x00114D65UL);
+
+        if (k == 0x01) {
+            if (REG8(0x00114D62UL) < 0x0F) {
+                if (REG8(0x00FFFEC0UL) == 0x06) {
+                    REG8(0x00FFFECBUL) = 0x1E;
+                    REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+                    return;
+                }
+                REG8(0x00FFFECBUL) = 0x1E;
+                {
+                    const u8 s = REG8(0x00FFFEC6UL);
+
+                    if (s == 0x00 || s == 0x05)
+                        REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+                }
+            }
+            if (REG8(0x00114D94UL) != 0) return;
+            /* otherwise on into the states */
+        } else if (k == 0x02) {
+            if (REG8(0x00FFFEC0UL) == 0x07) {
+                REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+                return;
+            }
+            {
+                const u8 s = REG8(0x00FFFEC6UL);
+
+                if (s == 0x00 || s == 0x05)
+                    REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+            }
+            return;
+        } else if (k == 0x03) {
+            if (REG8(0x00FFFEC0UL) == 0x05) {
+                REG8(0x00FFFEC7UL) |= 0x40;
+                REG8(0x00FFFEC3UL) = 0x00;
+                REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+                return;
+            }
+            {
+                const u8 s = REG8(0x00FFFEC6UL);
+
+                if (s == 0x00 || s == 0x05)
+                    REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+            }
+            return;
+        } else {
+            link_delay(0x0014);
+            REG8(0x00114D94UL) = 0x00;
+            REG8(0x00114D65UL) = (u8)(REG8(0x00114D65UL) + 1);
+
+            if (REG8(0x00114D65UL) == 0xC8) module_give_up();
+            {
+                const u8 s = REG8(0x00FFFEC6UL);
+
+                if (s == 0x00 || s == 0x05) module_give_up();
+            }
+            return;
+        }
+    }
+
+    switch (REG8(0x00114D62UL)) {
+    case 0x00:
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x04;
+            REG8(0x0011F2A2UL) = 0x02;
+            link_send_start();
+            REG8(0x0011F54DUL) = 0x7D;
+            REG8(0x00114D99UL) = 0x00;
+            module_flash_step(0x01);
+            REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        } else {
+            module_panel_blink(0x01);
+        }
+        return;
+
+    case 0x01:
+        if (REG8(0x0011F54DUL) != 0) {
+            REG8(0x0011F54DUL) = (u8)(REG8(0x0011F54DUL) - 1);
+            module_panel_blink(0x01);
+        } else {
+            REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        }
+        return;
+
+    case 0x02:
+        module_fetch_step((u8 *)0x00114D62UL);
+        return;
+
+    case 0x03:
+        module_hoop_check((u8 *)0x00114D62UL);
+        return;
+
+    case 0x04:
+        if (!module_link_quiet()) return;
+        module_fixed_box(0x01);
+        REG8(0x00114D91UL) = 0x01;
+        label_colours();
+        box5_draw(REG8(0x00114D96UL));
+        label_percent();
+        module_arrow_back_2(0x00);
+        module_arrow_fwd_3(0x01);
+        {
+            const u32 pat = (u32)(long)(short)(u16)
+                            ((u16)REG8(PAT_B(0x00)) << 1);
+            const u16 w = (u16)(REG16(0x00104CCEUL + pat) / 10);
+            const u16 h = (u16)(REG16(0x00104D06UL + pat) / 10);
+
+            REG16(0x0011F4E2UL) = h;
+            REG16(0x0011F4E0UL) = w;
+            module_size_labels((short)w, (short)h);
+        }
+        REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        return;
+
+    case 0x05:
+        {
+            /* the sum is kept as a full word here and as a byte below */
+            const u16 n = (u16)((u16)((u16)REG8(PAT_B(0x05)) * 0x1B)
+                                + (u16)REG8(PAT_B(0x00)));
+
+            if (n != (u16)REG8(0x00114D92UL)) {
+                REG8(0x00114D7BUL) = 0x01;
+                REG8(0x0011F4E6UL) = 0x00;
+                REG8(0x00114D7CUL) = 0x00;
+            } else {
+                REG8(0x00114D7BUL) = 0x14;
+            }
+        }
+        REG8(0x00114D92UL) = (u8)(REG8(PAT_B(0x00))
+                                  + (u8)(u16)((u16)REG8(PAT_B(0x05)) * 0x1B));
+        REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        return;
+
+    case 0x06:
+        if (REG8(0x00114D7BUL) != 0) return;
+        module_run_step((u8 *)0x00114D62UL);
+        return;
+
+    case 0x07:
+        if (module_link_quiet() && REG8(0x00114DB9UL) == 0)
+            REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        else
+            module_panel_blink(0x01);
+        return;
+
+    case 0x08:
+        if ((REG8(0x00114D50UL) & 0x21) != 0 ||
+            REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) {
+            module_fixed_box(0x01);
+            return;
+        }
+        REG8(0x00FFFECBUL) = 0x1E;
+        {
+            const u32 pat = (u32)(long)(short)(u16)
+                            ((u16)REG8(PAT_B(0x00)) << 1);
+            const u16 w = (u16)(REG16(0x00104CCEUL + pat) / 10);
+            const u16 h = (u16)(REG16(0x00104D06UL + pat) / 10);
+
+            REG16(0x0011F4E2UL) = h;
+            REG16(0x0011F4E0UL) = w;
+            module_size_labels((short)w, (short)h);
+            REG16(0x0011F4E4UL) = REG16(0x00104C96UL + pat);
+            if (REG16(0x0011F4E4UL) != 0)
+                label_minutes((short)REG16(0x0011F4E4UL));
+        }
+        REG8(0x0011F2A1UL) = 0x03;
+        REG8(0x0011A61AUL) = 0x01;
+        link_send_start();
+        REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        return;
+
+    case 0x09:
+        if ((REG8(0x00114D50UL) & 0x21) != 0 ||
+            REG8(0x0011F29EUL) != 0 || REG8(0x0011F2B6UL) != 0) {
+            module_fixed_box(0x01);
+            return;
+        }
+        link_claim(REG8(0x0011F535UL));
+        module_panel_blink(0x00);
+        REG8(0x00114D62UL) = (u8)(REG8(0x00114D62UL) + 1);
+        return;
+
+    case 0x0A:
+        if (REG8(0x00114D7CUL) != 0) {
+            const u8 k = REG8(0x00114D7CUL);
+
+            if (k == 0x01) {
+                spin = 0;
+                REG8(0x00114D7CUL) = (u8)(k + 1);
+            } else if (k == 0x02) {
+                const u8 s = REG8(0x00FFFEC6UL);
+
+                if (s != 0x00 && s != 0x05) {
+                    spin = (u16)(spin + 1);
+                    if (spin == 0x00C8) REG8(0x00FFFEC4UL) |= 0x20;
+                    return;
+                }
+                REG8(0x00114D7CUL) = (u8)(REG8(0x00114D7CUL) + 1);
+            } else if (k == 0x03) {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                REG8(0x00114D4FUL) |= 0x01;
+                REG8(0x00114D7CUL) = (u8)(REG8(0x00114D7CUL) + 1);
+            } else if (k == 0x04) {
+                REG8(0x00114D7CUL) = 0x00;
+                REG8(0x00114D50UL) &= (u8)~0x01;
+                REG8(0x00114D50UL) &= (u8)~0x02;
+            }
+            return;
+        }
+
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0 &&
+            REG8(0x00114D7BUL) == 0 && REG8(0x00114D4EUL) != 0 &&
+            REG8(0x00114DBAUL) == 0 && REG8(0x00114DB9UL) == 0) {
+            if ((REG8(0x00FFFEC1UL) & 0x08) && REG8(0x0011F30EUL) == 0) {
+                REG8(0x00114D62UL) = 0x0B;
+                REG8(0x0011F54EUL) = 0x00;
+                return;
+            }
+            module_lid_check();
+            return;
+        }
+        REG8(0x00114D98UL) = 0x00;
+        return;
+
+    case 0x0B:
+        module_ask_time((u8 *)0x00114D62UL);
+        if (REG8(0x00114D62UL) == 0x0C) {
+            REG8(0x00114D98UL) = 0x01;
+            REG8(0x00FFFEC4UL) &= (u8)~0x20;
+        }
+        return;
+
+    case 0x0C:
+        {
+            const u8 s = REG8(0x00FFFEC6UL);
+
+            if (s != 0x00 && s != 0x05) {
+                REG8(0x00114D62UL) = 0x0D;
+                REG8(0x00114D95UL) = 0x01;
+                REG8(0x00114D99UL) = 0x00;
+            }
+        }
+        if (REG8(0x0011F30EUL) != 0) {
+            REG8(0x00FFFEC4UL) |= 0x20;
+            REG8(0x00114D62UL) = 0x0A;
+        }
+        if ((REG8(0x00FFFEC4UL) & 0x10) && (REG8(0x00FFFEC7UL) & 0x01)) {
+            REG8(0x00FFFEC4UL) |= 0x20;
+            REG8(0x00114D62UL) = 0x0A;
+            link_claim(0x1A);
+        }
+        if ((REG8(0x00FFFEC4UL) & 0x10) && !(REG8(0x00FFFEC1UL) & 0x08)) {
+            REG8(0x00FFFEC4UL) |= 0x20;
+            REG8(0x00114D62UL) = 0x0A;
+        }
+        return;
+
+    case 0x0D:
+        module_state_0D(&wait);
+        return;
+
+    case 0x0E:
+        module_state_0E(&wait);
+        return;
+
+    case 0x0F:
+        if (REG8(0x00FFFEC0UL) == 0x03) {
+            if (REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+                REG8(0x0011F2A1UL) = 0x03;
+                REG8(0x0011A616UL) = 0x02;
+                link_send_start();
+                REG8(0x00114D62UL) = 0x10;
+            } else {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                REG8(0x00FFFED1UL) = REG8(0x0011F54CUL);
+                REG16(0x00114D4CUL) |= 0x0200;
+                REG8(0x00114D62UL) = 0x00;
+                REG8(0x00114D66UL) = 0x00;
+            }
+        }
+        return;
+
+    case 0x10:
+        if (REG8(0x00FFFEC0UL) == 0x04) {
+            REG8(0x00FFFECBUL) = 0x00;
+            pedal_service();
+            main_motor_service();
+            REG8(0x00114D62UL) = 0x11;
+        }
+        return;
+
+    case 0x11:
+        link_delay(REG16(0x0011A662UL));
+        REG8(0x00FFFED1UL) = REG8(0x0011F54CUL);
+        REG8(0x00FFFECBUL) = 0x1E;
+        pedal_service();
+        main_motor_service();
+        REG8(0x00114D62UL) = 0x0D;
+        return;
+
+    default:
+        return;
+    }
+}
+
+/* H'2315A4. Which screen the module wants next, by H'114D8A. State four is
+ * the only one that does not clear the request afterwards. */
+void module_screen_step(void)
+{
+    switch (REG8(0x00114D8AUL)) {
+    case 0x01:
+        screen_switch(0x15, 0x01, 0x00);
+        REG8(0x00114D72UL) = 0x01;
+        REG8(0x00114D8AUL) = 0x00;
+        break;
+
+    case 0x02:
+        if (REG8(0x00114DA1UL) == 0x01) screen_switch(0x14, 0x01, 0x00);
+        else                            screen_switch(0x13, 0x01, 0x00);
+        REG8(0x00114D7EUL) = 0x01;
+        if (REG8(0x00114D9BUL) == 0) REG8(0x00114DADUL) = 0x01;
+        REG8(0x00114D8AUL) = 0x00;
+        break;
+
+    case 0x03:
+        screen_switch(0x16, 0x01, 0x00);
+        REG8(0x00114D72UL) = 0x02;
+        REG8(0x00114D8AUL) = 0x00;
+        break;
+
+    case 0x04:
+        REG8(0x00114D72UL) = 0x3E;
+        screen_switch(0x37, 0x01, 0x00);
+        pattern_mark_ready();
+        break;
+
+    case 0x05:
+        REG8(0x00114D72UL) = 0x2D;
+        screen_switch(0x24, 0x01, 0x00);
+        REG8(0x00114D8AUL) = 0x00;
+        module_arrow_fwd_2(0x01);
+        module_arrow_back_1(0x01);
+        module_colour_bitmap(REG8(0x00114D89UL));
+        break;
+
+    case 0x06:
+        module_link_lost();
+        break;
+
+    default:
+        REG8(0x00114D8AUL) = 0x00;
+        break;
+    }
+}
+
+/* H'23182A. The module has gone: everything cleared out, the screen put back
+ * to the one that matches what bit 0 of H'114D51 says was attached, and the
+ * whole thing marked as unplugged. If the hardware is still moving it waits
+ * a pass instead and asks again next time. */
+void module_link_lost(void)
+{
+    const u8 state = REG8(0x00FFFEC6UL);
+
+    if (state == 0x00 || state == 0x05) {
+        module_buffers_clear();
+
+        if (REG8(0x00114D51UL) & 0x01) {
+            REG8(0x00114D7EUL) = 0x01;
+            REG8(0x00114D8BUL) = 0x00;
+            REG8(0x00114D9BUL) = 0x01;
+            link_claim(0x05);
+            screen_switch(0x14, 0x01, 0x00);
+            REG8(0x00114DA1UL) = 0x01;
+            REG8(PAT_B(0x03)) = 0x01;
+            REG8(0x00114D8EUL) = 0x03;
+        } else {
+            REG8(0x00114D7EUL) = 0x01;
+            link_claim(0x05);
+            REG8(0x00114D8BUL) = 0x00;
+            REG8(0x00114D9BUL) = 0x01;
+            screen_switch(0x13, 0x01, 0x00);
+            REG8(0x00114DA1UL) = 0x00;
+            REG8(PAT_B(0x03)) = 0x00;
+            REG8(0x00114D8EUL) = 0x02;
+        }
+        REG8(0x00114D8AUL) = 0x00;
+        return;
+    }
+
+    if (REG8(0x00114D8AUL) == 0) module_wait_pass();
+    REG8(0x00114D8AUL) = 0x06;
+}
+
+/* H'244DE0. A pass held open while the module finishes moving: the state
+ * machine, the pedal and the main motor turned over until H'114D83 comes
+ * back to nought. H'114D83 counting to H'C8 gives up and puts everything
+ * back, and so does the hardware coming to rest. */
+void module_wait_pass(void)
+{
+    module_cursor_erase();
+
+    {
+        const u8 s = REG8(0x00FFFEC6UL);
+
+        if (s == 0x00 || s == 0x05) return;
+    }
+
+    do {
+        const u8 n = REG8(0x00114D83UL);
+
+        if (n == 0x00) {
+            REG8(0x00114D83UL) = (u8)(n + 1);
+        } else if (n == 0x01) {
+            if (REG8(0x00114D62UL) != 0x0E) {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                link_delay(0x000A);
+                REG8(0x00114D83UL) = (u8)(REG8(0x00114D83UL) + 1);
+            }
+        } else {
+            link_delay(0x0014);
+            REG8(0x00114D83UL) = (u8)(REG8(0x00114D83UL) + 1);
+
+            /* this routine's own giving-up block, which is not the one
+             * H'235B0E uses: it clears H'114D83 rather than H'114D65, does
+             * not touch H'FFFEC4, and does not ask for a screen */
+            if (REG8(0x00114D83UL) == 0xC8) module_wait_reset();
+
+            {
+                const u8 s = REG8(0x00FFFEC6UL);
+
+                if (s == 0x00 || s == 0x05) module_wait_reset();
+            }
+        }
+
+        if (REG8(0x00114D66UL) != 0) module_state_machine();
+        pedal_service();
+        main_motor_service();
+    } while (REG8(0x00114D83UL) != 0);
+
+    REG8(0x00114D98UL) = 0x00;
+    REG8(0x00114D99UL) = 0x01;
+}
+
+/* H'231B32. The module reset held open: H'11F9C walks two steps, the first
+ * turning a whole pass over and the second clearing everything out and going
+ * back to screen H'12. Nothing happens unless H'114D9F asks for it. */
+void module_reset_wait(void)
+{
+    if (REG8(0x00114D9FUL) == 0) return;
+
+    do {
+        const u8 n = REG8(0x00114D9CUL);
+
+        if (n == 0x00) {
+            REG8(0x00114D4FUL) &= (u8)~0x08;
+            REG8(0x00114D80UL) = 0x00;
+            module_wait_pass();
+            REG8(0x00114D9CUL) = (u8)(REG8(0x00114D9CUL) + 1);
+        } else if (n == 0x01) {
+            if (REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+                module_buffers_clear();
+                screen_switch(0x12, 0x01, 0x00);
+                REG8(0x00114D9CUL) = 0x00;
+            }
+        }
+    } while (REG8(0x00114D9CUL) != 0);
+}
+
+/* H'237E3C. A key press while the embroidery module is attached.
+ *
+ * Twelve keys in a reversed jump table at H'237E7A: the codes H'21F68C
+ * hands over. Most of them share the same two guards -- H'114D78 at H'EE
+ * means the module is mid-something, and bit 0 of H'FFFEC4 means it is
+ * really there -- and then wait a pass for the hardware to settle.
+ *
+ * Key H'6D is the one that does the work: it is the button that leaves the
+ * embroidery screens, and where it goes depends on H'114D8E. Eight or nine
+ * puts the panel away and goes to screen H'37; four or five stops the run
+ * first; one to three asks the module to name itself and only goes on if it
+ * answers.
+ */
+void module_key(u8 key)
+{
+    switch (key) {
+    case 0x74:
+        if (REG8(0x00114D78UL) <= 0x01) return;
+
+        module_wait_pass();
+        if (REG8(0x00114D78UL) == 0xEE) {
+            module_restart();
+            screen_store1_clear();
+        }
+        if ((REG8(0x00114D4FUL) & 0x08) || REG8(0x00114D9CUL) != 0)
+            module_reset_wait();
+        else
+            module_buffers_clear();
+
+        if (module_link_quiet() && (REG8(0x00114D51UL) & 0x40)) {
+            REG8(0x0011F2A1UL) = 0x07;
+            REG8(0x00114D51UL) &= (u8)~0x40;
+            link_send_start();
+            while (!module_link_quiet()) rom_host_service();
+        }
+        REG8(0x00114D8EUL) = 0x01;
+        return;
+
+    case 0x70: case 0x71: case 0x72: case 0x78: case 0x7D:
+        if (REG8(0x00114D78UL) == 0xEE) return;
+        if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+        REG8(0x00114D78UL) = 0xFF;
+        module_unpark();
+        REG8(0x00114D8EUL) = 0x00;
+        module_wait_pass();
+        return;
+
+    case 0x73: case 0x79:
+        if (REG8(0x00114D78UL) == 0xEE) return;
+        if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+        {
+            const u8 s = REG8(0x00FFFEC6UL);
+
+            if (s == 0x00 || s == 0x05) {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                REG8(0x00114D66UL) = 0x00;
+            }
+        }
+        module_wait_pass();
+        REG8(0x00114D88UL) = 0x01;
+        REG8(0x0011F305UL) = 0x01;
+        return;
+
+    case 0x75:
+        if (REG8(0x00114D78UL) == 0xEE) return;
+        if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+        {
+            const u8 s = REG8(0x00FFFEC6UL);
+
+            if (s == 0x00 || s == 0x05) {
+                REG8(0x00FFFEC4UL) |= 0x20;
+                REG8(0x00114D66UL) = 0x00;
+            }
+        }
+        module_wait_pass();
+        return;
+
+    case 0x77:
+        if (REG8(0x00114D78UL) == 0xEE) return;
+        if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        REG8(0x00114D84UL) = 0x01;
+        return;
+
+    case 0x6D:
+        if (REG8(0x00114D78UL) == 0xEE) return;
+        if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+        if (module_home_request() != 0) return;
+        if (REG8(0x00114D72UL) != 0) return;
+        if (!module_link_quiet()) return;
+
+        REG8(0x001040BAUL) = REG8(0x00114D8EUL);
+
+        if (REG8(0x00114D8EUL) >= 0x08 && REG8(0x00114D8EUL) <= 0x09) {
+            embroidery_panel_save();
+            REG8(0x00114D8EUL) = 0x07;
+            REG8(0x00114D72UL) = 0x06;
+            screen_switch(0x37, 0x01, 0x00);
+            pattern_mark_ready();
+            return;
+        }
+
+        if (REG8(0x00114D8EUL) >= 0x04 && REG8(0x00114D8EUL) <= 0x05) {
+            if (REG8(0x00114DACUL) != 0) return;
+
+            REG8(0x00114D93UL) = 0x00;
+            module_home_request();
+            REG8(0x00114D98UL) = 0x00;
+            REG8(0x0011F30EUL) = 0x00;
+            REG8(0x00114D8EUL) = 0x00;
+
+            if (REG8(0x00FFFEC6UL) != 0) { REG8(0x00114D8AUL) = 0x04; return; }
+            if (!module_link_quiet()) return;
+
+            REG8(0x00114D72UL) = 0x3E;
+            screen_switch(0x37, 0x01, 0x00);
+            pattern_mark_ready();
+            return;
+        }
+
+        if (REG8(0x00114D8EUL) >= 0x01 && REG8(0x00114D8EUL) <= 0x03) {
+            if (module_identify() == 0) { link_claim(0x0B); return; }
+
+            REG8(0x0011A63CUL) = 0x00;
+            REG8(0x0011F4E6UL) = 0x00;
+            REG8(0x00114D96UL) = 0x00;
+            REG8(0x0011F534UL) = 0x00;
+            REG8(0x00114D98UL) = 0x00;
+            stitch_reset_current();
+            REG16(0x0011F292UL) = 0x0000;
+            REG8(0x00114D89UL) = 0x00;
+            REG16(0x0011F4DCUL) = 0x0000;
+            REG16(0x0011F4DEUL) = 0x0000;
+            REG8(0x00114D8EUL) = 0x00;
+            REG8(0x00114D72UL) = 0x3F;
+            screen_switch(0x37, 0x01, 0x00);
+            pattern_mark_ready();
+        }
+        return;
+
+    case 0x81:
+    default:
+        return;
+    }
+}
+
+/* ---- the screen bodies' helpers ---------------------------------------
+ * H'22382A's thirty-odd screen bodies are inline blocks behind a table of
+ * seventy-nine entries at H'2238B0, and they lean on a set of small drawing
+ * helpers. These are the ones with the most callers.
+ */
+
+/* H'21752E. The box the sewing screen keeps its picture in: cleared in
+ * frame B and then drawn from H'34C6CD into frame A. */
+void sew_picture_box(void)
+{
+    draw_rect(0x006B, 0x0051, 0x00CD, 0x0097, LCD_FRAME_B, 0x00, 0x01);
+    bitmap_draw(0x006B, 0x0051, 0x00CD, 0x0097,
+                (const u8 *)0x0034C6CDUL, LCD_FRAME_A);
+}
+
+/* H'213ABC. The little needle-stop picture, one of two by bit 5 of
+ * H'FFFEF6. The bit is rotated down to the bottom of the byte three times
+ * rather than shifted, which comes to the same thing here. */
+void needle_stop_picture(void)
+{
+    u8 k = (u8)(REG8(0x00FFFEF6UL) & 0x20);
+    u8 i;
+
+    for (i = 0; i < 3; i++) k = (u8)((u8)(k << 1) | (u8)(k >> 7));
+    k = (u8)(k & 0x07);
+
+    bitmap_draw(0x002C, 0x000B, 0x0030, 0x0019,
+                (const u8 *)REG32(0x00115892UL
+                                  + (u32)(long)(short)(u16)((u16)k << 2)),
+                LCD_FRAME_A);
+}
+
+/* H'21B34C. The number in H'FFFECD drawn top right, and only when it moves.
+ * H'11B35E remembers what was drawn; [fresh] forgets it. */
+void speed_number_draw(u8 fresh)
+{
+    char buf[6];
+
+    if (fresh != 0) REG16(0x0011B35EUL) = 0xFFFF;
+
+    if ((u16)REG8(0x00FFFECDUL) != REG16(0x0011B35EUL)) {
+        int_to_decimal((short)(u16)REG8(0x00FFFECDUL), buf);
+        text_draw(buf, 0x00F3, 0x0087, 0x0100, 0x008D, 0x0002, 0x02,
+                  (const u8 *)0x00119DE6UL);
+        REG16(0x0011B35EUL) = (u16)REG8(0x00FFFECDUL);
+    }
+}
+
+/* H'213882. The eleven boxes of the stitch-width strip, from a table of
+ * four words each at H'11524E, with the one H'FFFEEA names drawn from
+ * H'34BD2D over the top.
+ *
+ * [fresh] redraws the lot; otherwise only a move repaints, and then only
+ * the two boxes that changed. H'11B2D0 remembers which was lit. */
+void width_strip_draw(u8 fresh)
+{
+    const u32 tbl = 0x0011524EUL;
+    short i;
+
+    if (fresh != 0) {
+        REG16(0x0011B2D0UL) = 0xFFFF;
+
+        for (i = 0; i <= 0x000A; i++) {
+            const u32 e = tbl + (u32)(long)(short)(u16)((u16)i << 3);
+
+            draw_rect(REG16(e), REG16(e + 2), REG16(e + 4), REG16(e + 6),
+                      LCD_FRAME_B, 0x00, 0x01);
+        }
+        {
+            const u32 e = tbl + (u32)(long)(short)(u16)
+                          ((u16)((u16)REG8(0x00FFFEEAUL)) << 3);
+
+            bitmap_draw(REG16(e), REG16(e + 2), REG16(e + 4), REG16(e + 6),
+                        (const u8 *)0x0034BD2DUL, LCD_FRAME_B);
+        }
+        REG16(0x0011B2D0UL) = (u16)REG8(0x00FFFEEAUL);
+    }
+
+    if ((u16)REG8(0x00FFFEEAUL) != REG16(0x0011B2D0UL)) {
+        {
+            const u32 e = tbl + (u32)(long)(short)(u16)
+                          ((u16)REG16(0x0011B2D0UL) << 3);
+
+            draw_rect(REG16(e), REG16(e + 2), REG16(e + 4), REG16(e + 6),
+                      LCD_FRAME_B, 0x00, 0x01);
+        }
+        {
+            const u32 e = tbl + (u32)(long)(short)(u16)
+                          ((u16)((u16)REG8(0x00FFFEEAUL)) << 3);
+
+            bitmap_draw(REG16(e), REG16(e + 2), REG16(e + 4), REG16(e + 6),
+                        (const u8 *)0x0034BD2DUL, LCD_FRAME_B);
+        }
+        REG16(0x0011B2D0UL) = (u16)REG8(0x00FFFEEAUL);
+    }
+}
+
+/* H'21348C. The two arrows beside a list, lit or dim by where the window
+ * sits in it. H'11B0AA remembers the back arrow's state and H'11B0AB the
+ * forward one, so each is only repainted when it changes; [fresh] sets both
+ * flags and draws nothing, which leaves the next call to do the work.
+ *
+ * The end of the window is entry one's value plus [span], and the length of
+ * the list is the first word the list points at. */
+void list_arrows(u16 index, u16 span, u16 back_box, u16 fwd_box, u8 fresh)
+{
+    const u32 table = REG32(0x0011B0BAUL);
+    const u32 entry = table + (u32)(long)(short)(u16)(0x12 * index);
+    const short top = (short)REG16(REG32(entry + 0x0C));
+
+    if (fresh != 0) {
+        REG8(0x0011B0ABUL) = 0x01;
+        REG8(0x0011B0AAUL) = 0x01;
+        return;
+    }
+
+    {
+        const u16 v = REG16(REG32(0x0011B0BAUL)
+                            + (u32)(long)(short)(u16)(0x12 * index) + 0x08);
+
+        if (v == 0x0001) {
+            if (REG8(0x0011B0AAUL) != 0) {
+                REG8(0x0011B0AAUL) = 0x00;
+                hitbox_blit(back_box, LCD_FRAME_A, 0x0034E4A8UL);
+            }
+        } else if ((short)v > (short)0x0001) {
+            if (REG8(0x0011B0AAUL) == 0) {
+                REG8(0x0011B0AAUL) = 0x01;
+                hitbox_blit(back_box, LCD_FRAME_A, 0x0034E46CUL);
+            }
+        }
+    }
+
+    {
+        const short end = (short)(REG16(REG32(0x0011B0BAUL) + 0x1A) + span);
+
+        if (end > top) {
+            if (REG8(0x0011B0ABUL) != 0) {
+                REG8(0x0011B0ABUL) = 0x00;
+                hitbox_blit(fwd_box, LCD_FRAME_A, 0x0034E520UL);
+            }
+        } else {
+            if (REG8(0x0011B0ABUL) == 0) {
+                REG8(0x0011B0ABUL) = 0x01;
+                hitbox_blit(fwd_box, LCD_FRAME_A, 0x0034E4E4UL);
+            }
+        }
+    }
+}
+
+/* H'2224E8. The pattern strip put back from the second store and its number
+ * redrawn, and H'11A176 asked for a repaint. */
+void picker_strip_restore(void)
+{
+    region_copy(0x0030, 0x00A0, 0x00E7, 0x00C0, 0x00A0,
+                0x000F1610UL, LCD_FRAME_A);
+    dialog_number_draw(REG16(0x0011A1CEUL));
+    REG8(0x0011A176UL) = 0x01;
+}
+
+/* H'21BDD6. The demonstration screen: five pictures shown one after another,
+ * a second each. H'11B362 counts round them, and which set of five depends
+ * on whether H'57FF80 says this is a H'B4 machine -- with picture nought
+ * coming out of the configuration block rather than the table.
+ *
+ * [fresh] just puts the counter back to nought. A press of H'77 leaves for
+ * screen H'17 with the foot switch position cleared. */
+void demo_screen_step(u8 fresh)
+{
+    u16 code = 0;
+
+    if (fresh != 0) { REG16(0x0011B362UL) = 0x0000; return; }
+
+    if (screen_leave_check(&code, 0x00) == 0x03) {
+        if (code == 0x0077) {
+            REG8(0x00FFFEC5UL) = 0x00;
+            screen_switch(0x17, 0x01, 0x00);
+        }
+        return;
+    }
+
+    if (REG8(0x0057FF80UL) == 0xB4) {
+        if (REG16(0x0011B362UL) == 0)
+            image_load(REG32(REG32(0x0011B2AEUL) + 0x10), LCD_SCRATCH);
+        else
+            image_load(REG32(0x001158BAUL
+                             + (u32)(long)(short)(u16)
+                               (REG16(0x0011B362UL) << 2)), LCD_SCRATCH);
+    } else {
+        if (REG16(0x0011B362UL) == 0)
+            image_load(REG32(REG32(0x0011B2AEUL) + 0x14), LCD_SCRATCH);
+        else
+            image_load(REG32(0x001158A6UL
+                             + (u32)(long)(short)(u16)
+                               (REG16(0x0011B362UL) << 2)), LCD_SCRATCH);
+    }
+
+    region_copy(0x0000, 0x0000, 0x013F, 0x00EF, 0x0000,
+                LCD_SCRATCH, LCD_FRAME_A);
+    hold_start(0x03E8);
+    REG16(0x0011B362UL) =
+        (u16)((short)(u16)(REG16(0x0011B362UL) + 1) % (short)5);
+}
+
+/* H'21EF02 and H'21C672. Two settings screens of the same shape: one flash
+ * byte, two boxes that are the yes and the no of it, H'19 to save and H'1A
+ * to leave without saving. The first owns H'57EFC6 and the second H'57EFC7,
+ * and the second also drives bit 6 of H'FFFEC1 from what it saved.
+ *
+ * The working copy lives in RAM -- H'11B3C0 and H'11B364 -- and is what the
+ * single-byte flash write is given the address of. */
+u8 setting_toggle_C6(u8 fresh)
+{
+    u16 value = 0, index = 0;
+
+    if (fresh != 0) {
+        screen_stack_push();
+        REG8(0x0011B3C0UL) = REG8(0x0057EFC6UL);
+        if (REG8(0x0011B3C0UL) != 0) hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        else                         hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+    }
+
+    if (touch_hit(0x0001, 0x0004, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0042) {
+        if (REG8(0x0011B3C0UL) == 0) {
+            hitbox_set_state(0x0002, 0x0002, 0x00, 0);
+            hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+            REG8(0x0011B3C0UL) = 0x01;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0043) {
+        if (REG8(0x0011B3C0UL) != 0) {
+            hitbox_set_state(0x0001, 0x0001, 0x00, 0);
+            hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+            REG8(0x0011B3C0UL) = 0x00;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        message_show_held(index);
+        REG8(0x00114DC7UL) |= 0x20;
+        rom_flash_write((const void *)0x0011B3C0UL, 0x0057EFC6UL, 1);
+        REG8(0x00114DC7UL) &= (u8)~0x20;
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+u8 setting_toggle_C7(u8 fresh)
+{
+    u16 value = 0, index = 0;
+
+    if (fresh != 0) {
+        screen_stack_push();
+        hitbox_set_state(0x0001, 0x0002, 0x00, 0);
+        if (REG8(0x0057EFC7UL) != 0) hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        else                         hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+        REG8(0x0011B364UL) = REG8(0x0057EFC7UL);
+    }
+
+    if (touch_hit(0x0001, 0x0004, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0042) {
+        if (REG8(0x0011B364UL) == 0) {
+            hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+            hitbox_set_state(0x0002, 0x0002, 0x00, 0);
+            REG8(0x0011B364UL) = 0x01;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0043) {
+        if (REG8(0x0011B364UL) != 0) {
+            hitbox_set_state(0x0001, 0x0001, 0x00, 0);
+            hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+            REG8(0x0011B364UL) = 0x00;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        message_show_held(index);
+        REG8(0x00114DC7UL) |= 0x20;
+        rom_flash_write((const void *)0x0011B364UL, 0x0057EFC7UL, 1);
+        REG8(0x00114DC7UL) &= (u8)~0x20;
+        if (REG8(0x0057EFC7UL) != 0) REG8(0x00FFFEC1UL) |= 0x40;
+        else                         REG8(0x00FFFEC1UL) &= (u8)~0x40;
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'222FD2. Where the page holding position H'11B212 starts. The first
+ * fifteen are all one page; after that the pages are five long, and the
+ * answer is the page's own start counted back from the walk. */
+u16 list_page_start(void)
+{
+    const short at = (short)(REG16(0x0011B212UL) + 1);
+    short e;
+
+    if (at <= 0x000F) return 0x0001;
+
+    for (e = 0x0010; ; e += 0x0005) {
+        if (e == at) return (u16)(e - 10);
+        if (e > at)  return (u16)(e - 15);
+    }
+}
+
+/* H'21B9CE. A screen with one way out of it: key H'77 for screen H'17, with
+ * the foot switch position cleared on the way. */
+u8 screen_only_77(void)
+{
+    u16 code = 0;
+
+    if (screen_leave_check(&code, 0x00) == 0x03) {
+        if (code == 0x0077) {
+            REG8(0x00FFFEC5UL) = 0x00;
+            screen_switch(0x17, 0x01, 0x00);
+        }
+    }
+    return 0x00;
+}
+
+/* H'21B6C6. The byte in H'FFFED8 drawn as a number, right-aligned in a box
+ * halfway down the screen. */
+void needle_number_draw(void)
+{
+    /* the ROM gives this two bytes of stack, which is one short of what
+     * three digits need; the field never holds three */
+    char buf[4];
+
+    int_to_decimal((short)(u16)REG8(0x00FFFED8UL), buf);
+    text_draw(buf, 0x0057, 0x00B5, 0x0064, 0x00BE, 0x0001, 0x00,
+              (const u8 *)0x001196EAUL);
+}
+
+/* H'21C466 and H'229F7E. Two more of the yes-and-no screens, but these do
+ * not save anything: box one and box two set a RAM byte and go straight back
+ * to the slot-four screen. The second sets H'11B0A9 as well, and sets it on
+ * both answers rather than only on the yes. */
+u8 choice_screen_17A(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        screen_stack_pop();
+        REG8(0x0011A17AUL) = 0x01;
+        screen_from_slot(0x04);
+        REG8(0x0011A179UL) = 0x01;
+    } else if (value == 0x0002) {
+        screen_stack_pop();
+        REG8(0x0011A17AUL) = 0x00;
+        screen_from_slot(0x04);
+        REG8(0x0011A179UL) = 0x01;
+    }
+    return 0x00;
+}
+
+u8 choice_screen_1E3(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        screen_stack_pop();
+        REG8(0x0011A1E3UL) = 0x01;
+        REG8(0x0011B0A9UL) = 0x01;
+        screen_from_slot(0x04);
+        REG8(0x0011A179UL) = 0x01;
+    } else if (value == 0x0002) {
+        screen_stack_pop();
+        REG8(0x0011A1E3UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+        screen_from_slot(0x04);
+        REG8(0x0011A179UL) = 0x01;
+    }
+    return 0x00;
+}
+
+/* H'23033A, H'2180C8 and H'21C3B8. Three menu screens of the same shape: a
+ * press is read, the message it carries is held, and what the box stands for
+ * says where to go. None of them does anything else.
+ */
+
+/* H'23033A. The two ways into the embroidery panel, one with the module's
+ * own set-up run and one without. */
+void menu_embroidery(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        REG8(0x00114D8EUL) = 0x07;
+        REG8(0x0011F304UL) = 0x01;
+        REG8(0x0011F532UL) = 0x07;
+        REG8(0x0011F533UL) = 0x07;
+        screen_switch(0x37, 0x01, 0x00);
+        screen_stack_pop();
+    } else if (value == 0x0002) {
+        REG8(0x00114D8EUL) = 0x07;
+        REG8(0x0011F304UL) = 0x01;
+        REG8(0x0011F532UL) = 0x00;
+        REG8(0x0011F533UL) = 0x00;
+        screen_switch(0x37, 0x01, 0x00);
+        screen_stack_pop();
+    }
+}
+
+/* H'2180C8. Three categories of pattern: whichever is pressed, the screen
+ * moves to H'03 and H'11B108 is set to the first item of that category in
+ * the list H'11B096 points at. */
+void menu_category(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0003, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+    screen_switch(0x03, 0x01, 0x00);
+
+    if (value == 0x0001)
+        REG16(0x0011B108UL) = first_item_of_category(0x12, REG32(0x0011B096UL));
+    else if (value == 0x0002)
+        REG16(0x0011B108UL) = first_item_of_category(0x13, REG32(0x0011B096UL));
+    else if (value == 0x0003)
+        REG16(0x0011B108UL) = first_item_of_category(0x14, REG32(0x0011B096UL));
+}
+
+/* H'21C3B8. Four ways out: three screens by number and H'1A to come back off
+ * the stack to H'27. */
+void menu_four_ways(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0004, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+
+    if (value == 0x0001)      screen_switch(0x4B, 0x01, 0x00);
+    else if (value == 0x0002) screen_switch(0x00, 0x01, 0x00);
+    else if (value == 0x0003) screen_switch(0x31, 0x01, 0x00);
+    else if (value == 0x001A) {
+        screen_stack_pop();
+        screen_switch(0x27, 0x01, 0x00);
+    }
+}
+
+/* H'218292, H'218188 and H'217DE0. Three more menu screens. The first two
+ * take the operator to a list of one category; the third is the same again
+ * with six categories and answers H'01 rather than H'00.
+ *
+ * H'218292 is the odd one: its second and third boxes are refused with
+ * message H'0A while H'11A178 says the machine is mid-something, and its
+ * first box goes to a different screen from the other two. */
+u8 menu_three_lists(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0003, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        screen_switch(0x02, 0x01, 0x00);
+        REG16(0x0011B108UL) = first_item_of_category(0x0F, 0x0011A88EUL);
+        return 0x00;
+    }
+    if (value == 0x0002) {
+        if (REG8(0x0011A178UL) != 0) { message_show(0x000A); return 0x00; }
+        screen_switch(0x33, 0x01, 0x00);
+        REG16(0x0011B108UL) = 0x0001;
+        return 0x00;
+    }
+    if (value == 0x0003) {
+        if (REG8(0x0011A178UL) != 0) { message_show(0x000A); return 0x00; }
+        screen_switch(0x35, 0x01, 0x00);
+        REG16(0x0011B108UL) = 0x0001;
+    }
+    return 0x00;
+}
+
+u8 menu_five_categories(void)
+{
+    u16 value = 0, index = 0;
+    u8 wanted;
+
+    if (touch_hit(0x0001, 0x0005, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+    screen_switch(0x03, 0x01, 0x00);
+
+    if      (value == 0x0001) wanted = 0x12;
+    else if (value == 0x0002) wanted = 0x13;
+    else if (value == 0x0003) wanted = 0x14;
+    else if (value == 0x0004) wanted = 0x15;
+    else if (value == 0x0005) wanted = 0x16;
+    else                      return 0x00;
+
+    REG16(0x0011B108UL) = first_item_of_category(wanted, REG32(0x0011B096UL));
+    return 0x00;
+}
+
+u8 menu_six_categories(void)
+{
+    u16 value = 0, index = 0;
+    u8 wanted;
+
+    if (touch_hit(0x0001, 0x0006, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+    screen_switch(0x02, 0x01, 0x00);
+
+    if      (value == 0x0001) wanted = 0x05;
+    else if (value == 0x0002) wanted = 0x07;
+    else if (value == 0x0003) wanted = 0x08;
+    else if (value == 0x0004) wanted = 0x0A;
+    else if (value == 0x0005) wanted = 0x0B;
+    else if (value == 0x0006) wanted = 0x0D;
+    else                      return 0x00;
+
+    REG16(0x0011B108UL) = first_item_of_category(wanted, 0x0011A88EUL);
+    return 0x01;
+}
+
+/* H'219CC8. Twelve boxes, of which two are ways out and the rest a choice.
+ *
+ * The chosen box is remembered in H'11A1AA so that the next press can put
+ * the old one back to state 0 before lighting the new one, and the choice
+ * itself is written to H'11B0FF as the value plus H'9C. Both exits put the
+ * message up before they look at the sewing flag, so a press while the
+ * machine is running is announced and then ignored.
+ *
+ * Box H'19 does nothing at all when nothing is chosen yet: the whole body,
+ * message included, sits inside the test on H'11A1AA. */
+u8 menu_twelve_choice(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x000C, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0019) {
+        if (REG16(0x0011A1AAUL) != 0xFFFF) {
+            message_show_held(index);
+            if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+            screen_switch(0x11, 0x02, 0x00);
+            REG16(0x0011A1AAUL) = 0xFFFF;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        message_show_held(index);
+        if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+        screen_stack_pop();
+        screen_switch(0x0F, 0x01, 0x00);
+        REG16(0x0011A1AAUL) = 0xFFFF;
+        return 0x00;
+    }
+
+    if (index != REG16(0x0011A1AAUL)) {
+        const u16 held = REG16(0x0011A1AAUL);
+
+        if (held != 0xFFFF) hitbox_set_state(held, held, 0x00, 0);
+        hitbox_set_state(index, index, 0x01, 0);
+        REG16(0x0011A1AAUL) = index;
+        REG8(0x0011B0FFUL) = (u8)((u8)value + 0x9C);
+    }
+    return 0x00;
+}
+
+/* H'21BBE6. The display test: three full-screen fills, one press apart.
+ *
+ * H'11B361 counts them. Arriving with the count at 0 paints the screen in
+ * colour 3 and puts the count at 1, and each press of the single box paints
+ * the next colour. After the third the count goes back to 0, the panel code
+ * at H'FFFEC5 is cleared and the screen leaves for H'17.
+ *
+ * The fills go straight into the visible buffer, not the back one -- there
+ * is nothing here for the flip to bring over. */
+u8 display_test(void)
+{
+    u16 value = 0, index = 0;
+
+    if (REG8(0x0011B361UL) == 0x00) {
+        draw_rect(0x0000, 0x0000, 0x013F, 0x00EF, LCD_FRAME_A, 0x03, 0x01);
+        REG8(0x0011B361UL) = 0x01;
+    }
+
+    if (touch_hit(0x0001, 0x0001, &value, &index) != 0x03) return 0x00;
+    if (value != 0x0001) return 0x00;
+
+    if (REG8(0x0011B361UL) == 0x01) {
+        draw_rect(0x0000, 0x0000, 0x013F, 0x00EF, LCD_FRAME_A, 0x00, 0x01);
+        REG8(0x0011B361UL) = 0x02;
+        hold_start(0x0064);
+        return 0x00;
+    }
+    if (REG8(0x0011B361UL) == 0x02) {
+        draw_rect(0x0000, 0x0000, 0x013F, 0x00EF, LCD_FRAME_A, 0x02, 0x01);
+        REG8(0x0011B361UL) = 0x03;
+        hold_start(0x0064);
+        return 0x00;
+    }
+    if (REG8(0x0011B361UL) == 0x03) {
+        REG8(0x0011B361UL) = 0x00;
+        hold_start(0x0064);
+        REG8(0xFFFEC5UL) = 0x00;
+        screen_switch(0x17, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'2227E6. The input trim, adjusted a step at a time.
+ *
+ * Boxes 1 and 2 are down and up; each lights itself if it is not lit
+ * already, moves the trim one step within H'00..H'FF and holds the screen
+ * for H'32 ticks, so that leaning on the box repeats. Box 3 accepts, which
+ * means one byte written back to the settings block in flash with the
+ * flash-busy bit up around it; box 4 cancels by reading the byte back out
+ * of flash. Both leave for screen H'27.
+ *
+ * The H'02 return from the hit test -- a release -- is what puts the two
+ * arrow boxes back to normal, and it is the only thing that does. */
+u8 trim_screen(void)
+{
+    u16 value = 0, index = 0;
+    const u8 hit = touch_hit(0x0001, 0x0004, &value, &index);
+
+    if (hit != 0x03) {
+        if (hit == 0x02) {
+            if (hitbox_kind(0x0001) == 0x01) {
+                hitbox_set_state(0x0001, 0x0001, 0x00, 0);
+            }
+            if (hitbox_kind(0x0002) == 0x01) {
+                hitbox_set_state(0x0002, 0x0002, 0x00, 0);
+            }
+        }
+        return 0x00;
+    }
+
+    if (value == 0x004E) {
+        const u8 trim = INPUT_TRIM;
+
+        if (hitbox_kind(0x0001) != 0x01) {
+            hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        }
+        if (trim != 0x00) INPUT_TRIM = (u8)(trim - 1);
+        hold_start(0x0032);
+        return 0x00;
+    }
+
+    if (value == 0x004F) {
+        const u8 trim = INPUT_TRIM;
+
+        if (hitbox_kind(0x0002) != 0x01) {
+            hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+        }
+        if (trim < 0xFF) INPUT_TRIM = (u8)(trim + 1);
+        hold_start(0x0032);
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        message_show_held(index);
+        FLASH_BUSY |= 0x20;
+        rom_flash_write((const void *)0xFFFEDFUL, 0x57FF92UL, 1);
+        FLASH_BUSY &= (u8)~0x20;
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        INPUT_TRIM = SETTING_TRIM;
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'21B7DA. The pedal test: the reading and two lamps, redrawn only when
+ * something has changed.
+ *
+ * H'FFFECE is the scaled pedal reading and H'11A1AC the copy of it that is
+ * already on the screen; bits 2 and 3 of H'FFFEC4 are the two switches and
+ * H'11A1AE and H'11A1B0 their copies, kept as the masked byte widened to a
+ * word rather than as a flag. A switch made is a black rectangle and a
+ * switch broken a white one, both drawn into the back buffer.
+ *
+ * All three copies go to H'FFFF on the way out, so that the screen draws
+ * itself in full the next time it is entered.
+ *
+ * The digits go into a six-byte local -- exactly enough for five and the
+ * terminator, which is what a word taken as a signed number needs. */
+u8 pedal_test_screen(void)
+{
+    char text[6];
+    u16 to = 0;
+    const u16 reading = REG16(0x00FFFECEUL);
+
+    if (REG16(0x0011A1ACUL) != reading) {
+        int_to_decimal((short)reading, text);
+        text_draw(text, 0x0082, 0x00CB, 0x00CD, 0x00D5, 0x0001, 0x02,
+                  (const u8 *)0x001196EAUL);
+        REG16(0x0011A1ACUL) = REG16(0x00FFFECEUL);
+    }
+
+    if ((u16)(REG8(0x00FFFEC4UL) & 0x04) != REG16(0x0011A1AEUL)) {
+        draw_rect(0x0083, 0x00A7, 0x0094, 0x00B0, LCD_FRAME_B,
+                  (u8)((REG8(0x00FFFEC4UL) & 0x04) ? 0x00 : 0x03), 0x01);
+        REG16(0x0011A1AEUL) = (u16)(REG8(0x00FFFEC4UL) & 0x04);
+    }
+
+    if ((u16)(REG8(0x00FFFEC4UL) & 0x08) != REG16(0x0011A1B0UL)) {
+        draw_rect(0x00C6, 0x00A7, 0x00CE, 0x00B0, LCD_FRAME_B,
+                  (u8)((REG8(0x00FFFEC4UL) & 0x08) ? 0x00 : 0x03), 0x01);
+        REG16(0x0011A1B0UL) = (u16)(REG8(0x00FFFEC4UL) & 0x08);
+    }
+
+    if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
+    if (to != 0x0077) return 0x00;
+
+    REG16(0x0011A1ACUL) = 0xFFFF;
+    REG16(0x0011A1AEUL) = 0xFFFF;
+    REG16(0x0011A1B0UL) = 0xFFFF;
+    REG8(0xFFFEC5UL) = 0x00;
+    screen_switch(0x17, 0x01, 0x00);
+    return 0x00;
+}
+
+/* H'21BA0E. Which machine this is: box 1 says H'AA and box 2 says H'B4, the
+ * two values the configuration byte at H'57FF80 takes.
+ *
+ * Pressing a box only moves the light and the pending value in H'11B360;
+ * nothing is written until the screen is left for H'77, and then only if
+ * the pending value differs from what is in flash. H'11A1B2 is the "come
+ * back and re-light" flag, set on the way out and acted on the next time
+ * the screen is entered -- which is what puts the light back on the box
+ * flash actually holds.
+ *
+ * The message number handed to H'211A9E on the way out is the second local,
+ * and on that path nothing has written it: it is the box index the hit test
+ * below leaves there, from whichever pass last went that way. That is in
+ * the original and is reproduced, so the local is deliberately left
+ * uninitialised here too. */
+u8 variant_screen(void)
+{
+    u16 value = 0;
+    u16 index;      /* read before it is written -- see above */
+
+    if (REG8(0x0011A1B2UL) != 0) {
+        hitbox_set_state(0x0001, 0x0001, 0x00, 0);
+        hitbox_set_state(0x0002, 0x0002, 0x00, 0);
+        REG8(0x0011B360UL) = CONFIG_BLOCK;
+        if (REG8(0x0011B360UL) == 0xAA) {
+            hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        } else {
+            hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+        }
+        REG8(0x0011A1B2UL) = 0x00;
+        return 0x00;
+    }
+
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+        if (REG8(0x0011B360UL) != CONFIG_BLOCK) {
+            sew_picture_box();
+            settings_save(0x00);
+            FLASH_BUSY |= 0x20;
+            rom_flash_write((const void *)0x0011B360UL, 0x0057FF80UL, 1);
+            FLASH_BUSY &= (u8)~0x20;
+        }
+        REG8(0x0011A1B2UL) = 0x01;
+        message_show_held(index);
+        REG8(0xFFFEC5UL) = 0x00;
+        screen_switch(0x17, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0001) {
+        hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        hitbox_set_state(0x0002, 0x0002, 0x00, 0);
+        REG8(0x0011B360UL) = 0xAA;
+        return 0x00;
+    }
+    if (value == 0x0002) {
+        hitbox_set_state(0x0002, 0x0002, 0x01, 0);
+        hitbox_set_state(0x0001, 0x0001, 0x00, 0);
+        REG8(0x0011B360UL) = 0xB4;
+    }
+    return 0x00;
+}
+
+/* H'22253E. Calibrating the touch panel: two crosses, and the straight line
+ * through them.
+ *
+ * Entering the screen with H'11A1BC set puts the calibration back to unity,
+ * so that the two readings taken here are raw panel counts rather than
+ * counts already run through the old line. Box H'50 takes the first cross
+ * and box H'51 the second, each once -- H'11B3CA and H'11B3CB say which
+ * have been taken -- and each beeps.
+ *
+ * With both in hand the line is worked out and written to flash. The
+ * crosses sit at H'28.8 and H'28.8 + H'F0 across, and H'28.8 and
+ * H'28.8 + H'A0 down, which is where the H'F0 and H'A0 come from; H'28.8
+ * is 40.5, the half pixel putting the cross on a pixel centre.
+ *
+ * Afterwards the screen goes to H'4A, or to H'17 if bit 7 of H'FFFEC4 is
+ * up -- the flag that says the panel was reached from the service menu. */
+u8 touch_cal_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (REG8(0x0011A1BCUL) != 0) {
+        TOUCH_CAL_X_SCALE  = f2u(1.0f);
+        TOUCH_CAL_Y_SCALE  = f2u(1.0f);
+        TOUCH_CAL_X_OFFSET = 0;
+        TOUCH_CAL_Y_OFFSET = 0;
+        REG8(0x0011A1BCUL) = 0x00;
+    }
+
+    if (REG8(0x0011B3CAUL) != 0 && REG8(0x0011B3CBUL) != 0) {
+        float scale;
+
+        scale = 240.0f / (float)(long)(short)(u16)
+                    (REG16(0x0011B3C6UL) - REG16(0x0011B3C2UL));
+        TOUCH_CAL_X_SCALE = f2u(scale);
+
+        scale = 160.0f / (float)(long)(short)(u16)
+                    (REG16(0x0011B3C8UL) - REG16(0x0011B3C4UL));
+        TOUCH_CAL_Y_SCALE = f2u(scale);
+
+        TOUCH_CAL_X_OFFSET = f2u(40.5f -
+            (float)(long)(short)REG16(0x0011B3C2UL) * u2f(TOUCH_CAL_X_SCALE));
+        TOUCH_CAL_Y_OFFSET = f2u(40.5f -
+            (float)(long)(short)REG16(0x0011B3C4UL) * u2f(TOUCH_CAL_Y_SCALE));
+
+        FLASH_BUSY |= 0x20;
+        rom_flash_write((const void *)0x0011A87EUL, 0x0057FFA0UL, 4);
+        rom_flash_write((const void *)0x0011A882UL, 0x0057FFA4UL, 4);
+        rom_flash_write((const void *)0x0011A886UL, 0x0057FFA8UL, 4);
+        rom_flash_write((const void *)0x0011A88AUL, 0x0057FFACUL, 4);
+        FLASH_BUSY &= (u8)~0x20;
+
+        REG8(0x0011B3CAUL) = 0x00;
+        REG8(0x0011B3CBUL) = 0x00;
+        REG8(0x0011A1BCUL) = 0x01;
+        screen_stack_pop();
+
+        if (!(REG8(0x00FFFEC4UL) & 0x80)) {
+            screen_switch(0x4A, 0x01, 0x00);
+        } else {
+            REG8(0xFFFEC5UL) = 0x00;
+            screen_switch(0x17, 0x01, 0x00);
+        }
+        return 0x00;
+    }
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0050) {
+        if (REG8(0x0011B3CAUL) == 0) {
+            REG16(0x0011B3C2UL) = REG16(0x0011B102UL);
+            REG16(0x0011B3C4UL) = REG16(0x0011B104UL);
+            beep(0x001E, 0x0064, 0x01);
+            REG8(0x0011B3CAUL) = 0x01;
+        }
+        return 0x00;
+    }
+    if (value == 0x0051) {
+        if (REG8(0x0011B3CBUL) == 0) {
+            REG16(0x0011B3C6UL) = REG16(0x0011B102UL);
+            REG16(0x0011B3C8UL) = REG16(0x0011B104UL);
+            beep(0x001E, 0x0064, 0x01);
+            REG8(0x0011B3CBUL) = 0x01;
+        }
+    }
+    return 0x00;
+}
+
+/* H'21CB2C. The top sewing speed, set in steps of ten.
+ *
+ * H'11B37A holds the value being edited and H'57FF94 the one in flash; the
+ * ceiling comes from H'57FF8A, and the floor is H'6E. Box H'15 takes ten
+ * off, H'16 puts ten on -- but only as far as ten below the ceiling, tested
+ * unsigned -- and H'7F goes straight to the ceiling. H'19 writes the value
+ * to flash and H'1A throws it away; both leave for screen H'27.
+ *
+ * The argument says this is the first pass over the screen, which is when
+ * the value is taken out of flash and the number first drawn. The number is
+ * redrawn by each of the three boxes that change it, from the same six-byte
+ * local the ROM writes it into. */
+#define SPEED_CEILING   REG16(0x57FF8AUL)
+
+static void max_speed_draw(u16 v)
+{
+    char text[6];
+
+    int_to_decimal((short)v, text);
+    text_draw(text, 0x00A6, 0x0056, 0x00E7, 0x0060, 0x0001, 0x02,
+              (const u8 *)0x001196EAUL);
+}
+
+u8 max_speed_screen(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG16(0x0011B37AUL) = SETTING_LIMIT;
+        max_speed_draw(REG16(0x0011B37AUL));
+    }
+
+    if (touch_hit(0x0001, 0x0005, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x0015) {
+        const u16 now = REG16(0x0011B37AUL);
+
+        if ((short)now >= 0x006E) {
+            REG16(0x0011B37AUL) = (u16)(now - 10);
+            max_speed_draw((u16)(now - 10));
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0016) {
+        const u16 now = REG16(0x0011B37AUL);
+
+        if ((u16)(SPEED_CEILING - 10) >= now) {
+            REG16(0x0011B37AUL) = (u16)(now + 10);
+            max_speed_draw((u16)(now + 10));
+        }
+        return 0x00;
+    }
+
+    if (value == 0x007F) {
+        REG16(0x0011B37AUL) = SPEED_CEILING;
+        max_speed_draw(REG16(0x0011B37AUL));
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        FLASH_BUSY |= 0x20;
+        rom_flash_write((const void *)0x0011B37AUL, 0x0057FF94UL, 2);
+        FLASH_BUSY &= (u8)~0x20;
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'2303EE. The two boxes on the module's own menu, and the eleven ways the
+ * second one can go.
+ *
+ * H'11F533 is what the module last said it was doing, and it decides where
+ * box 2 leads: H'07 is a pattern in hand, and then H'114D8F says whether it
+ * came back H'08, H'04 or something else; H'08 and H'09 are the two hoop
+ * screens; H'02 to H'04 are a pattern being sewn, which is the long branch;
+ * and everything else is a machine that has lost its place, so the buffers
+ * are cleared and the screen goes back to H'12.
+ *
+ * The long branch takes the waiting slot, puts two bytes into its second
+ * record, picks the screen by H'114D8E and then sends the module two
+ * messages -- H'07 only if bit 6 of H'114D51 is up, then H'01 -- waiting
+ * for the link to go quiet after each. Both waits are the whole of
+ * H'244D64's quiet test spelled out twice over, the same as everywhere
+ * else in this cluster.
+ */
+void link_send_start(void);
+void pattern_mark_ready(void);
+
+void module_menu_screen(void)
+{
+    u16 value = 0, index = 0;
+    u8  kind;
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return;
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        if (REG8(0x0011F533UL) == 0x07) {
+            REG8(0x00114D8EUL) = 0x07;
+            screen_switch(0x37, 0x01, 0x00);
+            REG8(0x00114D90UL) = 0x01;
+            REG8(0x00114D8FUL) = 0x00;
+            REG8(0x0011A177UL) = 0x01;
+        } else {
+            REG8(0x00114D8EUL) = 0x07;
+            REG8(0x00114D72UL) = 0x3E;
+            screen_switch(0x37, 0x01, 0x00);
+            pattern_mark_ready();
+        }
+        REG8(0x00114D8FUL) = 0x00;
+        REG8(0x0011F534UL) = 0x01;
+        screen_stack_pop();
+        return;
+    }
+
+    if (value != 0x0002) return;
+
+    kind = REG8(0x0011F533UL);
+    REG8(0x00114D8EUL) = kind;
+
+    if (kind == 0x07) {
+        const u8 back = REG8(0x00114D8FUL);
+
+        if (back == 0x08) {
+            REG8(0x00114D90UL) = 0x08;
+            screen_switch(0x37, 0x01, 0x00);
+        } else if (back == 0x04) {
+            REG8(0x00114D90UL) = 0x04;
+            screen_switch(0x37, 0x01, 0x00);
+        } else {
+            REG8(0x00114D8EUL) = 0x07;
+            screen_switch(0x37, 0x01, 0x00);
+            REG8(0x0011A177UL) = 0x01;
+        }
+        REG8(0x00114D8FUL) = 0x00;
+    } else if (kind == 0x08) {
+        screen_switch(0x15, 0x01, 0x00);
+        REG8(0x0011A177UL) = 0x01;
+        if (REG8(0x00114D8FUL) == 0x0F) REG8(0x00114D84UL) = 0x01;
+    } else if (kind == 0x09) {
+        screen_switch(0x16, 0x01, 0x00);
+        REG8(0x0011A177UL) = 0x01;
+        if (REG8(0x00114D8FUL) == 0x0F) REG8(0x00114D84UL) = 0x01;
+    } else if (kind >= 0x02 && kind <= 0x04) {
+        pattern_slot_begin();
+        REG8(PAT_B(0x03)) = REG8(0x00114DA1UL);
+        REG8(PAT_B(0x05)) = (u8)(REG8(0x00114D8CUL) / 0x1B);
+
+        if (REG8(0x00114D8EUL) == 0x03) screen_switch(0x14, 0x01, 0x00);
+        else                            screen_switch(0x13, 0x01, 0x00);
+
+        REG8(0x00114D7EUL) = 0x01;
+        if (REG8(0x00114D9BUL) == 0) REG8(0x00114DADUL) = 0x01;
+        REG8(0x00114D98UL) = 0x00;
+
+        if (module_link_quiet() && (REG8(0x00114D51UL) & 0x40)) {
+            REG8(0x0011F2A1UL) = 0x07;
+            REG8(0x00114D51UL) &= (u8)~0x40;
+            link_send_start();
+            while (!module_link_quiet()) loop_tick();
+        }
+        if (module_link_quiet()) {
+            REG8(0x0011F2A1UL) = 0x01;
+            link_send_start();
+            while (!module_link_quiet()) loop_tick();
+        }
+    } else {
+        module_buffers_clear();
+        REG8(0x00114D8EUL) = 0x01;
+        REG8(0x00114D9BUL) = 0x01;
+        screen_switch(0x12, 0x01, 0x00);
+    }
+
+    REG8(0x00114D8FUL) = 0x00;
+    REG8(0x00114D51UL) &= (u8)~0x40;
+    screen_stack_pop();
+}
+
+/* H'2144CA. The strip along the top of the sewing screen, redrawn only
+ * where something has moved.
+ *
+ * Six words remember what is on the screen already: H'11B2F2 the presser
+ * foot in H'FFFEEB, H'11B2F0 bit 2 of H'FFFEE2, H'11B2F8 and H'11B2FA bits
+ * 4 and 3 of H'FFFEFA, H'11B2F4 bit 7 of H'FFFEFA and H'11B2F6 bit 3 of
+ * H'FFFEF7. The argument puts all six to H'FFFF, which forces the whole
+ * strip to be drawn again.
+ *
+ * The foot number is drawn as digits below H'80 and as a record above it:
+ * H'11541E is a table of eight-byte entries, a string and a picture, and
+ * the picture is only drawn if it is there. Drawing a foot above H'80 also
+ * puts two of the other remembered words back to H'FFFF, so the marks
+ * beside it are drawn again over the ground the record just covered.
+ *
+ * The last two share one patch of screen: each clears it and draws its own
+ * mark, and each clears it on the way out only if the other is not there.
+ */
+#define STATUS_FOOT     ((u16)REG8(0x00FFFEEBUL))
+#define STATUS_E2_2     ((u16)(REG8(0x00FFFEE2UL) & 0x04))
+#define STATUS_FA_4     ((u16)(REG8(0x00FFFEFAUL) & 0x10))
+#define STATUS_FA_3     ((u16)(REG8(0x00FFFEFAUL) & 0x08))
+#define STATUS_FA_7     ((u16)(REG8(0x00FFFEFAUL) & 0x80))
+#define STATUS_F7_3     ((u16)(REG8(0x00FFFEF7UL) & 0x08))
+
+static u32 status_foot_record(u32 base)
+{
+    return REG32(base + (u32)(long)(short)(u16)
+                     ((u16)(STATUS_FOOT + 0xFF80) << 3));
+}
+
+static void status_mark_clear(void)
+{
+    draw_rect(0x0032, 0x001E, 0x0046, 0x0025, LCD_FRAME_A, 0x00, 0x01);
+}
+
+void status_bar_refresh(u8 redraw_all)
+{
+    char text[6];
+
+    if (redraw_all != 0) {
+        REG16(0x0011B2F2UL) = 0xFFFF;
+        REG16(0x0011B2F0UL) = 0xFFFF;
+        REG16(0x0011B2F4UL) = 0xFFFF;
+        REG16(0x0011B2F6UL) = 0xFFFF;
+        REG16(0x0011B2F8UL) = 0xFFFF;
+        REG16(0x0011B2FAUL) = 0xFFFF;
+    }
+
+    if (STATUS_FOOT != REG16(0x0011B2F2UL) ||
+        STATUS_E2_2 != REG16(0x0011B2F0UL) ||
+        STATUS_FA_4 != REG16(0x0011B2F8UL) ||
+        STATUS_FA_3 != REG16(0x0011B2FAUL)) {
+        draw_rect(0x0036, 0x0004, 0x0046, 0x001C, LCD_FRAME_A, 0x00, 0x01);
+    }
+
+    if (STATUS_FOOT != REG16(0x0011B2F2UL)) {
+        if (REG8(0x00FFFEEBUL) < 0x80) {
+            int_to_decimal((short)STATUS_FOOT, text);
+            text_draw(text, 0x0011, 0x000D, 0x001F, 0x0016, 0x0001, 0x01,
+                      (const u8 *)0x001196EAUL);
+            REG16(0x0011B2F0UL) = 0xFFFF;
+            REG16(0x0011B2F8UL) = 0xFFFF;
+        } else {
+            const u32 picture = status_foot_record(0x00115422UL);
+
+            text_draw((const char *)status_foot_record(0x0011541EUL),
+                      0x0011, 0x000D, 0x001F, 0x0016, 0x0001, 0x01,
+                      (const u8 *)0x001196EAUL);
+
+            if (picture != 0) {
+                bitmap_draw(0x0038, 0x0004, 0x0041, 0x001C,
+                            (const u8 *)picture, LCD_FRAME_A);
+            }
+        }
+        REG16(0x0011B2F2UL) = STATUS_FOOT;
+    }
+
+    if (STATUS_E2_2 != REG16(0x0011B2F0UL)) {
+        if (REG8(0x00FFFEE2UL) & 0x04) {
+            bitmap_draw(0x0036, 0x000B, 0x0046, 0x001B,
+                        (const u8 *)0x0034B898UL, LCD_FRAME_A);
+        }
+        REG16(0x0011B2F0UL) = STATUS_E2_2;
+    }
+
+    if (STATUS_FA_4 != REG16(0x0011B2F8UL)) {
+        if (REG8(0x00FFFEFAUL) & 0x10) {
+            bitmap_draw(0x0036, 0x0005, 0x0046, 0x001B,
+                        (const u8 *)0x0034B96FUL, LCD_FRAME_A);
+        }
+        REG16(0x0011B2F8UL) = STATUS_FA_4;
+    }
+
+    if (STATUS_FA_3 != REG16(0x0011B2FAUL)) {
+        if (REG8(0x00FFFEFAUL) & 0x08) {
+            bitmap_draw(0x0036, 0x0008, 0x0046, 0x0018,
+                        (const u8 *)0x0034B9BAUL, LCD_FRAME_A);
+        }
+        REG16(0x0011B2FAUL) = STATUS_FA_3;
+    }
+
+    if (STATUS_FA_7 != REG16(0x0011B2F4UL)) {
+        if (REG8(0x00FFFEFAUL) & 0x80) {
+            status_mark_clear();
+            bitmap_draw(0x0032, 0x001E, 0x0046, 0x0025,
+                        (const u8 *)0x0034B8CFUL, LCD_FRAME_A);
+        } else if (!(REG8(0x00FFFEF7UL) & 0x08)) {
+            status_mark_clear();
+        }
+        REG16(0x0011B2F4UL) = STATUS_FA_7;
+    }
+
+    if (STATUS_F7_3 != REG16(0x0011B2F6UL)) {
+        if (REG8(0x00FFFEF7UL) & 0x08) {
+            status_mark_clear();
+            bitmap_draw(0x0032, 0x0020, 0x0046, 0x0025,
+                        (const u8 *)0x0034B920UL, LCD_FRAME_A);
+        } else if (!(REG8(0x00FFFEFAUL) & 0x80)) {
+            status_mark_clear();
+        }
+        REG16(0x0011B2F6UL) = STATUS_F7_3;
+    }
+}
+
+/* H'21B726. The needle position, in steps of four.
+ *
+ * H'FFFED8 holds it and H'21B6C6 draws it. Box 1 takes four off but not
+ * below zero, box 2 puts four on but not above H'10, and neither redraws
+ * unless it moved. The screen is left for H'17 the moment the panel asks
+ * for H'77.
+ *
+ * The two locals share a slot: the screen number the leave check writes and
+ * the box value the hit test writes are the same two bytes, which is why
+ * the hit test's index goes in the *second* local here and the first in the
+ * screens that have no leave check. */
+u8 needle_pos_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+        REG8(0xFFFEC5UL) = 0x00;
+        screen_switch(0x17, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (touch_hit(0x0001, 0x0002, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x0001) {
+        const u8 now = REG8(0x00FFFED8UL);
+
+        if (now != 0) {
+            REG8(0x00FFFED8UL) = (u8)(now - 4);
+            needle_number_draw();
+        }
+        return 0x00;
+    }
+    if (value == 0x0002) {
+        const u8 now = REG8(0x00FFFED8UL);
+
+        if (now < 0x10) {
+            REG8(0x00FFFED8UL) = (u8)(now + 4);
+            needle_number_draw();
+        }
+    }
+    return 0x00;
+}
+
+/* H'222DF4. Three runs of screen numbers that want repainting when bit 0 of
+ * H'FFFEC4 is up: H'13 to H'16, H'23 to H'24, and H'37 to H'38. Everything
+ * else, and a clear bit, leaves H'11A177 alone.
+ *
+ * The screen number comes back off the stack rather than out of R6L, which
+ * is where it arrived -- the routine pushes the register and reads its own
+ * low byte again. */
+void screen_mark_repaint(u8 screen)
+{
+    if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+
+    if (screen < 0x13) return;
+    if (screen >= 0x17) {
+        if (screen < 0x23) return;
+        if (screen >= 0x25) {
+            if (screen < 0x37) return;
+            if (screen > 0x38) return;
+        }
+    }
+    REG8(0x0011A177UL) = 0x01;
+}
+
+/* H'21BD1E. The application's version, drawn once and then left alone.
+ *
+ * H'11A1B3 is the "not drawn yet" flag: it is cleared on the way in and set
+ * again on the way out, so coming back to the screen draws it afresh. The
+ * string is the identity block at H'200100 from its fourth byte -- past the
+ * "NMM" -- which is six characters and the terminator, and the local it goes
+ * into is eight bytes. */
+u8 version_screen(void)
+{
+    char text[8];
+    u16 to = 0;
+
+    if (REG8(0x0011A1B3UL) != 0) {
+        REG8(0x0011A1B3UL) = 0x00;
+        str_copy(text, (const char *)(APP_IDENTITY + 3));
+        text_draw(text, 0x0035, 0x0017, 0x005D, 0x001E, 0x0001, 0x01,
+                  (const u8 *)0x00119A66UL);
+    }
+
+    if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
+    if (to != 0x0077) return 0x00;
+
+    REG8(0x0011A1B3UL) = 0x01;
+    REG8(0xFFFEC5UL) = 0x00;
+    screen_switch(0x17, 0x01, 0x00);
+    return 0x00;
+}
+
+/* H'219978. Four boxes: three that go somewhere and one that goes back.
+ *
+ * Only box H'52 answers 1; the other three answer 0. Going back reads the
+ * screen to return to out of H'11B0A6, tells H'222DF4 about it, and puts
+ * H'11B114 into H'11B108 on the way. */
+u8 menu_four_screens(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0004, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x0052) { screen_switch(0x2D, 0x01, 0x00); return 0x01; }
+    if (value == 0x0053) { screen_switch(0x39, 0x01, 0x00); return 0x00; }
+    if (value == 0x0054) { screen_switch(0x0F, 0x01, 0x00); return 0x00; }
+
+    if (value == 0x001A) {
+        if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+        screen_stack_pop();
+        screen_mark_repaint(REG8(0x0011B0A6UL));
+        REG16(0x0011B108UL) = REG16(0x0011B114UL);
+        screen_switch(REG8(0x0011B0A6UL), 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+u32 module_reply_buffer(void);
+
+/* H'22298C. The version again, this time with the module's.
+ *
+ * The application's own comes from the identity block as in H'21BD1E; the
+ * module's is whatever H'23E45A points at, and it is only drawn if it is not
+ * the empty string at H'250ADF. One box, H'1A, goes back to screen H'4A. */
+u8 module_version_screen(u8 first_pass)
+{
+    char text[8];
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        const char *reply;
+
+        str_copy(text, (const char *)(APP_IDENTITY + 3));
+        text_draw(text, 0x007B, 0x004C, 0x00E8, 0x005E, 0x0001, 0x01,
+                  (const u8 *)0x0011936EUL);
+
+        reply = (const char *)module_reply_buffer();
+        if (str_compare(reply, (const char *)0x00250ADFUL) != 0) {
+            text_draw(reply, 0x007B, 0x0099, 0x00E8, 0x00AB, 0x0001, 0x01,
+                      (const u8 *)0x0011936EUL);
+        }
+    }
+
+    if (touch_hit(0x0001, 0x0001, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x001A) {
+        message_show_held(index);
+        screen_stack_pop();
+        screen_switch(0x4A, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'21CF7C and H'21CF86. How deep the screen stack is, and what is at a
+ * given depth. Entry zero of the stack is the depth itself, which is why
+ * both read from the same address. */
+u16 screen_stack_depth(void)
+{
+    return (u16)REG8(0x0011A18BUL);
+}
+
+u8 screen_stack_at(u16 n)
+{
+    return REG8(0x0011A18BUL + (u32)(long)(short)n);
+}
+
+/* H'2220DC. The drawing areas cleared and the queue position taken away. */
+void drawing_reset(void)
+{
+    finish_22950C();
+    QUEUE_POS = 0xFFFF;
+}
+
+/* H'210544 and H'21056C. The help pictures: two tables of H'24-byte records,
+ * nine longwords each, one table per machine. H'219DE0 picks the second when
+ * the configuration byte says H'AA -- the machine with the module -- so the
+ * first is the one without.
+ *
+ * The record number is multiplied out as a longword and the field number
+ * added to the *low half* of it, so the index is a signed word however far
+ * the multiplication carried. */
+static u32 help_picture_at(u32 table, u16 entry, u16 part)
+{
+    return REG32(table + (u32)(long)(short)(u16)
+                     ((u16)(entry * 0x24) + (u16)(part << 2)));
+}
+
+u32 help_picture(u16 entry, u16 part)
+{
+    return help_picture_at(0x003CFA2CUL, entry, part);
+}
+
+u32 help_picture_module(u16 entry, u16 part)
+{
+    return help_picture_at(0x003D2024UL, entry, part);
+}
+
+/* H'21C150. The version string drawn where H'21BD1E draws it, and with the
+ * same font. Like H'20E126 it takes its argument back off the stack rather
+ * than out of the register it arrived in. */
+void version_text_draw(const char *s)
+{
+    text_draw(s, 0x0035, 0x0017, 0x005D, 0x001E, 0x0001, 0x01,
+              (const u8 *)0x00119A66UL);
+}
+
+/* H'218C1A. A cursor that blinks: one pass in ten flips it, and H'11B31C
+ * says which way it is. The line is H'1B tall and drawn in the visible
+ * buffer, so nothing has to be flipped over for it to show. */
+void cursor_blink(u16 x, u16 y)
+{
+    const u16 n = (u16)(REG16(0x0011B31AUL) + 1);
+
+    REG16(0x0011B31AUL) = n;
+    if (n != 0x000A) return;
+
+    draw_line(x, y, x, (u16)(y + 0x1A), LCD_FRAME_A,
+              (u8)(REG8(0x0011B31CUL) != 0 ? 0x00 : 0x03));
+
+    REG8(0x0011B31CUL) = (u8)(REG8(0x0011B31CUL) == 0 ? 0x01 : 0x00);
+    REG16(0x0011B31AUL) = 0x0000;
+}
+
+/* H'24A374. Whether the thing that owns the link is still waiting for what
+ * it asked for. Six owners have an answer; every other owner, an owner of
+ * zero, a state at H'114D86 that is not three, and a clear bit 0 of
+ * H'FFFEC4 all say no.
+ *
+ * H'114DB9 is re-read before each of the six tests rather than kept, which
+ * is in the original and makes no difference here. */
+u8 link_owner_waiting(void)
+{
+    if (!(REG8(0x00FFFEC4UL) & 0x01)) return 0x00;
+    if (REG8(0x00114DB9UL) == 0) return 0x00;
+    if (REG8(0x00114D86UL) != 0x03) return 0x00;
+
+    if (REG8(0x00114DB9UL) == 0x01 && (MACHINE_FLAGS & 0x08)) return 0x01;
+    if (REG8(0x00114DB9UL) == 0x02 && !(MACHINE_FLAGS & 0x08)) return 0x01;
+    if (REG8(0x00114DB9UL) == 0x11 && !(REG8(0x00114D51UL) & 0x01)) return 0x01;
+    if (REG8(0x00114DB9UL) == 0x18 && (REG8(0x00114D51UL) & 0x01)) return 0x01;
+    if (REG8(0x00114DB9UL) == 0x10 && !(MACHINE_FLAGS & 0x08)) return 0x01;
+    if (REG8(0x00114DB9UL) == 0x1A && !(REG8(0x00FFFEC7UL) & 0x01)) return 0x01;
+
+    return 0x00;
+}
+
+/* H'217CCE. One third of a box marked.
+ *
+ * The box is cleared in the back buffer and then a narrow rectangle drawn
+ * inside it in colour 2: the first third at +2, the second at +H'0E, the
+ * third at +H'1A, each six wide and running from two below the top to
+ * H'20 below it. Any other third does nothing at all, not even the clear.
+ *
+ * Like H'212E78 the whole H'12-byte entry is copied into a local first and
+ * the coordinates read out of the copy. */
+void hitbox_third_mark(u16 box, u8 which)
+{
+    const u32 e = HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * box);
+    u16 copy[9];
+    u16 x0, y0, x1, y1;
+    int n;
+
+    for (n = 0; n < 9; n++) copy[n] = REG16(e + (u32)(2 * n));
+
+    if      (which == 0x01) x0 = (u16)(copy[0] + 0x02);
+    else if (which == 0x02) x0 = (u16)(copy[0] + 0x0E);
+    else if (which == 0x03) x0 = (u16)(copy[0] + 0x1A);
+    else                    return;
+
+    y0 = (u16)(copy[1] + 0x02);
+    x1 = (u16)(x0 + 0x06);
+    y1 = (u16)(copy[1] + 0x20);
+
+    draw_rect(copy[0], copy[1], copy[2], copy[3], LCD_FRAME_B, 0x00, 0x01);
+    draw_rect(x0, y0, x1, y1, LCD_FRAME_B, 0x02, 0x01);
+}
+
+/* H'212FF0. A run of boxes moved along: the value at +8 and the list at
+ * +H'0C copied from one box to another, and the state carried over with
+ * H'211518 whenever it differs so that the picture follows.
+ *
+ * Which way the copy runs depends on which way the run moves, so that a
+ * source and destination that overlap do not eat themselves: moving down
+ * copies from the first box forward, moving up copies from the last box
+ * back. The two ends are the same distance apart either way, which is what
+ * [last] - [first] + [dest] works out. */
+void hitbox_run_shift(u16 first, u16 last, u16 dest)
+{
+    const u32 table = HITBOX_TABLE;
+    short from, to;
+
+    if ((short)first > (short)dest) {
+        for (from = (short)first, to = (short)dest;
+             from <= (short)last; from++, to++) {
+            const u32 d = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)to);
+            const u32 s = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)from);
+
+            REG16(d + 0x08) = REG16(s + 0x08);
+            REG32(d + 0x0C) = REG32(s + 0x0C);
+            if (REG8(d + 0x10) != REG8(s + 0x10)) {
+                hitbox_set_state((u16)to, (u16)to, REG8(s + 0x10), 0);
+            }
+        }
+        return;
+    }
+
+    if ((short)first < (short)dest) {
+        for (from = (short)last,
+             to = (short)(u16)((u16)((u16)last - (u16)first) + (u16)dest);
+             from >= (short)first; from--, to--) {
+            const u32 d = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)to);
+            const u32 s = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)from);
+
+            REG16(d + 0x08) = REG16(s + 0x08);
+            REG32(d + 0x0C) = REG32(s + 0x0C);
+            if (REG8(d + 0x10) != REG8(s + 0x10)) {
+                hitbox_set_state((u16)to, (u16)to, REG8(s + 0x10), 0);
+            }
+        }
+    }
+}
+
+/* H'21CFB0. The bar beside the balance setting, drawn from the middle of
+ * its track outwards.
+ *
+ * The track runs from H'38 to H'6A below the origin and the bar's far end
+ * is the value put through a straight line -- times minus three and an
+ * eighth, plus 106 and a half -- so a value of eight lands exactly on the
+ * middle at H'51 and larger values go up. The bar itself is colour 2 and
+ * whatever is left of the track is cleared, which takes two rectangles when
+ * the bar is short and one when it fills its half. */
+void balance_bar_draw(u16 value)
+{
+    const u16 x0  = (u16)(HITBOX_X0 + 0x89);
+    const u16 x1  = (u16)(HITBOX_X0 + 0x9B);
+    const u16 top = (u16)(HITBOX_Y0 + 0x38);
+    const u16 mid = (u16)(HITBOX_Y0 + 0x51);
+    const u16 bot = (u16)(HITBOX_Y0 + 0x6A);
+    const u16 end = (u16)(HITBOX_Y0 +
+        (u16)(int)((float)(long)(short)value * -3.125f + 106.5f));
+
+    draw_rect(x0, mid, x1, end, LCD_FRAME_A, 0x02, 0x01);
+
+    if ((short)end <= (short)mid) {
+        if ((short)end > (short)top) {
+            draw_rect(x0, top, x1, (u16)(end - 1), LCD_FRAME_A, 0x00, 0x01);
+        }
+        draw_rect(x0, (u16)(mid + 1), x1, bot, LCD_FRAME_A, 0x00, 0x01);
+    } else {
+        draw_rect(x0, top, x1, (u16)(mid - 1), LCD_FRAME_A, 0x00, 0x01);
+        if ((short)end < (short)bot) {
+            draw_rect(x0, (u16)(end + 1), x1, bot, LCD_FRAME_A, 0x00, 0x01);
+        }
+    }
+}
+
+/* H'218378. Two strokes of a preview drawn or rubbed out.
+ *
+ * There are two tables of H'10-byte entries in RAM, H'1152DE and H'11531E,
+ * four entries each: two line segments per entry, x0 y0 x1 y1 twice over.
+ * The second argument picks the table and the third picks the colour -- 3
+ * to draw, 0 to rub out -- and everything is offset by H'8C across and H'64
+ * down, into the back buffer.
+ *
+ * The original spells all four branches out in full, sixteen table reads
+ * apiece, each one recomputing the index. */
+void preview_stroke_draw(u16 index, u8 alt, u8 on)
+{
+    const u32 e = (alt != 0 ? 0x001152DEUL : 0x0011531EUL) +
+        (u32)(long)(short)(u16)((u16)(index << 4));
+    const u8 colour = (u8)(on != 0 ? 0x03 : 0x00);
+
+    draw_line((u16)(REG16(e + 0x00) + 0x8C), (u16)(REG16(e + 0x02) + 0x64),
+              (u16)(REG16(e + 0x04) + 0x8C), (u16)(REG16(e + 0x06) + 0x64),
+              LCD_FRAME_B, colour);
+    draw_line((u16)(REG16(e + 0x08) + 0x8C), (u16)(REG16(e + 0x0A) + 0x64),
+              (u16)(REG16(e + 0x0C) + 0x8C), (u16)(REG16(e + 0x0E) + 0x64),
+              LCD_FRAME_B, colour);
+}
+
+/* H'213274 and H'213356. A run of boxes scrolled through its list, on and
+ * back.
+ *
+ * Both move the run with H'212FF0 first and then patch up the [step] boxes
+ * left over at the far end: on, their slots go up by [step] and any that
+ * lands past the end of the list is greyed; back, their slots come down and
+ * any that was grey and is now inside the list is un-greyed. The un-greying
+ * writes the state byte straight rather than going through H'211518, but
+ * the greying does not, so that the picture is drawn.
+ *
+ * The list's length comes out of whatever list the *first* box points at,
+ * before anything has moved. Both answer with box one's slot. */
+u16 hitbox_list_scroll_on(u16 first, u16 last, u16 step)
+{
+    const u32 table = HITBOX_TABLE;
+    const u16 length = REG16(REG32(table +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * first) + 0x0C));
+    short i;
+
+    hitbox_run_shift((u16)(step + first), last, first);
+
+    for (i = (short)(u16)((u16)last - (u16)(step - 1));
+         i <= (short)last; i++) {
+        const u32 e = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+
+        if (REG8(e + 0x10) == 0x02) REG8(e + 0x10) = 0x00;
+        REG16(e + 0x08) = (u16)(REG16(e + 0x08) + step);
+        if ((short)REG16(e + 0x08) > (short)length) {
+            hitbox_set_state((u16)i, (u16)i, 0x02, 0);
+        }
+    }
+
+    hitbox_redraw_run(first, last);
+    return REG16(table + 0x1A);
+}
+
+u16 hitbox_list_scroll_back(u16 first, u16 last, u16 step)
+{
+    const u32 table = HITBOX_TABLE;
+    const u16 length = REG16(REG32(table +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * first) + 0x0C));
+    short i;
+
+    hitbox_run_shift(first, (u16)(last - step), (u16)(step + first));
+
+    for (i = (short)first; (short)(u16)(step + first) > i; i++) {
+        const u32 e = table + (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+
+        REG16(e + 0x08) = (u16)(REG16(e + 0x08) - step);
+        if (REG8(e + 0x10) == 0x02 &&
+            (short)REG16(e + 0x08) <= (short)length) {
+            REG8(e + 0x10) = 0x00;
+        }
+    }
+
+    hitbox_redraw_run(first, last);
+    return REG16(table + 0x1A);
+}
+
+/* ---- the module's state machines, and what they call --------------------
+ * H'235B0E is the module's own eighteen-state machine, H'2417D4 the nine
+ * states that fetch a pattern, and H'2431EE the twelve that start and stop
+ * the sewing. They call each other and call back into H'235B0E through
+ * H'244DE0, so the whole cluster is written together and declared here.
+ */
+void module_state_machine(void);
+void module_wait_pass(void);
+void module_link_lost(void);
+void module_screen_step(void);
+void module_fetch_step(u8 *step);
+void module_run_step(u8 *step);
+
+/* H'244D64. Whether the module is in a state that will take a message. The
+ * two states that will are H'04 and H'06, and in H'04 bit 3 of H'FFFEC1
+ * takes it away again. Refusals hand the link to an owner first. */
+u8 module_can_talk(void)
+{
+    u8 state;
+
+    if (REG8(0x00114DB9UL) != 0) return 0x00;
+
+    state = REG8(0x00FFFEC0UL);
+    if (state != 0x04 && state != 0x06) { link_claim(0x03); return 0x00; }
+    if (REG8(0x00FFFEC1UL) & 0x08) { link_claim(0x02); return 0x00; }
+    return 0x01;
+}
+
+/* H'231E28. A percentage with a "%" after it in the first left-hand label,
+ * the same shape as H'231DD2's minutes. */
+void label_percent_left(u8 value)
+{
+    int_to_decimal((short)(u16)value, (char *)0x0011F2D6UL);
+    REG8(0x0011F294UL) = 0x25;   /* '%' */
+    REG8(0x0011F295UL) = 0x00;
+    str_append((char *)0x0011F2D6UL, (const char *)0x0011F294UL);
+    text_left_94((const char *)0x0011F2D6UL);
+}
+
+/* H'23E510. Stopping the module: four messages sent one after another, with
+ * H'11A63E walking the steps and bit H'8000 of H'11A63A held up for the
+ * whole run. The caller's step counter moves on at the end.
+ *
+ * Step three is the odd one: when the link is busy on the H'21 mask it does
+ * not wait, it moves on regardless. */
+void module_stop_sequence(u8 *step)
+{
+    const u8 n = REG8(0x0011A63EUL);
+
+    if (n == 0x00) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+
+        REG16(0x0011A63AUL) |= 0x8000;
+        REG8(0x0011F2A1UL) = 0x03;
+        REG8(0x0011A61CUL) = 0x09;
+        link_send_start();
+        REG8(0x0011A63EUL) = (u8)(REG8(0x0011A63EUL) + 1);
+        return;
+    }
+
+    if (n == 0x01) {
+        if ((REG8(0x00114D50UL) & 0x21) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+
+        REG8(0x0011F2A1UL) = 0x01;
+        link_send_start();
+        REG8(0x0011A63EUL) = (u8)(REG8(0x0011A63EUL) + 1);
+        return;
+    }
+
+    if (n == 0x02) {
+        if ((REG8(0x00114D50UL) & 0x22) != 0) return;
+        if (REG8(0x0011F29EUL) != 0) return;
+        if (REG8(0x0011F2B6UL) != 0) return;
+
+        REG8(0x0011F2A1UL) = 0x02;
+        link_send_start();
+        REG8(0x0011A63EUL) = (u8)(REG8(0x0011A63EUL) + 1);
+        return;
+    }
+
+    if (n == 0x03) {
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0 &&
+            (REG8(0x00114D50UL) & 0x22) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+            REG8(0x0011F2A1UL) = 0x0F;
+            REG8(0x0011F2A2UL) = 0x01;
+            link_send_start();
+            REG8(0x0011A63EUL) = (u8)(REG8(0x0011A63EUL) + 1);
+            return;
+        }
+        /* every refusal here still moves on -- step three never waits */
+        REG8(0x0011A63EUL) = (u8)(n + 1);
+        return;
+    }
+
+    if (REG8(0x0011F29EUL) != 0) return;
+    if (REG8(0x0011F2B6UL) != 0) return;
+
+    *step = (u8)(*step + 1);
+    REG8(0x0011A63EUL) = 0x00;
+    REG16(0x0011A63AUL) = (u16)(REG16(0x0011A63AUL) & ~0x8000);
+}
+
+/* H'2317B2. Back to screen H'15 with the panel state set to eight. */
+void module_to_screen_15(void)
+{
+    REG8(0x00114D8EUL) = 0x08;
+    screen_switch(0x15, 0x01, 0x00);
+}
+
+/* H'23DE04. Message H'03/H'0B sent, waiting for the link both before and
+ * after -- a real wait, turning the host service over until it is quiet. The
+ * answer handed back is whatever H'11F2B6 held at the end, which is always
+ * nought, and the caller stores it anyway. */
+u8 module_send_0B(void)
+{
+    for (;;) {
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0 &&
+            (REG8(0x00114D50UL) & 0x22) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) break;
+        rom_host_service();
+    }
+
+    if (REG8(0x00114D8CUL) != 0) {
+        REG8(0x00114D8CUL) = 0x00;
+        REG8(0x00114D8BUL) = 0x00;
+    }
+
+    REG8(0x0011F2A1UL) = 0x03;
+    REG8(0x0011A61BUL) = 0x0B;
+    link_send_start();
+
+    for (;;) {
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) break;
+        rom_host_service();
+    }
+
+    return 0x00;
+}
+
+/* H'243A8C. The run control the two big machines share. What arrives says
+ * what to do: H'00 arms it, H'01 starts it, and anything else runs one pass
+ * of the sub-machine in H'11F52D.
+ *
+ * The passes fall into one another: H'00 falls into H'01 and H'01 falls into
+ * H'02, so one call can do three steps. H'11F52F says why it is stopping --
+ * H'01 the module finished, H'02 or H'03 something asked it to -- and that
+ * chooses which screen it goes back to. Everything past H'0B, and every
+ * number the table does not know, ends in the same reset.
+ */
+u8 module_run_control(u8 what)
+{
+    u8 n, v;
+
+    if (what == 0x00) {
+        if (REG8(0x0011F52FUL) >= 0x0A) return 0x00;
+
+        REG8(0x00114D4FUL) &= (u8)~0x20;
+        if (REG8(0x0011F52FUL) != 0) {
+            REG8(0x0011F52DUL) = 0x0A;
+            REG8(0x0011F52EUL) = 0x00;
+        } else {
+            REG8(0x0011F52CUL) = 0x00;
+            REG8(0x0011F52DUL) = 0x00;
+            REG8(0x0011F52FUL) = 0x00;
+            REG8(0x0011F52EUL) = 0x00;
+        }
+        return 0x01;
+    }
+
+    if (what == 0x01) {
+        if (REG8(0x0011F52CUL) != 0) return 0x00;
+
+        REG8(0x00114D4FUL) &= (u8)~0x20;
+        REG8(0x0011F52CUL) = 0x01;
+        REG8(0x0011F52DUL) = 0x00;
+        REG8(0x0011F52FUL) = 0x00;
+        REG8(0x0011F52EUL) = 0x00;
+        REG8(0x0011F530UL) = 0x01;
+        return 0x01;
+    }
+
+    n = REG8(0x0011F52DUL);
+
+    if (n == 0x00) {
+        if (REG8(0x0011F52CUL) == 0) return 0x01;
+
+        if (REG8(0x00114D4FUL) & 0x20) {
+            REG8(0x0011F531UL) = 0x01;
+            REG8(0x00114D73UL) = 0x01;
+            REG8(0x00114D4FUL) &= (u8)~0x20;
+            v = REG8(0x0011F530UL);
+            if (v < 0x63) { v = (u8)(v + 1); REG8(0x0011F530UL) = v; }
+            if (v < 0x64) label_percent_left(v);
+        }
+
+        if (!(REG8(0x00FFFEDBUL) & 0x04)) return 0x01;
+
+        label_percent_left(0x62);
+        REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+        n = 0x01;
+    }
+
+    if (n == 0x01) {
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+            REG8(0x00114D4FUL) &= (u8)~0x20;
+            REG8(0x0011F52CUL) = 0x00;
+            REG8(0x0011F52DUL) = 0x00;
+            REG8(0x0011F52FUL) = 0x00;
+            REG8(0x0011F52EUL) = 0x00;
+            return 0x01;
+        }
+        if (!(REG8(0x00114D4FUL) & 0x20)) return 0x01;
+
+        REG8(0x00114D4FUL) &= (u8)~0x20;
+        REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+        n = 0x02;
+    }
+
+    if (n == 0x02) {
+        if (REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+            REG8(0x0011F2A1UL) = 0x0E;
+            REG8(0x0011F2A2UL) |= 0x04;
+            link_send_start();
+            label_percent_left(0x64);
+            if (REG8(0x0011A63DUL) != 0) REG8(0x0011F52FUL) = 0x02;
+            if (REG8(0x00114D7DUL) != 0) REG8(0x0011F52FUL) = 0x03;
+            if (REG8(0x001040B4UL) != 0) REG8(0x0011F52FUL) = 0x01;
+            REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+        }
+        return 0x01;
+    }
+
+    if (n == 0x03) {
+        if ((REG8(0x00114D50UL) & 0x21) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0 &&
+            (REG8(0x00114D50UL) & 0x22) == 0 &&
+            REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0)
+            REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+        return 0x01;
+    }
+
+    if (n == 0x04) return 0x01;
+
+    if (n == 0x0A) {
+        if (REG8(0x001040B4UL) == 0 && REG8(0x0011A63DUL) == 0 &&
+            REG8(0x00114D7DUL) == 0 && REG8(0x00114D66UL) == 0)
+            REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+        return 0x01;
+    }
+
+    if (n == 0x0B) {
+        const u8 why = REG8(0x0011F52FUL);
+
+        if (why == 0x01) {
+            REG8(0x00114D8EUL) = 0x00;
+            REG8(0x001040B5UL) = module_send_0B();
+            REG8(0x00114D72UL) = 0x01;
+            module_to_screen_15();
+        } else if (why >= 0x02 && why <= 0x03) {
+            REG8(0x00114D93UL) = 0x00;
+            REG8(0x00114D98UL) = 0x00;
+            REG8(0x0011F30EUL) = 0x00;
+            REG8(0x00114D72UL) = 0x01;
+            module_to_screen_15();
+        } else {
+            REG8(0x0011F52CUL) = 0x00;
+        }
+
+        if (REG8(PAT_B(0x03)) == 0x03) REG8(0x00114D92UL) = 0xFF;
+        REG8(0x0011F52DUL) = (u8)(REG8(0x0011F52DUL) + 1);
+    }
+
+    REG8(0x00114D4FUL) &= (u8)~0x20;
+    REG8(0x0011F52CUL) = 0x00;
+    REG8(0x0011F52DUL) = 0x00;
+    REG8(0x0011F52FUL) = 0x00;
+    REG8(0x0011F52EUL) = 0x00;
+    return 0x01;
 }
 
 /* ---- the module key, and what it reaches -------------------------------
@@ -14474,3 +19259,3423 @@ void isr_sci0_txi(void) { isr_sci0_txi_body(); }
 
 void isr_sci0_rxi(void) __attribute__((interrupt_handler));
 void isr_sci0_rxi(void) { isr_sci0_rxi_body(); }
+
+/* H'21AC2E. One box, and it goes back to whatever the screen stack has on
+ * top -- the depth read first and used as the index, which is entry zero of
+ * the stack read again as a number. */
+u8 screen_back_one(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0001, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+    if (value != 0x0001) return 0x00;
+
+    if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+    screen_stack_pop();
+    screen_switch(screen_stack_at(screen_stack_depth()), 0x01, 0x00);
+    return 0x00;
+}
+
+/* H'216E6C. A message that goes away either when the operator presses its
+ * one box or when the thing that put it up stops waiting.
+ *
+ * Both ways do the same five things: the message held, slot four made
+ * current again, the two "a message can go up" bytes set, H'246D7E, and the
+ * stack popped. They differ only in what makes H'11A177 go up -- the timed
+ * way asks nothing else, the pressed way asks that the stack flag at
+ * H'11A17C is down as well -- and in the order of the pop.
+ *
+ * On the timed way the message number handed to H'211A9E is the first local
+ * and nothing has written it, the same read-before-write as H'21BA0E.
+ *
+ * A clear bit and a waiter that has stopped waiting both fall into the hit
+ * test, not just the clear bit: the two tests branch to the same place. */
+u8 message_wait_screen(void)
+{
+    u16 value = 0;
+    u16 index;      /* read before it is written on the first path */
+
+    if ((REG8(0x00FFFEC4UL) & 0x01) && link_owner_waiting()) {
+        message_show_held(index);
+        screen_from_slot(0x04);
+        REG8(0x0011A179UL) = 0x01;
+        REG8(0x0011B0A9UL) = 0x01;
+        message_state_set();
+        if (REG8(0x00FFFEC4UL) & 0x01) REG8(0x0011A177UL) = 0x01;
+        screen_stack_pop();
+        return 0x00;
+    }
+
+    if (touch_hit(0x0001, 0x0001, &value, &index) != 0x03) return 0x00;
+    if (value != 0x001A) return 0x00;
+
+    message_show_held(index);
+    screen_from_slot(0x04);
+    REG8(0x0011A179UL) = 0x01;
+    REG8(0x0011B0A9UL) = 0x01;
+    message_state_set();
+    screen_stack_pop();
+    if ((REG8(0x00FFFEC4UL) & 0x01) && REG8(0x0011A17CUL) == 0) {
+        REG8(0x0011A177UL) = 0x01;
+    }
+    return 0x00;
+}
+
+/* H'21D104. The presser-foot pressure, H'00 to H'10, shown on the balance
+ * bar. H'11B382 is the value being edited and H'11B380 the one to go back
+ * to; the byte in flash is at H'57FF8F.
+ *
+ * Box H'17 puts one on as far as H'10, H'18 takes one off as far as zero,
+ * H'7F goes to the middle at eight, H'19 accepts and H'1A cancels. Accepting
+ * leaves the screen *before* it writes the flash, and copies the value into
+ * a local first because the flash writer takes an address to copy from. */
+u8 foot_pressure_screen(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        const u16 v = (u16)REG8(0x0057FF8FUL);
+
+        screen_stack_push();
+        REG16(0x0011B382UL) = v;
+        REG16(0x0011B380UL) = v;
+        balance_bar_draw(v);
+    }
+
+    if (touch_hit(0x0001, 0x0005, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x0017) {
+        if ((short)REG16(0x0011B382UL) < 0x0010) {
+            REG16(0x0011B382UL) = (u16)(REG16(0x0011B382UL) + 1);
+            balance_bar_draw(REG16(0x0011B382UL));
+        }
+        return 0x00;
+    }
+    if (value == 0x0018) {
+        if ((short)REG16(0x0011B382UL) > 0) {
+            REG16(0x0011B382UL) = (u16)(REG16(0x0011B382UL) - 1);
+            balance_bar_draw(REG16(0x0011B382UL));
+        }
+        return 0x00;
+    }
+    if (value == 0x007F) {
+        REG16(0x0011B382UL) = 0x0008;
+        balance_bar_draw(REG16(0x0011B382UL));
+        return 0x00;
+    }
+    if (value == 0x0019) {
+        u8 out;
+
+        screen_stack_pop();
+        screen_switch(0x27, 0x01, 0x00);
+        FLASH_BUSY |= 0x20;
+        out = REG8(0x0011B383UL);
+        rom_flash_write(&out, 0x0057FF8FUL, 1);
+        FLASH_BUSY &= (u8)~0x20;
+        return 0x00;
+    }
+    if (value == 0x001A) {
+        screen_stack_pop();
+        REG16(0x0011B382UL) = REG16(0x0011B380UL);
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'218780. The two boxes at H'1C and H'1D, and the stroke that goes with
+ * them, put up or taken down.
+ *
+ * The first argument picks which of the two tables H'218378 draws from and,
+ * with it, which stitch category the current pattern has to be in for the
+ * stroke to mean anything: H'11 for the first table and H'10 for the
+ * second. The second argument is the press: down puts both boxes into state
+ * 0 and draws the stroke, or greys them if the category is wrong; up is
+ * only acted on when the boxes were greyed, and then it rubs the stroke out,
+ * clears H'FFFEFD and draws stroke zero in its place.
+ *
+ * The record index is widened without sign, unlike every other use of the
+ * stitch descriptor table. */
+void stitch_stroke_toggle(u8 variant, u8 pressed)
+{
+    const u8 want = (u8)(variant != 0 ? 0x11 : 0x10);
+    const u32 rec = ITEM_TABLE +
+        (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL));
+
+    if (pressed != 0) {
+        hitbox_set_state(0x001C, 0x001D, 0x00, 0);
+        if (REG8(rec + 0x17) == want) {
+            preview_stroke_draw((u16)REG8(0x00FFFEFDUL), variant, 0x01);
+        } else {
+            hitbox_set_state(0x001C, 0x001D, 0x05, 0);
+        }
+        return;
+    }
+
+    if (REG8(rec + 0x17) != want) return;
+    if (hitbox_kind(0x001C) != 0x05) return;
+
+    hitbox_set_state(0x001C, 0x001D, 0x00, 0);
+    preview_stroke_draw((u16)REG8(0x00FFFEFDUL), variant, 0x00);
+    REG8(0x00FFFEFDUL) = 0x00;
+    preview_stroke_draw(0x0000, variant, 0x01);
+}
+
+/* H'219A52. A list of twelve boxes with arrows either side, and a choice
+ * that is remembered in H'11B328.
+ *
+ * The two arrows scroll the list three at a time, and each is only live
+ * when its flag -- H'11B0AA up, H'11B0AB down -- says there is more list
+ * that way. Scrolling puts the lit box out and lights whichever box the
+ * choice has moved to afterwards, found by value rather than by index
+ * because the boxes have shifted underneath it.
+ *
+ * Box H'19 goes on to screen H'10 in slot two and H'1A comes back off the
+ * stack to H'0E; both forget the choice and both are refused while sewing.
+ * Anything else is a choice: the old lit box goes out, the pressed one comes
+ * on, and the value less H'25 goes into H'11B0FE. */
+u8 pattern_list_screen(void)
+{
+    u16 value = 0, index = 0;
+    u16 box;
+
+    if (touch_hit(0x0001, 0x0010, &value, &index) != 0x03) return 0x00;
+
+    if (value == 0x0017) {
+        if (REG8(0x0011B0AAUL) != 0) {
+            message_show_held(index);
+            box = hitbox_find(0x0001, 0x000C, REG16(0x0011B328UL), 0x01);
+            hitbox_set_state(box, box, 0x00, 0);
+            REG16(0x0011B108UL) =
+                hitbox_list_scroll_back(0x0001, 0x000C, 0x0003);
+            box = hitbox_find(0x0001, 0x000C, REG16(0x0011B328UL), 0x01);
+            hitbox_set_state(box, box, 0x01, 0);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0018) {
+        if (REG8(0x0011B0ABUL) != 0) {
+            message_show_held(index);
+            box = hitbox_find(0x0001, 0x000C, REG16(0x0011B328UL), 0x01);
+            hitbox_set_state(box, box, 0x00, 0);
+            REG16(0x0011B108UL) =
+                hitbox_list_scroll_on(0x0001, 0x000C, 0x0003);
+            box = hitbox_find(0x0001, 0x000C, REG16(0x0011B328UL), 0x01);
+            hitbox_set_state(box, box, 0x01, 0);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        if (REG16(0x0011B328UL) != 0) {
+            message_show_held(index);
+            if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+            screen_switch(0x10, 0x02, 0x00);
+            REG16(0x0011B328UL) = 0x0000;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        message_show_held(index);
+        if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+        screen_stack_pop();
+        screen_switch(0x0E, 0x01, 0x00);
+        REG16(0x0011B328UL) = 0x0000;
+        return 0x00;
+    }
+
+    if (value != REG16(0x0011B328UL)) {
+        if (REG16(0x0011B328UL) != 0) {
+            box = hitbox_find(0x0001, 0x000C, REG16(0x0011B328UL), 0x00);
+            hitbox_set_state(box, box, 0x00, 0);
+        }
+        hitbox_set_state(index, index, 0x01, 0);
+        REG16(0x0011B328UL) = value;
+        REG8(0x0011B0FEUL) = (u8)((u8)value + 0xDB);
+    }
+    return 0x00;
+}
+
+/* H'219DE0. The help page for whatever H'11B0FE and H'11B0FF name, drawn
+ * out of one of the two picture tables.
+ *
+ * Which table, and how long a record is, both follow the configuration
+ * byte: the machine with the module has nine parts to a record and the one
+ * without has ten, even though both tables are laid out the same way. The
+ * record number is the page times that stride plus the part, added as a
+ * byte with the carry taken into the top half.
+ *
+ * A record whose first part is there and whose second is not is one picture
+ * for the whole page: it goes into the scratch buffer and is copied across
+ * from there, which is what stops it appearing a strip at a time. Otherwise
+ * the nine parts go into the nine boxes -- the first eight through
+ * H'212D8A, and the ninth placed by its own width and height so that its
+ * bottom right corner lands at H'0112, H'00EA.
+ *
+ * The two halves are written out in full in the original, one per table. */
+static u32 help_page_part(u8 module, u16 rec, u16 part)
+{
+    return module ? help_picture_module(rec, part) : help_picture(rec, part);
+}
+
+void help_page_draw(void)
+{
+    const u8  module = (u8)(CONFIG_BLOCK == 0xAA);
+    const u16 rec = (u16)((u16)((module ? 9 : 10) * (u16)REG8(0x0011B0FEUL))
+                          + (u16)REG8(0x0011B0FFUL));
+    short i;
+
+    if (help_page_part(module, rec, 0) != 0 &&
+        help_page_part(module, rec, 1) == 0) {
+        const u32 p = help_page_part(module, rec, 0);
+
+        bitmap_draw(0x0004, 0x0027, 0x0114, 0x00EC,
+                    (const u8 *)p, LCD_SCRATCH);
+        region_copy(0x0004, 0x0027, 0x0114, 0x00EC, 0x0027,
+                    LCD_SCRATCH, LCD_FRAME_A);
+        return;
+    }
+
+    for (i = 0; i <= 0x0008; i++) {
+        const u32 p = help_page_part(module, rec, (u16)i);
+
+        if (p == 0) continue;
+
+        if (i < 0x0008) {
+            hitbox_blit((u16)(i + 1), LCD_FRAME_A, p);
+        } else {
+            const u16 y0 = (u16)(0x00EA - header_word_1((const u8 *)p));
+            const u16 x0 = (u16)(0x0112 - header_word_0((const u8 *)p));
+
+            bitmap_draw(x0, y0, 0x0112, 0x00EA, (const u8 *)p, LCD_FRAME_A);
+        }
+    }
+}
+
+/* H'21C846. The beep settings: eight of them, each a pair of bytes -- on or
+ * off, and which of three patterns -- copied out of flash into H'11B368 to
+ * be edited and written back on accept.
+ *
+ * Boxes 1 to 8 pick a setting: the pressed one lights, the last one goes
+ * out, H'11A1B6 is pointed at its pair, and boxes 9 and H'0A show the on/off
+ * state while box H'0B shows the pattern as one of three thirds. Boxes 9 and
+ * H'0A set it, H'0B steps the pattern round 1-2-3, H'19 writes the block to
+ * flash and H'1A throws it away.
+ *
+ * On the way in box 5 is greyed on the machine with the module -- that
+ * setting means nothing there -- and the whole run is put back to state 0
+ * first. Box H'0B does not check H'11A1B6 before following it, unlike boxes
+ * 9 and H'0A, which do. */
+u8 beep_settings_screen(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        hitbox_set_state(0x0001, 0x000D, 0x00, 0);
+        if (CONFIG_BLOCK == 0xAA) hitbox_set_state(0x0005, 0x0005, 0x02, 0);
+        REG16(0x0011B366UL) = 0x0000;
+        mem_copy((u8 *)0x0011B368UL, (const u8 *)0x0057EFC8UL, 0x0012);
+        return 0x00;
+    }
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return 0x00;
+
+    if ((short)index <= 0x0008 && REG16(0x0011B366UL) != index) {
+        const u16 was = REG16(0x0011B366UL);
+        u32 p;
+
+        hitbox_set_state(index, index, 0x01, 0);
+        hitbox_set_state(was, was, 0x00, 0);
+
+        p = 0x0011B368UL + (u32)(long)(short)(u16)((u16)(index << 1));
+        REG32(0x0011A1B6UL) = p;
+
+        if (REG8(p) != 0) {
+            hitbox_set_state(0x0009, 0x0009, 0x01, 0);
+            hitbox_set_state(0x000A, 0x000A, 0x00, 0);
+        } else {
+            hitbox_set_state(0x0009, 0x0009, 0x00, 0);
+            hitbox_set_state(0x000A, 0x000A, 0x01, 0);
+        }
+
+        hitbox_third_mark(0x000B, REG8(REG32(0x0011A1B6UL) + 1));
+        REG16(0x0011B366UL) = index;
+    }
+
+    if (value == 0x0009) {
+        const u32 p = REG32(0x0011A1B6UL);
+
+        if (p != 0) {
+            REG8(p) = 0x01;
+            hitbox_set_state(0x0009, 0x0009, 0x01, 0);
+            hitbox_set_state(0x000A, 0x000A, 0x00, 0);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x000A) {
+        const u32 p = REG32(0x0011A1B6UL);
+
+        if (p != 0) {
+            REG8(p) = 0x00;
+            hitbox_set_state(0x0009, 0x0009, 0x00, 0);
+            hitbox_set_state(0x000A, 0x000A, 0x01, 0);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x000B) {
+        REG8(REG32(0x0011A1B6UL) + 1) =
+            (u8)(REG8(REG32(0x0011A1B6UL) + 1) + 1);
+        if (REG8(REG32(0x0011A1B6UL) + 1) > 0x03) {
+            REG8(REG32(0x0011A1B6UL) + 1) = 0x01;
+        }
+        hitbox_third_mark(0x000B, REG8(REG32(0x0011A1B6UL) + 1));
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        message_show_held(index);
+        FLASH_BUSY |= 0x20;
+        rom_flash_write((const void *)0x0011B368UL, 0x0057EFC8UL, 0x12);
+        FLASH_BUSY &= (u8)~0x20;
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x27, 0x01, 0x00);
+    }
+    return 0x00;
+}
+
+/* H'221B6E. The pattern strip put back on the screen when one of seven
+ * screens is returned to.
+ *
+ * Four shapes between them, and all four end the same way: the cursor put
+ * out, the screen made current, its leave hook run with force, and the two
+ * "settling" bytes raised. Anything but those seven screens does nothing at
+ * all -- not even the tail.
+ *
+ * The strip itself is the same four rectangles every time, only the width of
+ * the top one moving; what changes is which run of boxes carries the list,
+ * which run is handed over with state 4, and where the two arrows are. The
+ * H'07 and H'34 shapes also slide a run of boxes along first, which is what
+ * makes room for the wider strip. */
+void pattern_strip_restore(u8 screen)
+{
+    if (screen == 0x07 || screen == 0x45) {
+        hitbox_set_state(0x001F, 0x0020, 0x00, 0);
+        hitbox_set_state(0x000B, 0x000F, 0x04, 0);
+        hitbox_run_shift(0x000B, 0x000F, 0x0021);
+        hitbox_set_state(0x0021, 0x0025, 0x03, 0);
+        draw_rect(0x0006, 0x009D, 0x00DD, 0x009E, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x0029, 0x009F, 0x002C, 0x00C1, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 0x00, 0x01);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0x02, 0x01);
+        hitbox_fill_from_list(0x001A, 0x0020, 0x0001, 0x00115A10UL);
+        hitbox_set_state(0x0012, 0x0015, 0x04, 0);
+        picker_arrows(0x001E, 0x001F, 0x01);
+    } else if (screen == 0x34 || screen == 0x36) {
+        hitbox_set_state(0x001A, 0x001B, 0x00, 0);
+        hitbox_set_state(0x0007, 0x0008, 0x04, 0);
+        hitbox_run_shift(0x0007, 0x0008, 0x0013);
+        hitbox_set_state(0x0013, 0x0014, 0x03, 0);
+        draw_rect(0x0006, 0x009D, 0x00E8, 0x009E, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x0029, 0x009F, 0x002C, 0x00C1, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 0x00, 0x01);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0x02, 0x01);
+        hitbox_fill_from_list(0x0015, 0x001B, 0x0001, 0x00115A10UL);
+        hitbox_set_state(0x000F, 0x0012, 0x04, 0);
+        picker_arrows(0x0019, 0x001A, 0x01);
+    } else if (screen == 0x04) {
+        hitbox_set_state(0x0024, 0x0025, 0x00, 0);
+        hitbox_set_state(0x0010, 0x0014, 0x04, 0);
+        draw_rect(0x0006, 0x009D, 0x00E8, 0x009E, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x0029, 0x009F, 0x002C, 0x00C1, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 0x00, 0x01);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0x02, 0x01);
+        hitbox_fill_from_list(0x001F, 0x0025, 0x0001, 0x00115A10UL);
+        hitbox_set_state(0x001B, 0x001E, 0x04, 0);
+        picker_arrows(0x0023, 0x0024, 0x01);
+    } else if (screen == 0x47) {
+        draw_rect(0x0004, 0x009D, 0x0114, 0x00C3, LCD_FRAME_A, 0x02, 0x01);
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 0x00, 0x01);
+        draw_rect(0x0004, 0x00C6, 0x013B, 0x00EC, LCD_FRAME_A, 0x02, 0x01);
+        hitbox_fill_from_list(0x000E, 0x0012, 0x0001, 0x00119362UL);
+    } else {
+        return;
+    }
+
+    picker_cursor(0x01);
+    REG8(0x0011A169UL) = screen;
+    screen_leave(screen, 0x01);
+    REG8(0x0011A174UL) = 0x01;
+    REG8(0x0011A17BUL) = 0x01;
+}
+
+/* H'2189A6 and H'218ADE. The two screens that step the stroke number in
+ * H'FFFEFD, one per stroke table: H'2189A6 draws from the first and wraps
+ * at three, H'218ADE from the second and wraps at H'0F.
+ *
+ * Entering either calls H'218780 twice, once as a press and once as a
+ * release, which is what puts the two boxes and the stroke up to start with;
+ * every later pass calls it once, as a release. Box H'6C steps up and H'6B
+ * steps down, and each rubs the old stroke out before drawing the new one.
+ * A press on a greyed box is dropped before the message, so a screen whose
+ * pattern is in the wrong category says nothing at all. */
+static u8 stroke_pick_screen(u8 first_pass, u8 variant, u8 top)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) stitch_stroke_toggle(variant, 0x01);
+    stitch_stroke_toggle(variant, 0x00);
+
+    if (touch_hit(0x001C, 0x001D, &value, &index) != 0x03) return 0x00;
+    if (hitbox_kind(index) == 0x05) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x006C) {
+        preview_stroke_draw((u16)REG8(0x00FFFEFDUL), variant, 0x00);
+        if (REG8(0x00FFFEFDUL) < top) {
+            const u8 v = (u8)(REG8(0x00FFFEFDUL) + 1);
+
+            REG8(0x00FFFEFDUL) = v;
+            preview_stroke_draw((u16)v, variant, 0x01);
+        } else {
+            REG8(0x00FFFEFDUL) = 0x00;
+            preview_stroke_draw(0x0000, variant, 0x01);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x006B) {
+        preview_stroke_draw((u16)REG8(0x00FFFEFDUL), variant, 0x00);
+        if (REG8(0x00FFFEFDUL) != 0) {
+            const u8 v = (u8)(REG8(0x00FFFEFDUL) - 1);
+
+            REG8(0x00FFFEFDUL) = v;
+            preview_stroke_draw((u16)v, variant, 0x01);
+        } else {
+            REG8(0x00FFFEFDUL) = top;
+            preview_stroke_draw((u16)top, variant, 0x01);
+        }
+    }
+    return 0x00;
+}
+
+u8 stroke_pick_screen_a(u8 first_pass)
+{
+    return stroke_pick_screen(first_pass, 0x01, 0x03);
+}
+
+u8 stroke_pick_screen_b(u8 first_pass)
+{
+    return stroke_pick_screen(first_pass, 0x00, 0x0F);
+}
+
+/* ---- the hoop offsets ---------------------------------------------------
+ * H'248FF0 and the nine handlers behind H'230D4E. The screen shows how far
+ * the hoop has been moved from where the module thinks it is, in millimetres
+ * each way, and lets it be nudged.
+ *
+ * H'104C7A and H'104C7B are the two offsets in half-millimetre steps, kept
+ * as signed bytes. H'248FF0 draws them: each is halved, its sign thrown
+ * away, turned into decimal and given "mm", and the two strings go into the
+ * two labels down the left edge.
+ *
+ * The original writes the two halves of that out twice over, once for a
+ * negative reading and once for a non-negative one, and the negative half
+ * runs the quotient through H'24ADC8 to take the sign off. Both are
+ * reproduced: for a non-negative reading the two agree anyway, so the
+ * duplication costs nothing but the instructions it is made of.
+ */
+static void hoop_offset_label(signed char raw, void (*draw)(const char *))
+{
+    char text[6];
+    char suffix[3];
+
+    suffix[0] = 0x6D;   /* "mm" */
+    suffix[1] = 0x6D;
+    suffix[2] = 0x00;
+
+    if (raw < 0) {
+        const short q = (short)((short)raw / 2);
+
+        int_to_decimal((short)(signed char)abs_short((short)(signed char)q),
+                       text);
+    } else {
+        const short q = (short)((short)raw / 2);
+
+        int_to_decimal((short)(signed char)q, text);
+    }
+
+    str_append(text, suffix);
+    draw(text);
+}
+
+void hoop_offsets_draw(void)
+{
+    hoop_offset_label((signed char)REG8(0x00104C7AUL), text_left_D9);
+    hoop_offset_label((signed char)REG8(0x00104C7BUL), text_left_BC);
+}
+
+/* H'248AC6 and the seven below it: one nudge of the hoop, one per direction.
+ *
+ * All eight are the same routine with two constants changed -- the direction
+ * code the module is sent in H'11A615, and which of the two offsets moves --
+ * and all eight refuse in the same three ways: the link never went quiet, or
+ * either offset is already further than H'64 from home. The limit is tested
+ * against the offset *before* the step, so a nudge that would take it past
+ * H'64 is allowed and the next one is not.
+ *
+ * The direction codes run clockwise from north: 1 N, 2 NE, 3 E, 4 SE, 5 S,
+ * 6 SW, 7 W, 8 NW. North is H'104C7B going down, so the second offset counts
+ * away from the operator.
+ */
+static void hoop_nudge(u8 code, signed char dx, signed char dy)
+{
+    if (link_wait_idle() == 0) return;
+    if (abs_short((short)(signed char)REG8(0x00104C7AUL)) > 0x0064) return;
+    if (abs_short((short)(signed char)REG8(0x00104C7BUL)) > 0x0064) return;
+
+    REG8(0x0011F2A1UL)  = 0x03;
+    REG8(0x0011A615UL)  = code;
+    REG8(0x0011F2A2UL) |= 0x08;
+    link_send_start();
+
+    if (dx != 0) REG8(0x00104C7AUL) = (u8)(REG8(0x00104C7AUL) + dx);
+    if (dy != 0) REG8(0x00104C7BUL) = (u8)(REG8(0x00104C7BUL) + dy);
+
+    hoop_offsets_draw();
+}
+
+/* H'248E5C. The hoop sent home: message H'0D, two seconds to let it get
+ * there, the slot's two stored positions zeroed and then message H'02. Each
+ * step waits for the link to go quiet first, and the last wait's answer is
+ * thrown away -- there is nothing left to do with it either way. */
+static void hoop_reset(void)
+{
+    REG8(0x00114D8EUL) = 0x00;
+    if (link_wait_idle() == 0) return;
+
+    REG8(0x0011F2A1UL) = 0x0D;
+    REG8(0x0011F2A2UL) = 0x01;
+    link_send_start();
+    link_delay(0x07D0);
+    if (link_wait_idle() == 0) return;
+
+    REG16(PAT_A(0x0C)) = 0x0000;
+    REG16(PAT_A(0x0E)) = 0x0000;
+    REG8(0x0011F2A1UL) = 0x02;
+    link_send_start();
+    (void)link_wait_idle();
+}
+
+/* H'230D4E. The nine boxes that move the hoop: eight directions and home.
+ *
+ * The eight nudges return 0 for the two that only move north and 1 for the
+ * rest, which is in the original and looks like nothing more than the order
+ * the handlers were written in. Home also leaves for screen H'1F. */
+u8 hoop_move_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0009, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    switch ((u16)(value - 1)) {
+    case 0x0000: hoop_nudge(0x08, -1, -1); return 0x00;
+    case 0x0001: hoop_nudge(0x01,  0, -1); return 0x00;
+    case 0x0002: hoop_nudge(0x02,  1, -1); return 0x01;
+    case 0x0003: hoop_nudge(0x07, -1,  0); return 0x01;
+    case 0x0004: hoop_nudge(0x03,  1,  0); return 0x01;
+    case 0x0005: hoop_nudge(0x06, -1,  1); return 0x01;
+    case 0x0006: hoop_nudge(0x05,  0,  1); return 0x01;
+    case 0x0007: hoop_nudge(0x04,  1,  1); return 0x01;
+    case 0x0008:
+        hoop_reset();
+        screen_switch(0x1F, 0x01, 0x00);
+        return 0x01;
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'217F04. Ten categories down one menu, and an eleventh box that only
+ * takes the screen change.
+ *
+ * The same shape as H'217DE0 further up, but with the ten handlers written
+ * out one per box behind a jump table rather than as a chain of compares.
+ * Each is the same four instructions with one constant changed, and the
+ * constants are the categories H'05 to H'0E in box order, so the arithmetic
+ * would collapse to "value plus four" -- it is left as the table it is,
+ * because that is what the original holds and a category out of place should
+ * be a difference rather than an off-by-one nobody notices.
+ *
+ * The message and the screen change both happen before the table is reached,
+ * so a value the table does not cover still leaves for screen H'02. */
+u8 menu_ten_categories(void)
+{
+    u16 value = 0, index = 0;
+    u8  wanted;
+
+    if (touch_hit(0x0001, 0x000A, &value, &index) != 0x03) return 0x00;
+
+    message_show_held(index);
+    screen_switch(0x02, 0x01, 0x00);
+
+    switch (value) {
+    case 0x0001: wanted = 0x05; break;
+    case 0x0002: wanted = 0x06; break;
+    case 0x0003: wanted = 0x07; break;
+    case 0x0004: wanted = 0x08; break;
+    case 0x0005: wanted = 0x09; break;
+    case 0x0006: wanted = 0x0A; break;
+    case 0x0007: wanted = 0x0B; break;
+    case 0x0008: wanted = 0x0C; break;
+    case 0x0009: wanted = 0x0D; break;
+    case 0x000A: wanted = 0x0E; break;
+    case 0x000B: return 0x01;   /* nothing to pick: the screen change is all */
+    default:     return 0x00;
+    }
+
+    REG16(0x0011B108UL) = first_item_of_category(wanted, 0x0011A88EUL);
+    return 0x01;
+}
+
+/* ---- the four "pick one of a list" screens ------------------------------
+ * H'21A320, H'21A56C, H'21A7F6 and H'21AA42. Four screens with the same
+ * skeleton and different handlers hanging off it: on the first pass the
+ * screen is pushed and the remembered box cleared, and every pass runs the
+ * hit test, lights the box that was pressed, puts the last one out, and then
+ * jumps into a table on the box value.
+ *
+ * The remembered box lives at H'11B32A, H'11B330, H'11B336 and H'11B33C --
+ * six bytes apart, one per screen, in the same order as the routines.
+ *
+ * They differ in more than their handlers: which values are left out of the
+ * lighting (two of them name H'04 and their last box, one takes everything
+ * below H'0B), and what the table is indexed by (three by value less one,
+ * H'21A320 by value less two). Each is written out with its own guard rather
+ * than folded into one parameterised routine, because those differences are
+ * exactly the sort a shared skeleton would hide.
+ */
+static void pick_box_light(u32 state, u16 value)
+{
+    const u16 was = REG16(state);
+
+    hitbox_set_state(was, was, 0x00, 0);
+    hitbox_set_state(value, value, 0x01, 0);
+    REG16(state) = value;
+}
+
+/* H'21AA42. Eight boxes: six pick one of six longwords out of the record at
+ * H'11B2AA, box 4 accepts what has been picked and box 8 goes back.
+ *
+ * The six offsets are H'60 to H'74 in steps of four, which is a run of six
+ * with box 4 sitting in the middle of it -- so the offset is not a plain
+ * multiple of the box number and the table is kept as a table. */
+#define PICK4_STATE  0x0011B33CUL
+#define PICK4_HELD   0x0011B33EUL
+
+static void pick_take(u32 held, u16 offset)
+{
+    REG32(held) = REG32(REG32(0x0011B2AAUL) + (u32)offset);
+}
+
+u8 pick_screen_4(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG16(PICK4_STATE) = 0x0000;
+    }
+
+    if (touch_hit(0x0001, 0x0008, &value, &index) != 0x03) return 0x00;
+
+    if (value != 0x0004 && value != 0x0008 && hitbox_kind(value) != 0x01) {
+        pick_box_light(PICK4_STATE, value);
+    }
+
+    if ((u16)(value - 1) > 0x0007) return 0x00;
+
+    switch (value) {
+    case 0x0001: pick_take(PICK4_HELD, 0x60); break;
+    case 0x0002: pick_take(PICK4_HELD, 0x64); break;
+    case 0x0003: pick_take(PICK4_HELD, 0x68); break;
+    case 0x0005: pick_take(PICK4_HELD, 0x6C); break;
+    case 0x0006: pick_take(PICK4_HELD, 0x70); break;
+    case 0x0007: pick_take(PICK4_HELD, 0x74); break;
+
+    case 0x0004:
+        if (REG16(PICK4_STATE) == 0) break;
+        message_show_held(index);
+        REG32(0x001161B8UL) = REG32(PICK4_HELD);
+        screen_remember(0x01);
+        screen_switch(0x3A, 0x01, 0x00);
+        break;
+
+    case 0x0008:
+        if (REG8(0x00114DC6UL) & 0x80) break;
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x39, 0x01, 0x00);
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'21A7F6. Eleven boxes: nine picks at H'38 to H'58, box 4 accepts and box
+ * H'0B goes back. The same shape as H'21AA42 with a wider window on the
+ * record. */
+#define PICK3_STATE  0x0011B336UL
+#define PICK3_HELD   0x0011B338UL
+
+u8 pick_screen_3(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG16(PICK3_STATE) = 0x0000;
+    }
+
+    if (touch_hit(0x0001, 0x000B, &value, &index) != 0x03) return 0x00;
+
+    if (value != 0x0004 && value != 0x000B && hitbox_kind(value) != 0x01) {
+        pick_box_light(PICK3_STATE, value);
+    }
+
+    if ((u16)(value - 1) > 0x000A) return 0x00;
+
+    switch (value) {
+    case 0x0001: pick_take(PICK3_HELD, 0x38); break;
+    case 0x0002: pick_take(PICK3_HELD, 0x3C); break;
+    case 0x0003: pick_take(PICK3_HELD, 0x40); break;
+    case 0x0005: pick_take(PICK3_HELD, 0x44); break;
+    case 0x0006: pick_take(PICK3_HELD, 0x48); break;
+    case 0x0007: pick_take(PICK3_HELD, 0x4C); break;
+    case 0x0008: pick_take(PICK3_HELD, 0x50); break;
+    case 0x0009: pick_take(PICK3_HELD, 0x54); break;
+    case 0x000A: pick_take(PICK3_HELD, 0x58); break;
+
+    case 0x0004:
+        if (REG16(PICK3_STATE) == 0) break;
+        message_show_held(index);
+        REG32(0x001161B8UL) = REG32(PICK3_HELD);
+        screen_remember(0x01);
+        screen_switch(0x3A, 0x01, 0x00);
+        break;
+
+    case 0x000B:
+        if (REG8(0x00114DC6UL) & 0x80) break;
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x39, 0x01, 0x00);
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'21A56C. Twelve boxes: ten picks at H'04 to H'24, then accept and back.
+ *
+ * This is the one whose lighting guard is a range rather than two names --
+ * everything below H'0B lights, so the last two boxes do not -- and the one
+ * whose tenth pick depends on the machine: H'2C with the module and H'28
+ * without. */
+#define PICK2_STATE  0x0011B330UL
+#define PICK2_HELD   0x0011B332UL
+
+u8 pick_screen_2(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG16(PICK2_STATE) = 0x0000;
+    }
+
+    if (touch_hit(0x0001, 0x000C, &value, &index) != 0x03) return 0x00;
+
+    if ((short)value < 0x000B && hitbox_kind(value) != 0x01) {
+        pick_box_light(PICK2_STATE, value);
+    }
+
+    if ((u16)(value - 1) > 0x000B) return 0x00;
+
+    switch (value) {
+    case 0x0001: pick_take(PICK2_HELD, 0x04); break;
+    case 0x0002: pick_take(PICK2_HELD, 0x08); break;
+    case 0x0003: pick_take(PICK2_HELD, 0x0C); break;
+    case 0x0004: pick_take(PICK2_HELD, 0x10); break;
+    case 0x0005: pick_take(PICK2_HELD, 0x14); break;
+    case 0x0006: pick_take(PICK2_HELD, 0x18); break;
+    case 0x0007: pick_take(PICK2_HELD, 0x1C); break;
+    case 0x0008: pick_take(PICK2_HELD, 0x20); break;
+    case 0x0009: pick_take(PICK2_HELD, 0x24); break;
+
+    case 0x000A:
+        if (CONFIG_BLOCK == 0xAA) pick_take(PICK2_HELD, 0x2C);
+        else                      pick_take(PICK2_HELD, 0x28);
+        break;
+
+    case 0x000B:
+        if (REG16(PICK2_STATE) == 0) break;
+        message_show_held(index);
+        REG32(0x001161B8UL) = REG32(PICK2_HELD);
+        screen_remember(0x01);
+        screen_switch(0x3A, 0x01, 0x00);
+        break;
+
+    case 0x000C:
+        if (REG8(0x00114DC6UL) & 0x80) break;
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x39, 0x01, 0x00);
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'21A320. Eleven boxes, and the odd one out of the four.
+ *
+ * Its table is indexed by the value less *two*, not less one, so box 1 is
+ * not in it at all; two of the ten entries point at the shared tail, so
+ * boxes 5 and 7 are in the table and do nothing. Its accept does not
+ * remember the screen, and where the other three all leave for H'39 this one
+ * leaves for H'0E.
+ *
+ * Accept is a four-way branch on which box is lit rather than a single
+ * screen change: boxes 1, 5 and 7 have screens of their own, nothing lit
+ * does nothing, and everything else takes the held longword across and goes
+ * to H'3A like the others. Boxes 5 and 7 being both "in the table doing
+ * nothing" and "named by accept" is what the two dead entries are for. */
+#define PICK1_STATE  0x0011B32AUL
+#define PICK1_HELD   0x0011B32CUL
+
+u8 pick_screen_1(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG16(PICK1_STATE) = 0x0000;
+    }
+
+    if (touch_hit(0x0001, 0x000B, &value, &index) != 0x03) return 0x00;
+
+    if (value != 0x0004 && value != 0x000B && hitbox_kind(value) != 0x01) {
+        pick_box_light(PICK1_STATE, value);
+    }
+
+    if ((u16)(value - 2) > 0x0009) return 0x00;
+
+    switch (value) {
+    case 0x0002: pick_take(PICK1_HELD, 0x30); break;
+    case 0x0003: pick_take(PICK1_HELD, 0x34); break;
+    case 0x0006: pick_take(PICK1_HELD, 0x5C); break;
+    case 0x0008: pick_take(PICK1_HELD, 0x78); break;
+    case 0x0009: pick_take(PICK1_HELD, 0x7C); break;
+    case 0x000A: pick_take(PICK1_HELD, 0x80); break;
+
+    case 0x0005:                /* in the table, and doing nothing */
+    case 0x0007:
+        break;
+
+    case 0x0004: {
+        const u16 held = REG16(PICK1_STATE);
+
+        message_show_held(index);
+        if      (held == 0x0001) screen_switch(0x3B, 0x01, 0x00);
+        else if (held == 0x0005) screen_switch(0x3C, 0x01, 0x00);
+        else if (held == 0x0007) screen_switch(0x3D, 0x01, 0x00);
+        else if (held != 0x0000) {
+            REG32(0x001161B8UL) = REG32(PICK1_HELD);
+            screen_switch(0x3A, 0x01, 0x00);
+        }
+        break;
+    }
+
+    case 0x000B:
+        if (REG8(0x00114DC6UL) & 0x80) break;
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(0x0E, 0x01, 0x00);
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'21B3DE. The main menu: fifteen boxes, most of them a screen change.
+ *
+ * Three things happen before the hit test. Two keys held together with a
+ * third input low clears the pattern queue out to flash and says so -- the
+ * only place in the application that offers it -- and leaving for screen
+ * H'77 clears the panel code. Both run on every pass.
+ *
+ * The panel code is set from the low byte of the box value before the table
+ * is reached, so it is set even for a value the table does not cover.
+ *
+ * Most handlers are the same three instructions -- put the message up, go to
+ * a screen -- but the two that lead to H'1F and H'22 pass 0 for "remember"
+ * where the rest pass 1, and boxes 3, 4, 9 and 15 put the message up and do
+ * nothing else. Box H'0C is the odd one: no message at all, and it toggles
+ * bit 7 of H'FFFEC1 with the box's own light.
+ *
+ * The H'02 return from the hit test -- a release -- is what puts box H'0C
+ * back down again. */
+static void main_menu_goto(u16 index, u8 screen, u8 remember)
+{
+    message_show_held(index);
+    screen_switch(screen, 0x01, remember);
+}
+
+u8 main_menu_screen(void)
+{
+    u16 value = 0, index = 0;
+    u8  hit;
+
+    if ((REG8(0x00FFFEDBUL) & 0x04) && (REG8(0x00FFFEDCUL) & 0x04) &&
+        (REG8(0x00FFFEDDUL) & 0x10)) {
+        sew_picture_box();
+        FLASH_BUSY |= 0x20;
+        queue_clear_to_flash();
+        FLASH_BUSY &= (u8)~0x20;
+        message_show(0x001D);
+        REG8(0x0011A17DUL) = 0x01;
+    }
+
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+        REG8(0x00FFFEC5UL) = 0x00;
+    }
+
+    hit = touch_hit(0x0001, 0x000F, &value, &index);
+
+    if (hit != 0x03) {
+        if (hit == 0x02 && hitbox_kind(0x000C) == 0x01) {
+            hitbox_set_state(0x000C, 0x000C, 0x00, 0);
+            MACHINE_FLAGS &= (u8)~0x80;
+        }
+        return 0x00;
+    }
+
+    REG8(0x00FFFEC5UL) = (u8)value;
+
+    if ((u16)(value - 1) > 0x000E) return 0x00;
+
+    switch (value) {
+    case 0x0001: main_menu_goto(index, 0x18, 0x01); break;
+    case 0x0002: main_menu_goto(index, 0x19, 0x01); break;
+    case 0x0005: main_menu_goto(index, 0x1D, 0x01); break;
+    case 0x0006: main_menu_goto(index, 0x00, 0x01); break;
+    case 0x0007: main_menu_goto(index, 0x1C, 0x01); break;
+    case 0x0008: main_menu_goto(index, 0x1A, 0x01); break;
+    case 0x000A: main_menu_goto(index, 0x1B, 0x01); break;
+    case 0x000B: main_menu_goto(index, 0x1E, 0x01); break;
+
+    /* these two do not remember the screen they are leaving */
+    case 0x000D: main_menu_goto(index, 0x1F, 0x00); break;
+    case 0x000E: main_menu_goto(index, 0x22, 0x00); break;
+
+    case 0x0003:
+    case 0x0004:
+    case 0x0009:
+    case 0x000F:
+        message_show_held(index);
+        break;
+
+    case 0x000C:
+        if (hitbox_kind(0x000C) != 0) break;
+        hitbox_set_state(0x000C, 0x000C, 0x01, 0);
+        /* bit 7 cleared and set again, which is what the original does */
+        MACHINE_FLAGS = (u8)((MACHINE_FLAGS & 0x7F) | 0x80);
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'216DE0. The three "are you sure" screens, put up the same way H'216D6C
+ * puts up a message: held off while one is already showing, while the splash
+ * is up, while a screen change is still settling, and while the machine is
+ * sewing.
+ *
+ * The first two remember the screen being left in slot 4 so they can go back
+ * to it; the third does not, and is the only one that cannot be answered. */
+void dialog_show(u16 which)
+{
+    if (REG8(0x0011A179UL) == 0) return;
+    if (REG8(0x0011A173UL) != 0) return;
+    if (REG8(0x0011B0A8UL) != 0) return;
+    if (REG8(0x00114DC6UL) & 0x80) return;
+
+    REG8(0x0011A179UL) = 0x00;
+
+    if (which == 0x0001) {
+        screen_remember(0x04);
+        screen_switch(0x48, 0x01, 0x00);
+    } else if (which == 0x0002) {
+        screen_remember(0x04);
+        screen_switch(0x49, 0x01, 0x00);
+    } else if (which == 0x0003) {
+        screen_switch(0x4D, 0x01, 0x00);
+    }
+}
+
+/* H'21C19C. The settings menu: thirteen boxes, ten of them a screen change.
+ *
+ * H'11A17A is the "something was changed" flag: finding it set on the way in
+ * writes the whole settings block out to flash, says so, and raises
+ * H'11A1B4 so that box H'0D knows to go back to the screen the change came
+ * from rather than to the remembered one.
+ *
+ * Box H'0C is the odd one -- it has no screen number of its own, so the one
+ * left in the register from the slot argument is used, which is screen 1.
+ * That is in the original and is reproduced; it looks like an omission
+ * rather than a choice, but it is what the machine does. */
+static void settings_menu_goto(u8 screen)
+{
+    screen_switch(screen, 0x01, 0x00);
+}
+
+u8 settings_menu_screen(u8 first_pass)
+{
+    u16 value = 0, index = 0;
+
+    if (first_pass != 0) {
+        screen_stack_push();
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011A17AUL) != 0) {
+        sew_picture_box();
+        settings_save(0x00);
+        REG8(0x0011A17AUL) = 0x00;
+        message_show(0x001D);
+        REG8(0x0011A17DUL) = 0x01;
+        REG8(0x0011A1B4UL) = 0x01;
+    }
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if ((u16)(value - 1) > 0x000C) return 0x00;
+
+    switch (value) {
+    case 0x0001:
+        settings_menu_goto(0x44);
+        REG8(0x0011A178UL) = 0x01;
+        REG8(0x0011A1B4UL) = 0x01;
+        break;
+
+    case 0x0002: settings_menu_goto(0x2E); break;
+    case 0x0003: settings_menu_goto(0x2B); break;
+    case 0x0004: settings_menu_goto(0x29); break;
+    case 0x0005: settings_menu_goto(0x2A); break;
+    case 0x0006: settings_menu_goto(0x2C); break;
+    case 0x0007: settings_menu_goto(0x2F); break;
+    case 0x0009: settings_menu_goto(0x28); break;
+    case 0x000A: settings_menu_goto(0x4A); break;
+    case 0x000C: settings_menu_goto(0x01); break;   /* see above */
+
+    case 0x0008: dialog_show(0x0001); break;
+
+    case 0x000B: break;             /* in the table, and doing nothing */
+
+    case 0x000D:
+        screen_stack_pop();
+        screen_mark_repaint(REG8(0x0011A16CUL));
+        if (REG8(0x0011A1B4UL) != 0) {
+            screen_switch(REG8(0x0011A16CUL), 0x01, 0x00);
+            REG16(0x0011B108UL) = REG16(0x0011B116UL);
+            REG16(0x0011B10AUL) = list_page_start();
+            REG8(0x0011A1B4UL) = 0x00;
+        } else {
+            screen_from_slot(0x03);
+        }
+        break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* H'214D24. The little picture at the top left of the screen, and the "F"
+ * beside it.
+ *
+ * A null picture means the box is cleared instead of blitted. The letter is
+ * a one-character string in the application's own image at H'250ADD, drawn
+ * right-aligned through the small font at H'119DE6 -- one of the few places
+ * anything reads a string constant out of the code region. */
+void module_letter_box(u32 picture)
+{
+    if (picture == 0) {
+        draw_rect(0x0048, 0x0002, 0x006A, 0x0024, LCD_FRAME_A, 0x00, 0x01);
+    } else {
+        bitmap_draw(0x0048, 0x0002, 0x006A, 0x0024,
+                    (const u8 *)picture, LCD_FRAME_A);
+    }
+
+    text_draw((const char *)0x00250ADDUL, 0x0049, 0x001E, 0x004C, 0x0023,
+              0x0001, 0x00, (const u8 *)0x00119DE6UL);
+}
+
+/* ---- the panel fields ---------------------------------------------------
+ * H'214990. Fourteen little readouts along the top of the screen, each one
+ * a few bits of a port latched into its own word at H'11B2FC upwards. A
+ * field is only redrawn when its bits have changed since last time, which is
+ * what the fourteen words are for.
+ *
+ * Ten of them keep the value and draw nothing -- the drawing is somebody
+ * else's job and the word is only there to be compared against. The other
+ * four put a picture in the box at the top left: three index a table of
+ * their own by the value, and the fourth picks between two fixed pictures by
+ * whether the bit is set at all.
+ *
+ * Called with [fresh] set, it puts all fourteen words to H'FFFF so that the
+ * next pass redraws everything, and draws the picture for [which] out of the
+ * icon table instead of doing any of the above.
+ */
+static void panel_field_plain(u16 v, u32 slot)
+{
+    if (REG16(slot) != v) REG16(slot) = v;
+}
+
+static void panel_field_pic(u16 v, u32 slot, u32 table)
+{
+    if (REG16(slot) == v) return;
+    module_letter_box(REG32(table + (u32)(long)(short)(u16)((u16)(v << 2))));
+    REG16(slot) = v;
+}
+
+void panel_field_update(u16 which, u8 fresh)
+{
+    if (fresh != 0) {
+        REG16(0x0011B2FCUL) = 0xFFFF;
+        REG16(0x0011B2FEUL) = 0xFFFF;
+        REG16(0x0011B300UL) = 0xFFFF;
+        REG16(0x0011B302UL) = 0xFFFF;
+        REG16(0x0011B304UL) = 0xFFFF;
+        REG16(0x0011B306UL) = 0xFFFF;
+        REG16(0x0011B308UL) = 0xFFFF;
+        REG16(0x0011B30AUL) = 0xFFFF;
+        REG16(0x0011B30CUL) = 0xFFFF;
+        REG16(0x0011B30EUL) = 0xFFFF;
+        REG16(0x0011B310UL) = 0xFFFF;
+        REG16(0x0011B312UL) = 0xFFFF;
+        REG16(0x0011B314UL) = 0xFFFF;
+        REG16(0x0011B316UL) = 0xFFFF;
+
+        if (which != 0) {
+            module_letter_box(REG32(0x001158CEUL +
+                (u32)(long)(short)(u16)((u16)(which << 2))));
+        } else {
+            module_letter_box(0);
+        }
+        return;
+    }
+
+    if (which == 0) return;
+
+    switch (which) {
+    case 0x0001:
+        panel_field_plain((u16)(REG8(0x00FFFEF5UL) & 0x40), 0x0011B304UL);
+        break;
+    case 0x0002:
+        panel_field_plain((u16)(REG8(0x00FFFEF6UL) & 0x10), 0x0011B306UL);
+        break;
+    case 0x0003:
+        panel_field_plain((u16)(REG8(0x00FFFEF5UL) & 0x10), 0x0011B308UL);
+        break;
+    case 0x0004:
+        panel_field_pic((u16)(REG8(0x00FFFEF9UL) & 0x0F),
+                        0x0011B302UL, 0x00115852UL);
+        break;
+    case 0x0005:
+        panel_field_plain((u16)(REG8(0x00FFFEF6UL) & 0x40), 0x0011B300UL);
+        break;
+    case 0x0006:
+        panel_field_plain((u16)(REG8(0x00FFFEF6UL) & 0x80), 0x0011B30AUL);
+        break;
+    case 0x0007:
+        panel_field_pic((u16)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F),
+                        0x0011B30CUL, 0x0011587AUL);
+        break;
+    case 0x0008:
+        panel_field_pic((u16)(REG8(0x00FFFEF6UL) & 0x0F),
+                        0x0011B2FEUL, 0x0011582EUL);
+        break;
+    case 0x0009:
+        panel_field_plain((u16)(REG8(0x00FFFEF5UL) & 0x08), 0x0011B30EUL);
+        break;
+    case 0x000A:
+        panel_field_plain((u16)(REG8(0x00FFFEF5UL) & 0x80), 0x0011B310UL);
+        break;
+    case 0x000C:
+        panel_field_pic((u16)(REG8(0x00FFFEF5UL) & 0x03),
+                        0x0011B2FCUL, 0x0011581EUL);
+        break;
+
+    case 0x0044: {
+        const u16 v = (u16)(REG8(0x00FFFEF5UL) & 0x04);
+
+        if (REG16(0x0011B312UL) != v) {
+            module_letter_box(v != 0 ? 0x0034E55CUL : 0x0034E5EDUL);
+            REG16(0x0011B312UL) = v;
+        }
+        break;
+    }
+
+    case 0x0046:
+        panel_field_pic((u16)REG8(0x00FFFEFDUL),
+                        0x0011B314UL, 0x0011589AUL);
+        break;
+    case 0x0047:
+        panel_field_plain((u16)(REG8(0x00FFFEF8UL) & 0x01), 0x0011B316UL);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ---- the panel switches -------------------------------------------------
+ * H'214DD4. Twenty fields of the machine's own state, reached by key, and
+ * three things that can be done to each: cleared, stepped on, or read.
+ *
+ * [clear] wins over [step], and with neither the current value comes back --
+ * so the same call reads the field or changes it depending on two flags. A
+ * key the table does not know answers H'FFFF, and so does key H'14: its
+ * table entry points straight at the "not found" tail, which is how a key
+ * that exists is made to look like one that does not.
+ *
+ * Six of the twenty are a single bit toggled in place. The rest each have
+ * their own arithmetic -- a count that wraps at nine, one that wraps at
+ * three, one that runs 2,3,4,5 and back to 0 with the configuration byte
+ * deciding where it wraps, and so on -- and those are written out one by
+ * one because that is what they are.
+ *
+ * [box] is the second argument: a message number to most of them and a box
+ * index to key H'47, which asks whether the box is greyed before it does
+ * anything.
+ */
+static u16 panel_bit(u32 port, u8 mask, u8 step, u8 clear)
+{
+    if (clear != 0) {
+        REG8(port) &= (u8)~mask;
+        return 0x0000;
+    }
+    if (step != 0) {
+        REG8(port) ^= mask;
+        hold_start(0x0064);
+        return 0x0000;
+    }
+    return (u16)(REG8(port) & mask);
+}
+
+u16 panel_switch(u8 key, u16 box, u8 step, u8 clear)
+{
+    switch (key) {
+    case 0x01:
+        if (step != 0) {
+            REG8(0x00FFFEF5UL) ^= 0x40;
+            hold_start(0x0064);
+        }
+        return 0x0000;
+
+    case 0x02: return panel_bit(0x00FFFEF6UL, 0x10, step, clear);
+    case 0x03: return panel_bit(0x00FFFEF5UL, 0x10, step, clear);
+    case 0x05: return panel_bit(0x00FFFEF6UL, 0x40, step, clear);
+    case 0x06: return panel_bit(0x00FFFEF6UL, 0x80, step, clear);
+    case 0x09: return panel_bit(0x00FFFEF5UL, 0x08, step, clear);
+    case 0x0A: return panel_bit(0x00FFFEF5UL, 0x80, step, clear);
+
+    case 0x04:
+        if (clear != 0) {
+            REG8(0x00FFFEF9UL) &= 0xF0;
+            return 0x0000;
+        }
+        if (step != 0) {
+            u16 v;
+
+            message_show_held(box);
+            v = (u16)(REG8(0x00FFFEF9UL) & 0x0F);
+            v = (u16)((v == 0x0009) ? 0x0000 : (u16)(v + 1));
+            REG8(0x00FFFEF9UL) =
+                (u8)((REG8(0x00FFFEF9UL) & 0xF0) | (u8)v);
+            return 0x0000;
+        }
+        return (u16)(REG8(0x00FFFEF9UL) & 0x0F);
+
+    case 0x07:
+        if (clear != 0) {
+            REG8(0x00FFFEF9UL) &= 0x0F;
+            return 0x0000;
+        }
+        if (step != 0) {
+            u16 v;
+
+            message_show_held(box);
+            v = (u16)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F);
+            if      (v == 0x0005) v = 0x0000;
+            else if (v == 0x0000) v = 0x0002;
+            else                  v = (u16)(v + 1);
+            REG8(0x00FFFEF9UL) =
+                (u8)((u8)((u8)v << 4) | (u8)(REG8(0x00FFFEF9UL) & 0x0F));
+            return 0x0000;
+        }
+        return (u16)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F);
+
+    case 0x08:
+        if (clear != 0) {
+            REG8(0x00FFFEF6UL) &= 0xF0;
+            return 0x0000;
+        }
+        if (step != 0) {
+            u16 v;
+
+            message_show_held(box);
+            v = (u16)(REG8(0x00FFFEF6UL) & 0x0F);
+            if      (v == 0x0008 && CONFIG_BLOCK == 0xB4) v = 0x0000;
+            else if (v == 0x0005 && CONFIG_BLOCK == 0xAA) v = 0x0000;
+            else if ((short)v >= 0x0002)                  v = (u16)(v + 1);
+            else                                          v = 0x0002;
+            REG8(0x00FFFEF6UL) =
+                (u8)((REG8(0x00FFFEF6UL) & 0xF0) | (u8)v);
+            return 0x0000;
+        }
+        if ((u8)(REG8(0x00FFFEF6UL) & 0x0F) < 0x02) return 0x0000;
+        return (u16)(REG8(0x00FFFEF6UL) & 0x0F);
+
+    case 0x0C:
+        if (clear != 0) {
+            REG8(0x00FFFEF5UL) &= 0xFC;
+            return 0x0000;
+        }
+        if (step != 0) {
+            u16 v;
+
+            message_show_held(box);
+            v = (u16)(REG8(0x00FFFEF5UL) & 0x03);
+            v = (u16)((v == 0x0003) ? 0x0000 : (u16)(v + 1));
+            REG8(0x00FFFEF5UL) =
+                (u8)((REG8(0x00FFFEF5UL) & 0xFC) | (u8)v);
+            return 0x0000;
+        }
+        return (u16)(REG8(0x00FFFEF5UL) & 0x03);
+
+    case 0x49:
+        if (clear != 0) {
+            REG8(0x00FFFEF6UL) &= 0xF0;
+            return 0x0000;
+        }
+        if (step != 0) {
+            if ((u8)(REG8(0x00FFFEF6UL) & 0x0F) == 0x01) {
+                REG8(0x00FFFEF6UL) &= 0xF0;
+            } else {
+                REG8(0x00FFFEF6UL) =
+                    (u8)((REG8(0x00FFFEF6UL) & 0xF0) | 0x01);
+            }
+            hold_start(0x0064);
+            return 0x0000;
+        }
+        return (u16)(((u8)(REG8(0x00FFFEF6UL) & 0x0F) == 0x01) ? 1 : 0);
+
+    case 0x47:
+        if (clear != 0) {
+            REG8(0x00FFFEF8UL) &= (u8)~0x01;
+            return 0x0000;
+        }
+        if (step != 0) {
+            if (hitbox_kind(box) == 0x05) return 0x0000;
+            if (REG8(0x00114DC6UL) & 0x80) return 0x0000;
+            REG8(0x00FFFEF8UL) ^= 0x01;
+            REG8(0x00FFFEFDUL) = (u8)(REG8(0x00FFFEF8UL) & 0x01);
+            hold_start(0x0064);
+            return 0x0000;
+        }
+        return (u16)(REG8(0x00FFFEF8UL) & 0x01);
+
+    case 0x44:
+        if (clear != 0) {
+            REG8(0x00FFFEF5UL) |= 0x04;      /* set, where the rest clear */
+            return 0x0000;
+        }
+        if (step != 0) {
+            REG8(0x00FFFEF5UL) ^= 0x04;
+            hold_start(0x0064);
+            return 0x0000;
+        }
+        return (u16)((REG8(0x00FFFEF5UL) & 0x04) ? 0 : 1);
+
+    case 0x46:
+        if (clear != 0) {
+            REG8(0x00FFFEFDUL) = 0x00;
+            return 0x0000;
+        }
+        if (step != 0) {
+            if (REG8(0x00FFFEFDUL) == 0x02) REG8(0x00FFFEFDUL) = 0x00;
+            else REG8(0x00FFFEFDUL) = (u8)(REG8(0x00FFFEFDUL) + 1);
+            return 0x0000;
+        }
+        return (u16)((REG8(0x00FFFEFDUL) == 0x01) ? 0 : 1);
+
+    case 0x6E:
+        if (step != 0) {
+            if (REG8(0x00FFFEEAUL) != 0) {
+                REG8(0x00FFFEEAUL) = (u8)(REG8(0x00FFFEEAUL) - 1);
+            }
+            return 0x0000;
+        }
+        return (u16)REG8(0x00FFFEEAUL);
+
+    case 0x6F:
+        if (step != 0) {
+            if (REG8(0x00FFFEEAUL) < 0x0A) {
+                REG8(0x00FFFEEAUL) = (u8)(REG8(0x00FFFEEAUL) + 1);
+            }
+            return 0x0000;
+        }
+        return (u16)REG8(0x00FFFEEAUL);
+
+    case 0x76:
+        if (step != 0) {
+            REG8(0x00FFFEF6UL) ^= 0x20;
+            if (REG8(0x0011A169UL) != 0x18) {
+                u8 k = (u8)(REG8(0x00FFFEF6UL) & 0x20);
+                u8 i;
+
+                for (i = 0; i < 3; i++) k = (u8)((u8)(k << 1) | (u8)(k >> 7));
+                k = (u8)(k & 0x07);
+
+                bitmap_draw(0x002C, 0x000B, 0x0030, 0x0019,
+                            (const u8 *)REG32(0x00115892UL +
+                                (u32)(long)(short)(u16)((u16)(k << 2))),
+                            LCD_FRAME_A);
+            }
+            hold_start(0x0064);
+            return 0x0000;
+        }
+        return (u16)(REG8(0x00FFFEF6UL) & 0x20);
+
+    case 0x7B:
+        if (step != 0 && !(REG8(0x00FFFEF8UL) & 0x80)) {
+            REG8(0x00FFFEF8UL) |= 0x80;
+        }
+        return 0x0000;
+
+    case 0x14:                  /* a key that exists and answers "no key" */
+    default:
+        break;
+    }
+    return 0xFFFF;
+}
+
+/* H'2136A6. Whether anything in a box's list is away from its default, and
+ * the little indicator box lit or put out to say so.
+ *
+ * The box at [box] carries a list at +H'0C -- a count and then that many
+ * words, the low byte of each a panel key. Every key is read through
+ * H'214DD4 and a positive answer means that field has been changed.
+ *
+ * Which box is the indicator depends on the screen: H'17 on five of them,
+ * H'16 on two more and H'0A on four, and on any other screen the routine
+ * does nothing at all.
+ *
+ * The walk happens only when H'11A17B says the screen has just been set up.
+ * It has two halves. The first runs round the list from one past the last
+ * box's value, wrapping at the count, and stops when it comes back to this
+ * box's own value -- so a value outside 1..count never stops it. The second
+ * walks the boxes from [box] to [last] and asks the same question of each,
+ * but only counts an answer when the box has been handed over (style 4).
+ *
+ * H'11A1A4 carries the answer between the walk and the drawing, which is
+ * why the drawing can run on a pass that did no walking. Bit 7 of H'FFFEE5
+ * decides whether "something changed" lights the box or leaves it alone. */
+void panel_any_set(u16 box, u16 last)
+{
+    const u32 entry = HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * box);
+    const u32 list  = REG32(entry + 0x0C);
+    const u16 count = REG16(list);
+    const u16 mine  = REG16(entry + 0x08);
+    const u16 from  = REG16(HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * last) + 0x08);
+    const u8  screen = REG8(0x0011A169UL);
+    u16 mark;
+    short i;
+
+    if (screen == 0x02 || screen == 0x07 || screen == 0x18 ||
+        screen == 0x30 || screen == 0x45) {
+        mark = 0x0017;
+    } else if (screen >= 0x03 && screen <= 0x04) {
+        mark = 0x0016;
+    } else if (screen >= 0x33 && screen <= 0x36) {
+        mark = 0x000A;
+    } else {
+        return;
+    }
+
+    if (REG8(0x0011A17BUL) != 0) {
+        REG8(0x0011A17BUL) = 0x00;
+
+        for (i = (short)(from + 1); ; i++) {
+            if (i > (short)count) i = 0x0001;
+            if ((u16)i == mine) break;
+            if ((short)panel_switch(REG8(list + (u32)(long)(short)
+                    (u16)((u16)i << 1) + 1), 0x0000, 0x00, 0x00) > 0) {
+                REG8(0x0011A1A4UL) = 0x01;
+                goto done;
+            }
+        }
+
+        for (i = (short)box; i <= (short)last; i++) {
+            const u16 v = REG16(HITBOX_TABLE +
+                (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i) + 0x08);
+
+            if ((short)panel_switch(REG8(list + (u32)(long)(short)
+                    (u16)((u16)(v << 1)) + 1), 0x0000, 0x00, 0x00) > 0) {
+                if (hitbox_style((u16)i) == 0x04) {
+                    REG8(0x0011A1A4UL) = 0x01;
+                    goto done;
+                }
+            }
+        }
+        REG8(0x0011A1A4UL) = 0x00;
+    }
+
+done:
+    if (REG8(0x0011A1A4UL) != 0 && (REG8(0x00FFFEE5UL) & 0x80)) {
+        if (hitbox_kind(mark) == 0x00) hitbox_set_state(mark, mark, 0x01, 0);
+    } else {
+        if (hitbox_kind(mark) == 0x01) hitbox_set_state(mark, mark, 0x00, 0);
+    }
+}
+
+/* H'200EA4. The first byte of one of the ten-byte records at H'57C6D6, the
+ * block settings_save copies out to flash. The index is worked out in
+ * sixteen bits and then zero-extended, so a record number past H'1999 wraps
+ * rather than running off the end. */
+u8 stitch_record_kind(u16 n)
+{
+    return REG8(0x0057C6D6UL + (u32)(u16)(10 * n));
+}
+
+/* ---- the panel strip ----------------------------------------------------
+ * H'213B16. The drawing counterpart of H'214DD4: one box of the strip along
+ * the top of the screen brought up to date from the field it stands for.
+ *
+ * Four shapes between the twenty handlers. Six are a lamp -- the box lit or
+ * put out by whether a bit is set. Five patch a picture into the icon table
+ * at the slot the box's own list entry names and then redraw the box, which
+ * is how a box with one entry shows one of several pictures. Five grey the
+ * box out or bring it back. The last two are one of each with an extra test.
+ *
+ * Each remembers what it last drew in its own word at H'11B2D2 upwards and
+ * does nothing when nothing has changed. Entering with [fresh] set puts all
+ * fifteen words to H'FFFF and does no drawing at all.
+ *
+ * H'11B0A8 and four screen numbers keep the fields underneath from being
+ * updated while a screen change is settling.
+ *
+ * The three flags the stitch descriptor sets -- taken from its word at +H'14
+ * -- decide which boxes are greyed: H'16 and H'17 raise one, H'3C to H'3E
+ * raise all three, and anything else lowers them.
+ */
+static void strip_light(u16 box, u32 slot, u16 v)
+{
+    if (REG16(slot) == v) return;
+    hitbox_set_state(box, box, (u8)(v != 0 ? 0x01 : 0x00), 0);
+    REG16(slot) = v;
+}
+
+/* The box's list entry names a slot in the icon table; the picture is put
+ * there and the box drawn again from it. */
+static void strip_patch(u16 box, u32 entry, u32 picture)
+{
+    const u32 at = REG32(entry + 0x0C) +
+        (u32)(long)(short)(u16)((u16)(REG16(entry + 0x08) << 1));
+
+    REG32(0x001158CEUL +
+          (u32)(long)(short)(u16)((u16)(REG16(at) << 2))) = picture;
+    hitbox_redraw_run(box, box);
+}
+
+static void strip_picture(u16 box, u32 entry, u32 slot, u16 v, u32 table)
+{
+    if (REG16(slot) == v) return;
+    strip_patch(box, entry,
+                REG32(table + (u32)(long)(short)(u16)((u16)(v << 2))));
+    REG16(slot) = v;
+}
+
+static void strip_grey(u16 box, u8 want)
+{
+    if (want != 0) {
+        if (hitbox_kind(box) != 0x05) hitbox_set_state(box, box, 0x05, 0);
+    } else {
+        if (hitbox_kind(box) == 0x05) hitbox_set_state(box, box, 0x00, 0);
+    }
+}
+
+void panel_strip_box(u8 key, u16 box, u8 fresh)
+{
+    const u32 entry = HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * box);
+    const u8  screen = REG8(0x0011A169UL);
+    u16 kind;
+    u8  a, b, c;
+
+    if (screen != 0x0C && screen != 0x0D && screen != 0x42 &&
+        screen != 0x18 && REG8(0x0011B0A8UL) == 0) {
+        panel_field_update(REG16(0x0057EFC4UL), fresh);
+    }
+
+    if (fresh != 0) {
+        REG16(0x0011B2D2UL) = 0xFFFF;
+        REG16(0x0011B2D4UL) = 0xFFFF;
+        REG16(0x0011B2EEUL) = 0xFFFF;
+        REG16(0x0011B2D6UL) = 0xFFFF;
+        REG16(0x0011B2D8UL) = 0xFFFF;
+        REG16(0x0011B2DAUL) = 0xFFFF;
+        REG16(0x0011B2DCUL) = 0xFFFF;
+        REG16(0x0011B2DEUL) = 0xFFFF;
+        REG16(0x0011B2E0UL) = 0xFFFF;
+        REG16(0x0011B2E2UL) = 0xFFFF;
+        REG16(0x0011B2E4UL) = 0xFFFF;
+        REG16(0x0011B2E6UL) = 0xFFFF;
+        REG16(0x0011B2E8UL) = 0xFFFF;
+        REG16(0x0011B2EAUL) = 0xFFFF;
+        REG16(0x0011B2ECUL) = 0xFFFF;
+        return;            /* the fresh path branches past the tail below */
+    }
+
+    kind = REG16(ITEM_TABLE +
+        (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x14);
+
+    if (kind == 0x0016) {
+        a = 0x01; b = 0x00; c = 0x00;
+    } else if (kind == 0x0017) {
+        c = 0x01; a = 0x01; b = 0x00;
+        REG8(0x00FFFEFDUL) = 0x00;
+    } else if ((short)kind >= 0x003C && (short)kind <= 0x003E) {
+        b = 0x01; c = 0x01; a = 0x01;
+        REG8(0x00FFFEFDUL) = 0x00;
+    } else {
+        b = 0x00; c = 0x00; a = 0x00;
+    }
+
+    switch (key) {
+    case 0x01: strip_light(box, 0x0011B2DAUL,
+                   (u16)(REG8(0x00FFFEF5UL) & 0x40)); break;
+    case 0x02: strip_light(box, 0x0011B2DCUL,
+                   (u16)(REG8(0x00FFFEF6UL) & 0x10)); break;
+    case 0x03: strip_light(box, 0x0011B2DEUL,
+                   (u16)(REG8(0x00FFFEF5UL) & 0x10)); break;
+    case 0x05: strip_light(box, 0x0011B2D6UL,
+                   (u16)(REG8(0x00FFFEF6UL) & 0x40)); break;
+    case 0x06: strip_light(box, 0x0011B2E0UL,
+                   (u16)(REG8(0x00FFFEF6UL) & 0x80)); break;
+    case 0x09: strip_light(box, 0x0011B2E4UL,
+                   (u16)(REG8(0x00FFFEF5UL) & 0x08)); break;
+    case 0x0A: strip_light(box, 0x0011B2E6UL,
+                   (u16)(REG8(0x00FFFEF5UL) & 0x80)); break;
+
+    case 0x04: strip_picture(box, entry, 0x0011B2D8UL,
+                   (u16)(REG8(0x00FFFEF9UL) & 0x0F), 0x00115852UL); break;
+    case 0x07: strip_picture(box, entry, 0x0011B2E2UL,
+                   (u16)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F),
+                   0x0011587AUL); break;
+    case 0x08: strip_picture(box, entry, 0x0011B2D4UL,
+                   (u16)(REG8(0x00FFFEF6UL) & 0x0F), 0x0011582EUL); break;
+    case 0x0C: strip_picture(box, entry, 0x0011B2D2UL,
+                   (u16)(REG8(0x00FFFEF5UL) & 0x03), 0x0011581EUL); break;
+    case 0x46: strip_picture(box, entry, 0x0011B2EAUL,
+                   (u16)REG8(0x00FFFEFDUL), 0x0011589AUL); break;
+
+    case 0x44: {
+        const u16 v = (u16)(REG8(0x00FFFEF5UL) & 0x04);
+
+        if (REG16(0x0011B2E8UL) != v) {
+            strip_patch(box, entry, v != 0 ? 0x0034E55CUL : 0x0034E5EDUL);
+            REG16(0x0011B2E8UL) = v;
+        }
+        break;
+    }
+
+    case 0x49: {
+        const u16 v = (u16)(REG8(0x00FFFEF6UL) & 0x0F);
+
+        if (REG16(0x0011B2EEUL) != v) {
+            hitbox_set_state(box, box, (u8)(v == 0x0001 ? 0x01 : 0x00), 0);
+            REG16(0x0011B2EEUL) = v;
+        }
+        break;
+    }
+
+    case 0x12: strip_grey(box, (u8)((REG8(0x00FFFEF8UL) & 0x01) || b)); break;
+    case 0x13: strip_grey(box, (u8)((REG8(0x00FFFEF8UL) & 0x01) || a)); break;
+    case 0x14: strip_grey(box, (u8)((REG8(0x00FFFEF8UL) & 0x01) || a)); break;
+
+    case 0x4C: {
+        const u16 n = (u16)(REG16(0x00FFFEE0UL) +
+                            (u16)REG8(0x00FFFEFDUL));
+
+        strip_grey(box, (u8)(stitch_record_kind(n) == 0 ||
+                             (REG8(0x00FFFEF8UL) & 0x01)));
+        break;
+    }
+
+    case 0x4D: {
+        const u8 on = (u8)((REG8(0x00FFFEFAUL) & 0x80) ||
+                           (REG8(0x00FFFEF7UL) & 0x08));
+
+        strip_grey(box, (u8)(on ? ((REG8(0x00FFFEF8UL) & 0x01) != 0) : 1));
+        break;
+    }
+
+    case 0x47:
+        if (c != 0) {
+            if (hitbox_kind(box) != 0x05) {
+                hitbox_set_state(box, box, 0x05, 0);
+                REG8(0x00FFFEF8UL) &= (u8)~0x01;
+            }
+        } else {
+            if (hitbox_kind(box) == 0x05) {
+                hitbox_set_state(box, box, 0x00, 0);
+            }
+        }
+        if (hitbox_kind(box) == 0x05) goto tail;
+        strip_light(box, 0x0011B2ECUL, (u16)(REG8(0x00FFFEF8UL) & 0x01));
+        break;
+
+    default:
+        break;
+    }
+
+tail:
+    if (REG8(0x00FFFEE2UL) & 0x04) {
+        if ((u8)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F) != 0) {
+            REG8(0x00FFFEF9UL) &= 0x0F;
+        }
+    }
+}
+
+/* H'2135FE. The whole panel strip brought up to date.
+ *
+ * With [fresh] set it makes one call with everything zeroed, which is what
+ * puts the fifteen remembered words to H'FFFF, and raises H'11A17B so that
+ * H'2136A6 walks the list next time. Otherwise it runs the boxes from
+ * [first] to [last], and for each one works out which panel key that box
+ * stands for: the box's own value indexes its list, and the low byte of the
+ * word found there is the key.
+ *
+ * The original copies the whole H'12-byte hitbox entry into a local frame
+ * first and reads the value and the list pointer out of the copy. Nothing
+ * changes the entry in between, so the copy makes no difference -- but it is
+ * what the original does and the fields are read from the copy here too.
+ *
+ * Either way it finishes by asking H'2136A6 whether anything in the run is
+ * away from its default. */
+void panel_strip_draw(u16 first, u16 last, u8 fresh)
+{
+    if (fresh != 0) {
+        panel_strip_box(0x00, 0x0000, 0x01);
+        REG8(0x0011A17BUL) = 0x01;
+    } else {
+        short i;
+
+        for (i = (short)first; i <= (short)last; i++) {
+            const u32 e = HITBOX_TABLE +
+                (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+            u16 copy[9];
+            u32 list;
+            u16 value;
+            int n;
+
+            for (n = 0; n < 9; n++) copy[n] = REG16(e + (u32)(2 * n));
+
+            value = copy[4];                              /* the +H'08 field */
+            list  = ((u32)copy[6] << 16) | (u32)copy[7];  /* the +H'0C field */
+
+            panel_strip_box(REG8(list +
+                (u32)(long)(short)(u16)((u16)(value << 1)) + 1),
+                (u16)i, 0x00);
+        }
+    }
+
+    panel_any_set(first, last);
+}
+
+/* ---- which strip the screen wears ---------------------------------------
+ * H'21F9D0. The pattern's category decides which of six lists the panel
+ * strip is filled from, and H'11A196 remembers which one is up so the work
+ * is done once per change rather than once per pass.
+ *
+ * The category less three indexes a table of twenty-three entries covering
+ * seven bodies, so most categories share a strip. Each body is the same
+ * four steps -- fill the run from the list, draw it fresh, remember the
+ * list, and say the screen wants laying out again -- with its own list, its
+ * own run of boxes, and its own idea of which panel bits to put back.
+ *
+ * The first two bodies are the odd ones. H'21FA6C looks at the pattern's
+ * own kind first and picks between two lists on that; H'21FC26 is its
+ * second half on its own. Both finish by clearing H'FFFEFD when the pedal
+ * bit is down, which none of the others do.
+ */
+static u16 strip_pattern_kind(void)
+{
+    return REG16(ITEM_TABLE +
+        (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x14);
+}
+
+static void strip_switch(u16 first, u16 last, u32 list)
+{
+    hitbox_fill_from_list(first, last, 0x0001, list);
+    panel_strip_draw(first, last, 0x01);
+    REG32(0x0011A196UL) = list;
+    REG8(0x00FFFEFDUL) = 0x00;
+    REG8(0x00FFFEF8UL) &= (u8)~0x01;
+    REG16(0x0011B10CUL) = 0x0001;
+}
+
+/* The list H'57EEF8 wants six panel bits put back as well, and zeroes the
+ * whole of H'FFFEF9 -- written in the original as "and with H'0F, then and
+ * with H'F0", which can only give nothing. */
+static void strip_switch_eef8(void)
+{
+    hitbox_fill_from_list(0x0010, 0x0015, 0x0001, 0x0057EEF8UL);
+    panel_strip_draw(0x0010, 0x0015, 0x01);
+    REG32(0x0011A196UL) = 0x0057EEF8UL;
+    REG8(0x00FFFEF9UL) = (u8)((u8)(REG8(0x00FFFEF9UL) & 0x0F) & 0xF0);
+    REG8(0x00FFFEF6UL) &= (u8)~0x80;
+    REG8(0x00FFFEF6UL) &= (u8)~0x40;
+    REG8(0x00FFFEF5UL) &= (u8)~0x10;
+    REG8(0x00FFFEF6UL) &= (u8)~0x10;
+    REG8(0x00FFFEF5UL) &= (u8)~0x08;
+    REG8(0x00FFFEF5UL) &= (u8)~0x80;
+    REG16(0x0011B10CUL) = 0x0001;
+}
+
+static void strip_pedal_settle(void)
+{
+    if (REG8(0x00FFFEFDUL) != 0 && !(REG8(0x00FFFEF8UL) & 0x01)) {
+        REG8(0x00FFFEFDUL) = 0x00;
+    }
+}
+
+void panel_strip_choose(void)
+{
+    const u8 idx = (u8)(REG8(ITEM_TABLE +
+        (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x17) + 0xFD);
+
+    if (idx > 0x16) return;
+
+    switch (idx) {
+    case 0x00:
+        if (strip_pattern_kind() != 0x0016 &&
+            strip_pattern_kind() != 0x0017) {
+            if (REG32(0x0011A196UL) != 0x0057EED6UL) {
+                strip_switch(0x0010, 0x0015, 0x0057EED6UL);
+            }
+        }
+        if (strip_pattern_kind() == 0x0016 ||
+            strip_pattern_kind() == 0x0017) {
+            if (REG32(0x0011A196UL) != 0x0057EEF8UL) strip_switch_eef8();
+            strip_pedal_settle();
+        }
+        break;
+
+    case 0x01:
+        if (REG32(0x0011A196UL) != 0x0057EEF8UL) strip_switch_eef8();
+        strip_pedal_settle();
+        break;
+
+    case 0x02: case 0x04: case 0x05: case 0x07:
+    case 0x08: case 0x0A: case 0x0C:
+        if (REG32(0x0011A196UL) != 0x0057EF1AUL) {
+            strip_switch(0x0010, 0x0015, 0x0057EF1AUL);
+        }
+        break;
+
+    case 0x03: case 0x06: case 0x09: case 0x0B:
+        if (REG32(0x0011A196UL) != 0x0057EF80UL) {
+            strip_switch(0x0010, 0x0015, 0x0057EF80UL);
+        }
+        break;
+
+    case 0x0D: case 0x0E:
+        if (REG32(0x0011A196UL) != 0x0057EF5EUL) {
+            hitbox_fill_from_list(0x000D, 0x0012, 0x0001, 0x0057EF5EUL);
+            panel_strip_draw(0x000D, 0x0012, 0x01);
+            REG32(0x0011A196UL) = 0x0057EF5EUL;
+            REG8(0x00FFFEFDUL) = 0x00;
+            REG8(0x00FFFEF9UL) &= 0x0F;
+            REG8(0x00FFFEF8UL) &= (u8)~0x01;
+            REG16(0x0011B10CUL) = 0x0001;
+        }
+        break;
+
+    case 0x0F: case 0x10: case 0x11: case 0x12:
+    case 0x14: case 0x15: case 0x16:
+        if (REG32(0x0011A196UL) != 0x0057EF3CUL) {
+            strip_switch(0x0019, 0x001E, 0x0057EF3CUL);
+        }
+        break;
+
+    case 0x13:
+        if (REG32(0x0011A196UL) != 0x0057EFA2UL) {
+            /* this one puts the two bits back before it fills, not after */
+            REG8(0x00FFFEFDUL) = 0x00;
+            REG8(0x00FFFEF8UL) &= (u8)~0x01;
+            hitbox_fill_from_list(0x0019, 0x001E, 0x0001, 0x0057EFA2UL);
+            panel_strip_draw(0x0019, 0x001E, 0x01);
+            REG32(0x0011A196UL) = 0x0057EFA2UL;
+            REG16(0x0011B10CUL) = 0x0001;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* H'2195F2. Seven pictures to choose between, and four keys that are not
+ * pictures at all.
+ *
+ * The screen answers a press or, failing that, a screen change asked for
+ * elsewhere -- H'21F940 writes its answer into the same local the hit test
+ * uses, so one key search covers both. The keys are searched rather than
+ * indexed, and the handlers are stored back to front behind H'2196B6, the
+ * same reversed-table idiom H'214DD4 uses.
+ *
+ * The seven picture keys, H'88 to H'8E, each blit their own bitmap into the
+ * one box and leave their own number in the bottom three bits of H'FFFEFA.
+ * The first of them ands those bits away and ors nothing back, which is the
+ * only reason it reads as a separate case rather than as "or with zero".
+ *
+ * Four keys hand straight to H'214DD4 as a step, and the low byte of the box
+ * value is the panel key -- so the same word is both the box's value here
+ * and a key over there. */
+static void picture_choice(u16 index, u32 picture, u8 code)
+{
+    message_show_held(index);
+    bitmap_draw(0x0045, 0x0057, 0x0086, 0x0098,
+                (const u8 *)picture, LCD_FRAME_A);
+    REG8(0x00FFFEFAUL) = (u8)((u8)(REG8(0x00FFFEFAUL) & 0xF8) | code);
+}
+
+u8 picture_choice_screen(void)
+{
+    u16 value = 0, index = 0;
+    u8  hit = touch_hit(0x0001, 0x000B, &value, &index);
+
+    if (hit != 0x03) hit = screen_leave_check(&value, 0x00);
+    if (hit != 0x03) return 0x00;
+
+    switch (value) {
+    case 0x0008:
+    case 0x000C:
+    case 0x006E:
+    case 0x006F:
+        (void)panel_switch((u8)value, index, 0x01, 0x00);
+        break;
+
+    case 0x000B:
+        message_show_held(index);
+        screen_remember(0x01);
+        screen_switch(0x3F, 0x01, 0x00);
+        break;
+
+    case 0x001A:
+        message_show_held(index);
+        if (REG8(0x00114DC6UL) & 0x80) break;
+        screen_stack_pop();
+        screen_switch(REG8(0x0011B0A7UL), 0x01, 0x00);
+        REG8(0x0011B0A9UL) = 0x01;
+        break;
+
+    case 0x0088: picture_choice(index, 0x0034F208UL, 0x00); break;
+    case 0x0089: picture_choice(index, 0x0034F33CUL, 0x01); break;
+    case 0x008A: picture_choice(index, 0x0034F463UL, 0x02); break;
+    case 0x008B: picture_choice(index, 0x0034F570UL, 0x03); break;
+    case 0x008C: picture_choice(index, 0x0034F69CUL, 0x04); break;
+    case 0x008D: picture_choice(index, 0x0034F7C8UL, 0x05); break;
+    case 0x008E: picture_choice(index, 0x0034F8D5UL, 0x06); break;
+
+    default:
+        break;
+    }
+    return 0x00;
+}
+
+/* ---- the queue's own list ----------------------------------------------
+ * H'210784, H'21DD6A and the two little stores below them.
+ */
+
+/* H'210784. How many entries at [from] and after it are category 1 -- the
+ * ones build_item_list leaves out -- plus one. The end of the run is
+ * recomputed on every pass because H'11B11C and H'11B28C can move while the
+ * queue is being edited. */
+u16 queue_run_length(u16 from)
+{
+    u16 n = 0x0001;
+    short at = (short)from;
+
+    for (;;) {
+        const short end = (short)(REG16(0x0011B11CUL) + REG16(0x0011B28CUL));
+
+        at++;
+        if (at > end) break;
+        if (REG8(ITEM_TABLE +
+                 (u32)(long)(short)(u16)(ITEM_STRIDE * (u16)at) + 0x17) != 0x01) {
+            break;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* H'21DD6A. One value inserted into a counted list of words: the tail is
+ * shifted up by one and the count goes up with it. The length handed to the
+ * move is worked out from the count *before* the insert, so the word being
+ * overwritten is included in what is moved. */
+void list_insert(u16 *list, u16 at, u16 value)
+{
+    const u32 base = (u32)list;
+    const u32 n = (u32)(u16)((u16)(REG16(base) - at + 1) << 1);
+    const u32 slot = base + (u32)(long)(short)(u16)((u16)(at << 1));
+
+    mem_move((void *)(slot + 2), (const void *)slot, n);
+    REG16(slot) = value;
+    REG16(base) = (u16)(REG16(base) + 1);
+}
+
+/* H'229054. One byte into the H'0D-byte record at H'11BBB4. */
+void beep_record_byte(u16 n, u8 v)
+{
+    REG8(0x0011BBB4UL + (u32)(long)(short)(u16)(13 * n)) = v;
+}
+
+/* H'228C3C. A word split into the two bytes at H'11BBAA, low half first.
+ *
+ * The high half is read back off the stack rather than out of the register,
+ * which is what makes the order look the wrong way round in the listing. */
+void beep_pair_store(u16 v)
+{
+    REG8(0x0011BBAAUL) = (u8)v;
+    REG8(0x0011BBABUL) = (u8)(v >> 8);
+}
+
+/* ---- one field of a queue record ---------------------------------------
+ * The queue is a thousand records of H'0D bytes at H'11BBAA -- the block
+ * settings_save writes out to flash in one go -- and thirteen little
+ * routines each put one field of one record. They are all the same three
+ * steps: work out the record's address, mask the old bits out, or the new
+ * ones in.
+ *
+ * Five take a plain byte and store it whole. The rest each have their own
+ * mask and their own shift, and one of them, H'228C90, takes a word and
+ * splits it across two bytes -- the ten-bit number the callers pass H'3FF
+ * and H'3FE for.
+ */
+#define QREC(rec) (0x0011BBAAUL + (u32)(long)(short)(u16)(13 * (rec)))
+
+void queue_put_number(u16 rec, u16 v)          /* H'228C90: ten bits, bytes 0-1 */
+{
+    REG8(QREC(rec) + 0) = (u8)v;
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) & 0xFC);
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) |
+                               (u8)((u8)(v >> 8) & 0x03));
+}
+
+void queue_put_mid4(u16 rec, u8 v)             /* H'228CE4: byte 1 bits 2-5 */
+{
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) & 0xC3);
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) |
+                               (u8)((u8)(v << 2) & 0x3C));
+}
+
+void queue_put_bit6(u16 rec, u8 v)             /* H'228D30: byte 1 bit 6 */
+{
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) & (u8)~0x40);
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) | v);
+}
+
+void queue_put_bit7(u16 rec, u8 v)             /* H'228D94: byte 1 bit 7 */
+{
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) & (u8)~0x80);
+    REG8(QREC(rec) + 1) = (u8)(REG8(QREC(rec) + 1) | v);
+}
+
+void queue_put_byte2(u16 rec, u8 v) { REG8(QREC(rec) + 2) = v; }  /* H'228DF8 */
+void queue_put_byte3(u16 rec, u8 v) { REG8(QREC(rec) + 3) = v; }  /* H'228E18 */
+void queue_put_byte5(u16 rec, u8 v) { REG8(QREC(rec) + 5) = v; }  /* H'228E9E */
+void queue_put_byte6(u16 rec, u8 v) { REG8(QREC(rec) + 6) = v; }  /* H'228EDA */
+void queue_put_byte10(u16 rec, u8 v) { REG8(QREC(rec) + 10) = v; } /* H'229054 */
+
+void queue_put_low6(u16 rec, u8 v)             /* H'228E38: byte 4 bits 0-5 */
+{
+    REG8(QREC(rec) + 4) = (u8)(REG8(QREC(rec) + 4) & 0xC0);
+    REG8(QREC(rec) + 4) = (u8)(REG8(QREC(rec) + 4) | (u8)(v & 0x3F));
+}
+
+/* H'229074: byte 4 bit 7 -- and only bit 7, though what is or'd in is three
+ * bits wide. The value is rotated right three times, so its bottom three
+ * bits arrive at the top, and then masked to H'E0. */
+void queue_put_top3(u16 rec, u8 v)
+{
+    u8 k = v;
+    u8 i;
+
+    REG8(QREC(rec) + 4) = (u8)(REG8(QREC(rec) + 4) & (u8)~0x80);
+    for (i = 0; i < 3; i++) k = (u8)((u8)(k >> 1) | (u8)(k << 7));
+    REG8(QREC(rec) + 4) = (u8)(REG8(QREC(rec) + 4) | (u8)(k & 0xE0));
+}
+
+void queue_put_low2(u16 rec, u8 v)             /* H'228F16: byte 7 bits 0-1 */
+{
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) & 0xFC);
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) | v);
+}
+
+void queue_put_bit3(u16 rec, u8 v)             /* H'228F7A: byte 7 bit 3 */
+{
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) & (u8)~0x08);
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) | (u8)(v >> 1));
+}
+
+void queue_put_high4(u16 rec, u8 v)            /* H'228FE0: byte 7 bits 4-7 */
+{
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) & 0x0F);
+    REG8(QREC(rec) + 7) = (u8)(REG8(QREC(rec) + 7) | (u8)(v << 4));
+}
+
+/* H'229100. Six of a pattern's parameters read out of the catalogue and put
+ * into a queue record, one getter and one setter each. Every getter is
+ * called with its "use the working copy" flag set. */
+void queue_put_params(u16 rec, u16 pattern)
+{
+    queue_put_mid4 (rec, stitch_param_4(pattern, 0x01));
+    queue_put_byte2(rec, stitch_param_2(pattern, 0x01));
+    queue_put_byte3(rec, stitch_param_1(pattern, 0x01));
+    queue_put_low6 (rec, stitch_param_5(pattern, 0x01));
+    queue_put_byte5(rec, stitch_param_6(pattern, 0x01));
+    queue_put_byte6(rec, stitch_param_7(pattern, 0x01));
+}
+
+/* H'2292CC. The first entry's pattern number, one on, put back. */
+void queue_number_bump(void)
+{
+    beep_pair_store((u16)(queue_entry_number_first() + 1));
+}
+
+/* H'229198. One queue record filled in from the machine's current state.
+ *
+ * Two flags at H'11A1E1 and H'11A1E2 stand for "nothing here" and "the end
+ * of a group": either one writes the two sentinel numbers H'3FF and H'3FE
+ * into the record and into its parameters, clears the flag, and stops. The
+ * record is zeroed first either way.
+ *
+ * Otherwise the pattern number goes in, then the six parameters, then eight
+ * more fields straight off the panel ports, and finally the byte H'2290E0
+ * answered at the top -- which is why that call comes first and its answer
+ * is carried all the way down. */
+void queue_record_fill(u16 rec)
+{
+    const u8 off = queue_entry_offset(rec);
+
+    mem_set(QREC(rec), 0x00, 0x000D);
+
+    if (REG8(0x0011A1E1UL) != 0) {
+        queue_put_number(rec, 0x03FF);
+        queue_put_params(rec, 0x03FF);
+        REG8(0x0011A1E1UL) = 0x00;
+        return;
+    }
+
+    if (REG8(0x0011A1E2UL) != 0) {
+        queue_put_number(rec, 0x03FE);
+        queue_put_params(rec, 0x03FE);
+        REG8(0x0011A1E2UL) = 0x00;
+        return;
+    }
+
+    queue_put_number(rec, REG16(0x00FFFEE0UL));
+    queue_put_bit6(rec, (u8)(REG8(0x00FFFEF6UL) & 0x40));
+    queue_put_bit7(rec, (u8)(REG8(0x00FFFEF6UL) & 0x80));
+    queue_put_params(rec, (u16)(REG16(0x00FFFEE0UL) + (u16)off));
+    queue_put_low2(rec, (u8)(REG8(0x00FFFEF5UL) & 0x03));
+    queue_put_bit3(rec, (u8)(REG8(0x00FFFEF5UL) & 0x10));
+    queue_put_high4(rec, (u8)((u8)(REG8(0x00FFFEF9UL) >> 4) & 0x0F));
+    queue_put_top3(rec, (u8)(REG8(0x00FFFEF5UL) & 0x04));
+    queue_put_byte10(rec, off);
+}
+
+/* H'210AB2. Room made in the three lists for a run of entries.
+ *
+ * H'210784 says how long the run is -- the entry asked for plus every
+ * category-1 entry after it -- and the whole run has to fit: adding it to
+ * H'11B198 must not take the total past H'3C, and when it would, H'11A18A is
+ * raised and nothing is inserted.
+ *
+ * Otherwise one slot is opened in H'11B212 for the entry itself, and then
+ * one slot in each of H'11B198 and H'11B11E for every entry of the run. */
+void queue_make_room(u16 at)
+{
+    const u16 run = queue_run_length(at);
+    short i;
+    u16 put = at;
+
+    if ((short)(REG16(0x0011B198UL) + run) > 0x003C) {
+        REG8(0x0011A18AUL) = 0x01;
+        return;
+    }
+
+    list_insert((u16 *)0x0011B212UL, (u16)(REG16(0x0011B212UL) + 1), at);
+    REG16(0x0011A186UL) = REG16(0x0011B212UL);
+
+    for (i = 1; i <= (short)run; i++) {
+        list_insert((u16 *)0x0011B198UL, (u16)(REG16(0x0011B198UL) + 1),
+                    (u16)(REG16(0x0011B11CUL) + REG16(0x0011B198UL) + 1));
+        list_insert((u16 *)0x0011B11EUL, (u16)(REG16(0x0011B11EUL) + 1), put);
+        put++;
+    }
+}
+
+/* H'228A92. One entry added to the queue.
+ *
+ * The queue is full at H'3E8 entries and says so with message H'20. Below
+ * that the records above the cursor are shifted up by one -- one H'0D-byte
+ * record's worth, moved with the ROM's memmove because the two overlap --
+ * the number list has a slot opened in it, the new record is filled in from
+ * the machine's state, and the picker is redrawn and stepped on by one.
+ *
+ * The number inserted into the list at H'11B3D8 is the first argument, read
+ * back off the stack rather than out of the register it arrived in; the
+ * offset stored in the record is the low byte of the second. */
+u8 queue_add_entry(u16 number, u16 offset)
+{
+    const u16 at = REG16(0x0011A1CCUL);
+
+    if ((short)REG16(0x0011B3D8UL) >= 0x03E8) {
+        message_show(0x0020);
+        return 0x00;
+    }
+
+    REG8(0x0011A184UL) = 0x01;
+
+    mem_move((void *)(0x0011BBB7UL + (u32)(long)(short)(u16)(13 * at)),
+             (const void *)(0x0011BBAAUL + (u32)(long)(short)(u16)(13 * at)),
+             (u32)(long)(short)(u16)
+                 (13 * (u16)(queue_entry_number_first() - at + 1)));
+
+    list_insert((u16 *)0x0011B3D8UL, (u16)(at + 1), number);
+    queue_put_byte10((u16)(at + 1), (u8)offset);
+    REG16(0x0011A1D2UL) = (u16)(REG16(0x0011A1D2UL) + 1);
+    queue_number_bump();
+    queue_record_fill((u16)(at + 1));
+    picker_draw_range((u16)(REG16(0x0011A1C8UL) + 1), (u16)(at + 1),
+                      REG16(0x0011A1D2UL));
+    picker_forward(0x0001);
+    return 0x01;
+}
+
+/* ---- taking an entry out again -----------------------------------------
+ * The four little readers and the two removers that answer H'21DD6A and
+ * H'228A92.
+ */
+
+/* H'22B23A. The low byte of the picker position. */
+u8 picker_pos_low(void) { return REG8(0x0011A1CDUL); }
+
+/* H'22B202. Whether the picker's first and last are the same position. */
+u8 picker_one_only(void)
+{
+    return (u8)(REG16(0x0011A1D0UL) == REG16(0x0011A1D2UL) ? 1 : 0);
+}
+
+/* H'22B21E. Whether the picker is at or before its first position. */
+u8 picker_at_start(void)
+{
+    return (u8)((short)REG16(0x0011A1CCUL) > (short)REG16(0x0011A1D0UL)
+                ? 0 : 1);
+}
+
+/* H'2292E4. The first entry's number, one off, put back. */
+void queue_number_drop(void)
+{
+    beep_pair_store((u16)(queue_entry_number_first() - 1));
+}
+
+/* H'21DD18. One value taken out of a counted list of words -- the mirror of
+ * H'21DD6A. The tail comes down by one, the word left at the end is zeroed,
+ * and the count comes down with it. The length is worked out from the count
+ * before the delete, so the word being removed is part of what moves. */
+void list_delete(u16 *list, u16 at)
+{
+    const u32 base = (u32)list;
+    const u16 n = (u16)((u16)(REG16(base) - at) << 1);
+    const u32 slot = base + (u32)(long)(short)(u16)((u16)(at << 1));
+
+    mem_copy((u8 *)slot, (const u8 *)(slot + 2), n);
+    REG16(base + (u32)(long)(short)(u16)((u16)(REG16(base) << 1))) = 0x0000;
+    REG16(base) = (u16)(REG16(base) - 1);
+}
+
+/* H'2292FC. One queue record taken out: the records above it come down by
+ * one, the record left at the end is zeroed, and the stored number comes
+ * down with them.
+ *
+ * The length of the move is the low word of the product, with no sign
+ * extension -- so a position past the first entry's number wraps rather than
+ * counting backwards. */
+void queue_remove_record(u16 at)
+{
+    const u16 n = (u16)(13 * (u16)(queue_entry_number_first() - at));
+
+    mem_copy((u8 *)(0x0011BBAAUL + (u32)(long)(short)(u16)(13 * at)),
+             (const u8 *)(0x0011BBB7UL + (u32)(long)(short)(u16)(13 * at)), n);
+    mem_set(0x0011BBAAUL +
+            (u32)(long)(short)(u16)(13 * queue_entry_number_first()),
+            0x00, 0x000D);
+    queue_number_drop();
+}
+
+/* H'20318C. A pattern taken up: its cached flags cleared down to bit 7, its
+ * four parameters copied into the live registers, and a handful of state
+ * bits put back.
+ *
+ * The four are copied only when bit 1 of H'114DCA is up *and* the pedal
+ * position is not H'FFFF; either failing, the whole set is recomputed from
+ * the catalogue instead. */
+void pattern_take_up(u16 n)
+{
+    const u32 flag = 0x000E4010UL + (u32)(u16)((u16)(n << 4));
+
+    REG8(flag) = (u8)(REG8(flag) & 0x80);
+
+    if ((REG8(0x00114DCAUL) & 0x02) && REG16(0x00FFFEFEUL) != 0xFFFF) {
+        REG8(0x0011A69EUL) = stitch_param_1(n, 0x01);
+        sew_param_a_set(REG8(0x0011A69EUL));
+        REG8(0x0011A6A0UL) = stitch_param_2(n, 0x01);
+        sew_param_b_set(REG8(0x0011A6A0UL));
+        REG8(0x00FFFEEAUL) = stitch_param_4(n, 0x01);
+        REG8(0x00FFFEECUL) = stitch_param_5(n, 0x01);
+    } else {
+        sew_params_for_pattern(n);
+        sew_params_publish();
+    }
+
+    REG8(0x00114DC7UL) &= (u8)~0x80;
+    REG8(0x00FFFEF8UL) &= (u8)~0x20;
+    REG8(0x0011A6CFUL) = 0x00;
+
+    if (REG8(0x00114DC6UL) & 0x08) {
+        REG8(0x00114DC6UL) &= (u8)~0x08;
+        REG8(0x00FFFEFAUL) &= (u8)~0x80;
+        REG8(0x00FFFEF7UL) &= (u8)~0x08;
+        REG8(0x0011A6AEUL) |= 0x01;
+        REG8(0x00114DCDUL) &= (u8)~0x08;
+    }
+}
+
+/* H'2016F2. Every cached flag in the table cleared down to bit 7, and then
+ * the pattern the pedal is on taken up. The loop stops one short of H'400,
+ * the same off-by-one item_flags_clear has. */
+void pattern_flags_clear_all(void)
+{
+    const u16 n = (u16)(REG16(0x00FFFEE0UL) + (u16)REG8(0x00FFFEFDUL));
+    u16 i;
+
+    for (i = 0; i < 0x03FF; i++) {
+        const u32 flag = 0x000E4010UL + (u32)(u16)((u16)(i << 4));
+
+        REG8(flag) = (u8)(REG8(flag) & 0x80);
+    }
+    pattern_take_up(n);
+}
+
+/* H'21C4EC. A screen handed over, with three ways of getting there.
+ *
+ * While H'11A184 is up the change is only asked for -- dialog 3 puts the
+ * question -- and the only preparation done is for screen H'41. Otherwise
+ * H'41 and H'12 both go to the screen properly and everything else only
+ * makes itself current, which is what leaves the screen change to whoever
+ * asked for it. */
+void screen_hand_over(u8 screen)
+{
+    REG8(0x0011B11AUL) = screen;
+
+    if (REG8(0x0011A184UL) != 0) {
+        if (REG8(0x0011B11AUL) == 0x41) {
+            dialog_backdrop_save(0x01);
+            screen_remember(0x01);
+            screen_put_away();
+        }
+        dialog_show(0x0003);
+        return;
+    }
+
+    if (REG8(0x0011B11AUL) == 0x41) {
+        dialog_backdrop_save(0x01);
+        screen_remember(0x01);
+        screen_switch(REG8(0x0011B11AUL), 0x01, 0x00);
+    } else if (REG8(0x0011B11AUL) == 0x12) {
+        drawing_reset();
+        REG8(0x0011A169UL) = REG8(0x0011B11AUL);
+        screen_switch(REG8(0x0011B11AUL), 0x01, 0x00);
+    } else {
+        drawing_reset();
+        REG8(0x0011A169UL) = REG8(0x0011B11AUL);
+    }
+}
+
+/* H'22A012. The whole queue read back out of flash: the two blocks copied
+ * in, the number list rebuilt an entry at a time, and the picker redrawn. */
+void queue_reload(void)
+{
+    short i;
+
+    mem_copy((u8 *)0x0011EE80UL, (const u8 *)0x0057B2D6UL, 0x0400);
+    mem_copy((u8 *)0x0011BBAAUL, (const u8 *)0x00578000UL, 0x32D5);
+
+    REG16(0x0011B3D8UL) = queue_entry_number_first();
+
+    for (i = 1; i <= 0x03E8; i++) {
+        REG16(0x0011B3D8UL + (u32)(long)(short)(u16)((u16)((u16)i << 1))) =
+            queue_entry_number((u16)i);
+    }
+
+    picker_rebuild(REG16(0x0011A1CEUL), 0x01, 0x01);
+}
+
+/* ---- the queue's ranges -------------------------------------------------
+ * H'11EE80 holds H'100 pairs of words -- a first and a last position each --
+ * and H'57B2D6 is the copy of them in flash.
+ */
+
+/* H'229368. Every range brought into line with the one at H'11A1CE after it
+ * has moved: a pair whose two halves are equal is cleared, and a pair that
+ * starts after the moved one's old start is shifted by however much the
+ * moved one grew. */
+void queue_ranges_shift(void)
+{
+    const u32 at = (u32)(long)(short)(u16)((u16)(REG16(0x0011A1CEUL) << 2));
+    const u16 grew = (u16)(REG16(0x0011EE82UL + at) -
+                           REG16(0x0057B2D8UL + at));
+    const u16 was  = REG16(0x0011EE80UL + at);
+    short i;
+
+    for (i = 0; i <= 0x00FF; i++) {
+        const u32 e = (u32)(long)(short)(u16)((u16)((u16)i << 2));
+
+        if (REG16(0x0011EE80UL + e) == REG16(0x0011EE82UL + e)) {
+            REG16(0x0011EE82UL + e) = 0x0000;
+            REG16(0x0011EE80UL + e) = 0x0000;
+        } else if ((short)REG16(0x0011EE80UL + e) > (short)was) {
+            REG16(0x0011EE80UL + e) = (u16)(REG16(0x0011EE80UL + e) + grew);
+            REG16(0x0011EE82UL + e) = (u16)(REG16(0x0011EE82UL + e) + grew);
+        }
+    }
+}
+
+/* H'229468. The queue and its ranges written back out to flash: the range at
+ * H'11A1CE takes the picker's own first and last, the rest are brought into
+ * line, and both blocks are programmed with the flash-busy bit up. */
+void queue_save_ranges(void)
+{
+    const u32 at = (u32)(long)(short)(u16)((u16)(REG16(0x0011A1CEUL) << 2));
+
+    REG8(0x0011A184UL) = 0x00;
+    FLASH_BUSY |= 0x20;
+    rom_flash_write((const void *)0x0011BBAAUL, 0x00578000UL, 0x32D5);
+
+    REG16(0x0011EE80UL + at) = REG16(0x0011A1D0UL);
+    REG16(0x0011EE82UL + at) = REG16(0x0011A1D2UL);
+    queue_ranges_shift();
+
+    rom_flash_write((const void *)0x0011EE80UL, 0x0057B2D6UL, 0x0400);
+    FLASH_BUSY &= (u8)~0x20;
+}
+
+/* H'228B80. One entry taken out from under the cursor, and only when the
+ * cursor is past the first position. Emptying the queue puts the picker's
+ * left edge back to H'30, with the cursor taken down and put up again round
+ * the move. */
+void queue_delete_entry(void)
+{
+    if (REG16(0x0011A1CCUL) == 0) return;
+    if ((short)REG16(0x0011A1CCUL) <= (short)REG16(0x0011A1D0UL)) return;
+
+    REG8(0x0011A184UL) = 0x01;
+    picker_back(0x0001);
+    REG16(0x0011A1D2UL) = (u16)(REG16(0x0011A1D2UL) - 1);
+    list_delete((u16 *)0x0011B3D8UL, (u16)(REG16(0x0011A1CCUL) + 1));
+
+    if (REG16(0x0011B3D8UL) == 0) {
+        picker_cursor(0x00);
+        REG16(0x0011A1C8UL) = 0x0030;
+        picker_cursor(0x01);
+    }
+
+    queue_remove_record((u16)(REG16(0x0011A1CCUL) + 1));
+    picker_draw_range((u16)(REG16(0x0011A1C8UL) + 1),
+                      (u16)(REG16(0x0011A1CCUL) + 1), REG16(0x0011A1D2UL));
+}
+
+/* H'222F00. Everything the machine holds about the pattern put back to
+ * nothing, ready for the next one.
+ *
+ * H'FFFEF9 is anded with H'F0 and then with H'0F, which can only leave
+ * nothing. That is in the original and is kept. */
+void pattern_state_reset(void)
+{
+    pattern_flags_clear_all();
+
+    REG8(0x00FFFEF5UL) &= (u8)~0x08;
+    REG8(0x00FFFEF5UL) &= (u8)~0x10;
+    REG8(0x00FFFEF6UL) &= (u8)~0x80;
+    REG8(0x00FFFEF6UL) &= (u8)~0x40;
+    REG8(0x00FFFEF6UL) &= (u8)~0x10;
+    REG8(0x00FFFEF5UL) &= (u8)~0x80;
+    REG8(0x00FFFEF9UL) = (u8)((u8)(REG8(0x00FFFEF9UL) & 0xF0) & 0x0F);
+    REG8(0x00FFFEF5UL) |= 0x04;
+
+    if (REG8(ITEM_TABLE +
+             (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x17) == 0x16) {
+        REG8(0x00FFFEFDUL) = 0x00;
+    }
+
+    REG8(0x00FFFEFCUL) = 0x00;
+    REG8(0x00FFFEFBUL) = 0x00;
+
+    REG8(0x00FFFEF6UL) = (u8)(REG8(0x00FFFEF6UL) & 0xF0);
+    if (!(REG8(0x00FFFEF6UL) & 0x20)) {
+        REG8(0x00FFFEF6UL) ^= 0x20;
+        needle_stop_picture();
+    }
+
+    REG8(0x00FFFEF5UL) = (u8)(REG8(0x00FFFEF5UL) & 0xFC);
+    REG8(0x0011A17BUL) = 0x01;
+}
+
+/* H'200EC0, H'2010EC. The nine settings of one pattern, moved between the
+ * ten-byte record at H'57C6D6 in flash and the sixteen-byte working copy at
+ * H'0E4010. Byte 0 of the record is the "this slot is in use" flag that
+ * H'200E46 clears and that the save below sets; the other nine are the
+ * settings, and they do not go into the working copy in order:
+ *
+ *   record +1 +2 +3 +4 +5 +6 +7 +8 +9
+ *   work   +1 +2 +7 +3 +8 +4 +5 +6 +9
+ *
+ * The load also republishes four of them into the panel's own bytes. Which
+ * of record +2/+3 and +4/+5 is used depends on bit 6 of H'11A7BD, the
+ * alternate-mode flag: the record carries both sets and the mode picks one.
+ */
+void stitch_working_load(u16 n, u8 announce)
+{
+    const u32 src  = 0x0057C6D6UL + (u32)(u16)(10 * n);
+    const u32 work = 0x000E4010UL + (u32)(u16)((u16)(n << 4));
+
+    REG8(work + 0x01) = REG8(src + 1);
+    REG8(work + 0x02) = REG8(src + 2);
+    REG8(work + 0x07) = REG8(src + 3);
+    REG8(work + 0x03) = REG8(src + 4);
+    REG8(work + 0x08) = REG8(src + 5);
+    REG8(work + 0x04) = REG8(src + 6);
+    REG8(work + 0x05) = REG8(src + 7);
+    REG8(work + 0x06) = REG8(src + 8);
+    REG8(work + 0x09) = REG8(src + 9);
+
+    REG8(0x0011A7D9UL) = REG8(src + 1);
+    REG8(0x0011A69EUL) = REG8(src + 1);
+    sew_param_a_set(REG8(src + 1));
+
+    if (REG8(0x0011A7BDUL) & 0x40) {
+        REG8(0x0011A6A0UL) = REG8(src + 4);
+        REG8(0x0011A7DAUL) = REG8(src + 4);
+        REG8(0x00FFFEFCUL) = REG8(src + 5);
+    } else {
+        REG8(0x0011A6A0UL) = REG8(src + 2);
+        REG8(0x0011A7DAUL) = REG8(src + 2);
+        REG8(0x00FFFEFCUL) = REG8(src + 3);
+    }
+    sew_param_b_set(REG8(0x0011A6A0UL));
+
+    REG8(0x0011A7D8UL) = REG8(src + 6);
+    REG8(0x00FFFEEAUL) = REG8(src + 6);
+    REG8(0x0011A7DBUL) = REG8(src + 7);
+    REG8(0x00FFFEECUL) = REG8(src + 7);
+    REG8(0x00FFFEFBUL) = REG8(src + 8);
+    REG8(0x0011A7ACUL) = REG8(src + 9);
+
+    if (announce != 0) {
+        REG8(0x00114DC6UL) |= 0x08;
+        REG8(0x00FFFEF7UL) |= 0x08;
+        REG8(0x00FFFEFAUL) &= (u8)~0x80;
+        REG8(0x00FFFEF5UL) |= 0x40;
+    }
+}
+
+/* H'2010EC. The same nine the other way, a byte at a time through the boot
+ * rom's flash writer, with bit 5 of H'114DC7 held up for the length of it.
+ * Byte 0 of the record goes to 1, which is what marks the slot as used. */
+void stitch_working_save(u16 n)
+{
+    const u32 dst  = 0x0057C6D6UL + (u32)(u16)(10 * n);
+    const u32 work = 0x000E4010UL + (u32)(u16)((u16)(n << 4));
+    u8 one = 0x01;
+
+    REG8(0x00114DC7UL) |= 0x20;
+
+    rom_flash_write(&one, dst + 0, 1);
+    rom_flash_write((const void *)(work + 0x01), dst + 1, 1);
+    rom_flash_write((const void *)(work + 0x03), dst + 4, 1);
+    rom_flash_write((const void *)(work + 0x08), dst + 5, 1);
+    rom_flash_write((const void *)(work + 0x02), dst + 2, 1);
+    rom_flash_write((const void *)(work + 0x07), dst + 3, 1);
+    rom_flash_write((const void *)(work + 0x04), dst + 6, 1);
+    rom_flash_write((const void *)(work + 0x05), dst + 7, 1);
+    rom_flash_write((const void *)(work + 0x06), dst + 8, 1);
+    rom_flash_write((const void *)(work + 0x09), dst + 9, 1);
+
+    REG8(0x00114DC7UL) &= (u8)~0x20;
+}
+
+/* H'213164. A run of boxes scrolled on by one entry.
+ *
+ * H'212FF0 slides boxes [first]+1..[last] down over [first], which leaves
+ * the last two boxes holding the same thing; the last one is then moved on
+ * to the next entry of its own list and the whole run drawn again. The
+ * wrap-around point is the count word at the head of the *first* box's
+ * list, read before the slide -- a run always shows one list, so the count
+ * is the same list's either way, but it is read from the box that is about
+ * to be overwritten.
+ *
+ * What the new entry looks like depends on its kind byte: the nine kinds
+ * below are drawn unlit, and everything else asks H'214DD4 what the field
+ * is set to and lights the box if the answer is positive.
+ *
+ * The answer is the value the first box ends up with, which is the entry
+ * the run now starts at. */
+u16 hitbox_run_scroll(u16 first, u16 last)
+{
+    const u32 head = HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * first);
+    const u32 tail = HITBOX_TABLE +
+        (u32)(long)(short)(u16)(HITBOX_STRIDE * last);
+    const u16 count = REG16(REG32(head + 0x0C));
+    u16 value;
+    u8  kind;
+
+    hitbox_run_shift((u16)(first + 1), last, first);
+
+    value = REG16(tail + 0x08);
+    if (value == count) value = 0x0001;
+    else                value = (u16)(value + 1);
+    REG16(tail + 0x08) = value;
+
+    kind = REG8(REG32(tail + 0x0C) +
+                (u32)(long)(short)(u16)((u16)(value << 1)) + 1);
+
+    if (kind == 0x04 ||
+        (kind >= 0x07 && kind < 0x09) ||
+        (kind >= 0x0B && kind < 0x0D) ||
+        kind == 0x44 || kind == 0x46) {
+        hitbox_set_state(last, last, 0x00, 0);
+    } else {
+        const u16 on = panel_switch(kind, last, 0, 0);
+        hitbox_set_state(last, last, (u8)(((short)on > 0) ? 0x01 : 0x00), 0);
+    }
+
+    hitbox_redraw_run(first, last);
+    REG8(0x0011A17BUL) = 0x01;
+    return REG16(head + 0x08);
+}
+
+/* H'2220F0. Backing out of a sub-screen to the one it was opened from.
+ *
+ * Four screens know how to do this and the rest do nothing at all. Each
+ * names the screen it goes back to -- H'07 and H'45 go to H'02 or H'30
+ * depending on which of the two is showing, H'34 and H'36 to H'35 or H'33,
+ * H'04 to H'03, H'47 to H'46 -- and then repaints the two panels the
+ * sub-screen covered and puts its strip of boxes back into their menu
+ * states. H'47 only clears the wide panel and has no boxes to put back.
+ *
+ * H'11A169 is written before H'21F1DE is called, so what is put away is the
+ * screen being *returned to*, not the one being left. That is in the
+ * original. */
+void screen_back_out(u8 screen)
+{
+    picker_cursor(0x00);
+    REG8(0x0011A174UL) = 0x00;
+
+    if (screen == 0x07 || screen == 0x45) {
+        REG8(0x0011A169UL) = (u8)((REG8(0x0011A169UL) == 0x07) ? 0x02 : 0x30);
+
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 2, 1);
+        hitbox_set_state(0x001F, 0x0020, 0x02, 0);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0, 1);
+        hitbox_set_state(0x0021, 0x0025, 0x04, 0);
+
+        hitbox_set_state(0x000B, 0x000F, 0x03, 0);
+        hitbox_redraw_run(0x000B, 0x000F);
+        hitbox_set_state(0x0012, 0x0015, 0x03, 0);
+        hitbox_redraw_run(0x0012, 0x0015);
+    } else if (screen == 0x34 || screen == 0x36) {
+        REG8(0x0011A169UL) = (u8)((REG8(0x0011A169UL) == 0x36) ? 0x35 : 0x33);
+
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 2, 1);
+        hitbox_set_state(0x001A, 0x001B, 0x02, 0);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0, 1);
+        hitbox_set_state(0x0013, 0x0014, 0x04, 0);
+
+        hitbox_set_state(0x0007, 0x0008, 0x03, 0);
+        hitbox_redraw_run(0x0007, 0x0008);
+        hitbox_set_state(0x000F, 0x0012, 0x03, 0);
+        hitbox_redraw_run(0x000F, 0x0012);
+    } else if (screen == 0x04) {
+        REG8(0x0011A169UL) = 0x03;
+
+        draw_rect(0x002D, 0x009F, 0x00EB, 0x00C1, LCD_FRAME_A, 2, 1);
+        hitbox_set_state(0x0024, 0x0025, 0x02, 0);
+        draw_rect(0x0115, 0x009D, 0x013B, 0x00C3, LCD_FRAME_A, 0, 1);
+
+        hitbox_set_state(0x0010, 0x0014, 0x03, 0);
+        hitbox_redraw_run(0x0010, 0x0014);
+        hitbox_set_state(0x001B, 0x001E, 0x03, 0);
+        hitbox_redraw_run(0x001B, 0x001E);
+    } else if (screen == 0x47) {
+        REG8(0x0011A169UL) = 0x46;
+
+        draw_rect(0x0004, 0x009D, 0x013B, 0x00EC, LCD_FRAME_A, 0, 1);
+    } else {
+        return;
+    }
+
+    screen_leave(REG8(0x0011A169UL), 0x01);
+    REG8(0x0011A17BUL) = 0x01;
+}
+
+/* ---- what a press does --------------------------------------------------
+ *
+ * H'21FF3C is the biggest routine in the application: a press turned into
+ * a message and the message acted on, over sixty-eight screens. Three
+ * helpers first, for the shapes it repeats.
+ */
+
+/* The six screens that have a queue under them. */
+static u8 queue_screen(u8 screen)
+{
+    return (u8)(screen == 0x04 || screen == 0x07 || screen == 0x34 ||
+                screen == 0x36 || screen == 0x45 || screen == 0x47);
+}
+
+/* Whether the picker will let the screen go. Asked only while H'11A175 is
+ * up -- that is, while the queue dialog is the thing showing. The first
+ * test is on the low byte of the position alone, which is what the original
+ * asks for. */
+static u8 picker_may_leave(void)
+{
+    if (picker_pos_low() == 0) return 0;
+    if (picker_at_start() != 0) return 0;
+    if (picker_one_only() != 0) return 0;
+    return 1;
+}
+
+/* The body under messages H'17 and H'18: the pattern strip moved a page
+ * back or a page on, with the pressed box taken out of its lit state and
+ * put back into it round the move. Six copies in the original, differing
+ * only in how far the strip runs, how big a page is, and whether a second
+ * run of boxes follows it along. */
+static void strip_page(u16 index, u16 last, u16 step, u8 forward,
+                       u16 shift_first, u16 shift_last, u16 shift_dest,
+                       u16 redraw_first, u16 redraw_last)
+{
+    u16 was;
+
+    message_show_held(index);
+
+    was = hitbox_find(0x0001, last, REG16(0x00FFFEE0UL), 0x01);
+    hitbox_set_state(was, was, 0x00, 0);
+
+    REG16(0x0011B108UL) = forward
+        ? hitbox_list_scroll_on(0x0001, last, step)
+        : hitbox_list_scroll_back(0x0001, last, step);
+
+    was = hitbox_find(0x0001, last, REG16(0x00FFFEE0UL), 0x01);
+    hitbox_set_state(was, was, 0x01, 0);
+
+    if (redraw_last != 0) {
+        hitbox_run_shift(shift_first, shift_last, shift_dest);
+        hitbox_redraw_run(redraw_first, redraw_last);
+    }
+}
+
+/* H'21FF3C. What a press does, screen by screen: the biggest single routine
+ * in the application and the one everything else on the panel hangs off.
+ *
+ * It is three dispatches deep. The screen picks a prelude, and six of the
+ * twelve screens that have one take the press as a *pattern* -- the boxes of
+ * the pattern strip -- and are finished with it. Anything the prelude does
+ * not claim falls through to the common body, where the screen picks a
+ * second range of boxes to hit-test; that hit yields a message number, and
+ * the message number picks one of twenty-four bodies out of a table of a
+ * hundred and twenty-four. Eighty-one of the hundred and twenty-four do
+ * nothing at all.
+ *
+ * Two words of local are threaded through the whole thing: the value the
+ * box carries, which becomes the message number, and the box's own index.
+ *
+ * Every path returns zero.
+ */
+u8 screen_touch(void)
+{
+    u16 value = 0;                    /* the box's value, then the message */
+    u16 index = 0;                    /* and which box it was */
+    u8  screen = REG8(0x0011A169UL);
+    u8  r;
+
+    switch (screen) {
+
+    /* ---- the pattern strip ------------------------------------------- */
+    case 0x02: case 0x18: case 0x30: case 0x44:
+        if (touch_hit(0x0001, 0x000F, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            const u16 was = hitbox_find(0x0001, 0x000F, REG16(0x00FFFEE0UL), 0);
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) {
+            const u8 s = REG8(0x0011A169UL);
+
+            if (s != 0x44 && s != 0x30) {
+                queue_make_room(REG16(0x00FFFEE0UL));
+                screen_switch(0x44, 0x01, 0x00);
+            }
+        }
+        return 0;
+
+    case 0x07: case 0x45:
+        if (touch_hit(0x0001, 0x000A, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            u16 was = hitbox_find(0x0001, 0x000F, REG16(0x00FFFEE0UL), 0);
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+
+            was = hitbox_find(0x0021, 0x0025, REG16(0x00FFFEE0UL), 0);
+            if (was != 0) hitbox_set_state(was, was, 0x00, 0);
+
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) {
+            const u8 s = REG8(0x0011A169UL);
+
+            if (s != 0x44 && s != 0x30) {
+                queue_make_room(REG16(0x00FFFEE0UL));
+                screen_switch(0x44, 0x01, 0x00);
+                return 0;
+            }
+        }
+        if (REG32(0x0011A196UL) != 0x0057EEF8UL) {
+            queue_add_entry(REG16(0x00FFFEE0UL), REG8(0x00FFFEFDUL));
+            hold_start(0x0096);
+        }
+        return 0;
+
+    case 0x03:
+        if (touch_hit(0x0001, 0x0014, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            const u16 was = hitbox_find(0x0001, 0x0014, REG16(0x00FFFEE0UL), 0);
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) screen_switch(0x44, 0x01, 0x00);
+        return 0;
+
+    case 0x04:
+        if (touch_hit(0x0001, 0x000F, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            const u16 was = hitbox_find(0x0001, 0x0014, REG16(0x00FFFEE0UL), 0);
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) {
+            screen_switch(0x44, 0x01, 0x00);
+            return 0;
+        }
+        queue_add_entry(REG16(0x00FFFEE0UL), REG8(0x00FFFEFDUL));
+        hold_start(0x0096);
+        return 0;
+
+    case 0x33: case 0x35:
+        if (touch_hit(0x0001, 0x0008, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            const u16 was = hitbox_find(0x0001, 0x0008, REG16(0x00FFFEE0UL), 0);
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) screen_switch(0x44, 0x01, 0x00);
+        return 0;
+
+    case 0x34: case 0x36:
+        if (touch_hit(0x0001, 0x0006, &value, &index) != 0x03) break;
+        if (REG8(0x00114DC6UL) & 0x80) break;
+
+        if (hitbox_kind(index) == 0) {
+            u16 was = hitbox_find(0x0001, 0x0008, REG16(0x00FFFEE0UL), 0);
+            u8  now, next;
+
+            hitbox_set_state(was, was, 0x00, 0);
+            hitbox_set_state(index, index, 0x01, 0);
+
+            was = hitbox_find(0x0013, 0x0014, REG16(0x00FFFEE0UL), 0);
+            if (was != 0) hitbox_set_state(was, was, 0x00, 0);
+
+            /* Moving between the two halves of a two-part pattern drops
+             * the mirror flag. The category of the one showing is read
+             * unsigned and the category of the one pressed signed, which is
+             * in the original. */
+            now = REG8(ITEM_TABLE +
+                       (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x17);
+            if (now == 0x10) {
+                next = REG8(ITEM_TABLE +
+                            (u32)(long)(short)(u16)(ITEM_STRIDE * value) + 0x17);
+                if (next == 0x11) REG8(0x00FFFEFDUL) = 0x00;
+            } else if (now == 0x11) {
+                next = REG8(ITEM_TABLE +
+                            (u32)(long)(short)(u16)(ITEM_STRIDE * value) + 0x17);
+                if (next == 0x10) REG8(0x00FFFEFDUL) = 0x00;
+            }
+
+            REG16(0x00FFFEE0UL) = value;
+            item_preview(value);
+            panel_strip_choose();
+        }
+        if (REG8(0x0011A178UL) != 0) {
+            screen_switch(0x44, 0x01, 0x00);
+            return 0;
+        }
+        queue_add_entry(REG16(0x00FFFEE0UL), REG8(0x00FFFEFDUL));
+        hold_start(0x0096);
+        return 0;
+
+    default:
+        break;
+    }
+
+    /* ---- the rest of the screen -------------------------------------- */
+    switch (screen) {
+    case 0x02: case 0x18: case 0x30:
+        r = touch_hit(0x0010, 0x0019, &value, &index);
+        break;
+
+    case 0x07: case 0x45:
+        r = touch_hit(0x0010, 0x0011, &value, &index);
+        if (r != 0x03) r = touch_hit(0x0016, 0x0020, &value, &index);
+        break;
+
+    case 0x03:
+        r = touch_hit(0x0015, 0x001E, &value, &index);
+        break;
+
+    case 0x04:
+        r = touch_hit(0x0015, 0x001A, &value, &index);
+        if (r != 0x03) r = touch_hit(0x001F, 0x0025, &value, &index);
+        break;
+
+    case 0x33: case 0x35:
+        r = touch_hit(0x0009, 0x0012, &value, &index);
+        break;
+
+    case 0x34: case 0x36:
+        r = touch_hit(0x0009, 0x000E, &value, &index);
+        if (r != 0x03) r = touch_hit(0x0015, 0x001B, &value, &index);
+        break;
+
+    case 0x42: r = touch_hit(0x0008, 0x000A, &value, &index); break;
+    case 0x44: r = touch_hit(0x0018, 0x0019, &value, &index); break;
+    case 0x46: r = touch_hit(0x0000, 0x0000, &value, &index); break;
+    case 0x47: r = touch_hit(0x000E, 0x0012, &value, &index); break;
+
+    default:
+        return 0;
+    }
+
+    if (r == 0x02) r = screen_leave_check(&value, 0x00);
+    if (r != 0x03) {
+        /* H'221B48 */
+        if (REG8(0x00FFFEF8UL) & 0x80) REG8(0x00FFFEF8UL) &= (u8)~0x80;
+        return 0;
+    }
+
+    for (;;) {
+        if ((u16)(value - 1) > 0x007B) return 0;
+
+        switch (value) {
+
+        /* The panel's own state: twenty of the hundred and twenty-four
+         * messages are a field of H'214DD4, stepped on by the press. */
+        case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06:
+        case 0x07: case 0x08: case 0x09: case 0x0A: case 0x0C: case 0x44:
+        case 0x46: case 0x47: case 0x49: case 0x6E: case 0x6F: case 0x76:
+        case 0x7B:
+            panel_switch((u8)value, index, 0x01, 0x00);
+            return 0;
+
+        /* ---- the pattern strip ---------------------------------------- */
+        case 0x17: case 0x18: {
+            const u8  forward = (u8)(value == 0x18);
+            const u8  screen2 = REG8(0x0011A169UL);
+            u16 last, step;
+            u16 sf = 0, sl = 0, sd = 0, rf = 0, rl = 0;
+
+            if (REG8(forward ? 0x0011B0ABUL : 0x0011B0AAUL) == 0) return 0;
+
+            switch (screen2) {
+            case 0x02: case 0x18: case 0x30: case 0x44:
+                last = 0x000F; step = 0x0005; break;
+            case 0x07: case 0x45:
+                last = 0x000F; step = 0x0005;
+                sf = 0x000B; sl = 0x000F; sd = 0x0021;
+                rf = 0x0021; rl = 0x0025; break;
+            case 0x03: case 0x04:
+                last = 0x0014; step = 0x0005; break;
+            case 0x33: case 0x35:
+                last = 0x0008; step = 0x0002; break;
+            case 0x34: case 0x36:
+                last = 0x0008; step = 0x0002;
+                sf = 0x0007; sl = 0x0008; sd = 0x0013;
+                rf = 0x0013; rl = 0x0014; break;
+            default:
+                return 0;
+            }
+
+            strip_page(index, last, step, forward, sf, sl, sd, rf, rl);
+            return 0;
+        }
+
+        case 0x15: {
+            const u8 s = REG8(0x0011A169UL);
+            u16 first, add, cap;
+
+            if (s == 0x02 || s == 0x07 || s == 0x18 || s == 0x30 || s == 0x45) {
+                first = 0x0010; add = 0x000F; cap = 0x0015;
+            } else if (s >= 0x03 && s <= 0x04) {
+                first = 0x0019; add = 0x0018; cap = 0x001E;
+            } else if (s >= 0x33 && s <= 0x36) {
+                first = 0x000D; add = 0x000C; cap = 0x0012;
+            } else if (s == 0x42) {
+                first = 0x0006; add = 0x0005; cap = 0x0007;
+            } else {
+                return 0;
+            }
+
+            message_show_held(index);
+            {
+                const u16 t = (u16)(REG16(REG32(0x0011A196UL)) + add);
+                const u16 to = ((short)t <= (short)cap) ? t : cap;
+
+                REG16(0x0011B10CUL) = hitbox_run_scroll(first, to);
+            }
+            return 0;
+        }
+
+        /* ---- the queue ------------------------------------------------ */
+        case 0x45: {
+            const u8 s = REG8(0x0011A169UL);
+
+            message_show_held(index);
+            if (REG8(0x0011A178UL) != 0) return 0;
+
+            if (s == 0x30 || s == 0x45) {
+                screen_switch(REG8(0x0011B0A4UL), 0x01, 0x00);
+                REG16(0x0011B108UL) = REG16(0x0011B112UL);
+            } else {
+                REG8(0x0011B0A4UL) = s;
+                REG16(0x0011B112UL) = REG16(0x0011B108UL);
+                screen_switch(0x30, 0x01, 0x00);
+                REG16(0x0011B10AUL) = 0x0001;
+            }
+            return 0;
+        }
+
+        case 0x48: {
+            const u8 s = REG8(0x0011A169UL);
+
+            if (s == 0x04 || s == 0x07 || s == 0x34 || s == 0x36 || s == 0x45) {
+                message_show_held(index);
+                REG8(0x0011B0A3UL) = REG8(0x0011A169UL);
+                screen_switch(0x43, 0x01, 0x00);
+            }
+            return 0;
+        }
+
+        case 0x0E:
+            if (queue_screen(REG8(0x0011A169UL))) {
+                message_show_held(index);
+                queue_delete_entry();
+            }
+            return 0;
+
+        case 0x0F:
+            if (queue_screen(REG8(0x0011A169UL))) {
+                message_show_held(index);
+                screen_hand_over(0x41);
+            }
+            return 0;
+
+        case 0x10:
+            if (queue_screen(REG8(0x0011A169UL))) {
+                message_show_held(index);
+                queue_save_ranges();
+            }
+            return 0;
+
+        case 0x40:
+            if (REG8(0x0011B3D6UL) != 0 && queue_screen(REG8(0x0011A169UL))) {
+                message_show_held(index);
+                picker_back(0x0001);
+            }
+            return 0;
+
+        case 0x41:
+            if (REG8(0x0011B3D7UL) != 0 && queue_screen(REG8(0x0011A169UL))) {
+                message_show_held(index);
+                picker_forward(0x0001);
+            }
+            return 0;
+
+        case 0x11: {
+            const u8 s = REG8(0x0011A169UL);
+
+            if (s == 0x04 || s == 0x07 || s == 0x34 || s == 0x36 || s == 0x45) {
+                message_show_held(index);
+                if (!(REG8(0x00114DC6UL) & 0x80)) {
+                    REG8(0x0011B0A2UL) = REG8(0x0011A169UL);
+                    screen_switch(0x42, 0x01, 0x00);
+                    REG8(0x0011A175UL) = 0x01;
+                }
+            } else if (s == 0x42) {
+                message_show_held(index);
+                screen_stack_pop();
+                dialog_backdrop_save(0x01);
+                screen_switch(REG8(0x0011B0A2UL), 0x01, 0x00);
+                REG8(0x0011A175UL) = 0x00;
+            }
+            return 0;
+        }
+
+        case 0x4A:
+            message_show_held(index);
+            pattern_state_reset();
+            return 0;
+
+        case 0x4B:
+            message_show_held(index);
+            if (REG8(0x0011A175UL) != 0) {
+                if (!picker_may_leave()) return 0;
+                screen_remember(0x01);
+            }
+            screen_switch(0x2D, 0x01, 0x00);
+            return 0;
+
+        case 0x0B:
+            message_show_held(index);
+            if (REG8(0x0011A175UL) != 0 && !picker_may_leave()) return 0;
+            screen_remember(0x01);
+            screen_switch(0x3F, 0x01, 0x00);
+            return 0;
+
+        case 0x0D:
+            message_show_held(index);
+            REG8(0x0011B0A5UL) = REG8(0x0011A169UL);
+            REG16(0x0011B118UL) = REG16(0x0011B108UL);
+            screen_switch(0x46, 0x01, 0x00);
+            return 0;
+
+        /* ---- the boxes that lead somewhere ---------------------------- */
+        case 0x12:
+            if (hitbox_kind(index) == 0x05) return 0;
+            message_show_held(index);
+            screen_remember(0x01);
+            screen_switch(0x09, 0x01, 0x00);
+            return 0;
+
+        case 0x13:
+            if (hitbox_kind(index) == 0x05) return 0;
+            message_show_held(index);
+            if (!(REG8(0x00114DC6UL) & 0x80)) {
+                REG8(0x0011B0A7UL) = REG8(0x0011A169UL);
+                REG8(0x00FFFEFDUL) = 0x02;
+                screen_switch(0x0B, 0x01, 0x00);
+            }
+            return 0;
+
+        case 0x14:
+            if (hitbox_kind(index) == 0x05) return 0;
+            message_show_held(index);
+            screen_remember(0x01);
+            screen_switch(0x0A, 0x01, 0x00);
+            return 0;
+
+        case 0x4C:
+            if (hitbox_kind(index) == 0x05) return 0;
+            message_show_held(index);
+            stitch_working_load((u16)(REG16(0x00FFFEE0UL) + REG8(0x00FFFEFDUL)),
+                                0x01);
+            return 0;
+
+        case 0x4D:
+            if (hitbox_kind(index) == 0x05) return 0;
+            message_show_held(index);
+            stitch_working_save((u16)(REG16(0x00FFFEE0UL) + REG8(0x00FFFEFDUL)));
+            return 0;
+
+        /* ---- coming back from a sub-screen ---------------------------- */
+        case 0x6D: {
+            const u8 s = REG8(0x0011A169UL);
+
+            if (REG8(0x00114DC6UL) & 0x80) return 0;
+
+            switch (s) {
+            case 0x02: case 0x30:
+                pattern_strip_restore((u8)((s == 0x02) ? 0x07 : 0x45));
+                queue_reload();
+                if (hitbox_find(0x000B, 0x000F, REG16(0x00FFFEE0UL), 0x01) != 0) {
+                    value = 0x0018;
+                    continue;
+                }
+                hold_start(0x0064);
+                return 0;
+
+            case 0x33: case 0x35:
+                pattern_strip_restore((u8)((s == 0x35) ? 0x36 : 0x34));
+                queue_reload();
+                if (hitbox_find(0x0007, 0x0008, REG16(0x00FFFEE0UL), 0x01) != 0) {
+                    value = 0x0018;
+                    continue;
+                }
+                hold_start(0x0064);
+                return 0;
+
+            case 0x03:
+                pattern_strip_restore(0x04);
+                queue_reload();
+                if (hitbox_find(0x0010, 0x0014, REG16(0x00FFFEE0UL), 0x01) != 0) {
+                    value = 0x0018;
+                    continue;
+                }
+                hold_start(0x0064);
+                return 0;
+
+            case 0x46:
+                pattern_strip_restore(0x47);
+                queue_reload();
+                hold_start(0x0064);
+                return 0;
+
+            case 0x34: case 0x36:
+                screen_back_out(s);
+                if (REG8(0x0011A169UL) == 0x35) {
+                    bitmap_draw(0x005E, 0x005E, 0x00E8, 0x00C1,
+                                (const u8 *)0x00300782UL, LCD_FRAME_A);
+                    stitch_stroke_toggle(0x01, 0x01);
+                } else {
+                    bitmap_draw(0x005E, 0x005E, 0x00E8, 0x00C1,
+                                (const u8 *)0x00300A47UL, LCD_FRAME_A);
+                    stitch_stroke_toggle(0x00, 0x01);
+                }
+                screen_hand_over(REG8(0x0011A169UL));
+                hold_start(0x0064);
+                return 0;
+
+            case 0x07: case 0x45:
+            case 0x04:
+            case 0x47:
+                screen_back_out(s);
+                screen_hand_over(REG8(0x0011A169UL));
+                hold_start(0x0064);
+                return 0;
+
+            default:
+                return 0;
+            }
+        }
+
+        /* H'57EFC4 holds a message the machine wants acting on next, which
+         * is taken here and put through the same table. */
+        case 0x7A: {
+            const u16 next = REG16(0x0057EFC4UL);
+
+            if (next == 0) return 0;
+            value = next;
+            index = 0x0000;
+            REG8(0x0011A17BUL) = 0x01;
+            continue;
+        }
+
+        case 0x7C:
+            REG8(0x00FFFEF8UL) |= 0x20;
+            return 0;
+
+        default:
+            return 0;
+        }
+    }
+}
