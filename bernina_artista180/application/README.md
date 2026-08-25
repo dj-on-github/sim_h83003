@@ -3185,6 +3185,79 @@ being taken.
 
 **4,457 cases pass over 572 routines.** app.bin is 124,728 bytes.
 
+## 14. One file into seventeen
+
+`app.c` had reached 22,681 lines. It is now `app.h` and seventeen sources,
+split by what a routine is *for*:
+
+| file | lines | what is in it |
+|---|---:|---|
+| `app_boot.c` | 807 | the boot ROM calls, the I2C bus, entry, the display's bring-up |
+| `app_flash.c` | 539 | the item index, the configuration block, writing the settings |
+| `app_motor.c` | 1101 | the ports, the timers, the motors, the foot control, the keys |
+| `app_stitch.c` | 808 | the stitch database, and making a pattern current |
+| `app_queue.c` | 1848 | the queue, stepping through it, stopping in the right place |
+| `app_sew.c` | 1270 | a stitch turned into motor positions, interpolated, driven |
+| `app_screen.c` | 1282 | the display subsystem, bitmaps, screens, the dialog, the picker |
+| `app_service.c` | 1187 | bringing the machine up, the diagnostics screen, service mode |
+| `app_isr.c` | 1543 | the two main loops, the timebase, the five interrupt handlers |
+| `app_hitbox.c` | 913 | the item preview, the two bars, the hit-box table |
+| `app_module.c` | 1199 | the module's panel: its slate, its labels, its numbers |
+| `app_modmath.c` | 1794 | the module's floating point, and the geometry it works out |
+| `app_body.c` | 1638 | the screen bodies' helpers |
+| `app_press.c` | 1105 | the module's state machines, the hit test, what a press does |
+| `app_sci.c` | 1716 | SCI0: the module's link and its three interrupts |
+| `app_panel.c` | 2053 | the screens, the hoop, the panel's fields, switches and strip |
+| `app_queuerec.c` | 1341 | the queue's own list and records, its ranges, and a press |
+
+`app.h` is the 200 addresses and constants they share, with the comments
+that explain them, and then a block of declarations per file -- 658 of them,
+every routine one file offers another. A routine only its own file calls
+stays `static` there and is not named in the header.
+
+The split was done mechanically rather than by hand: a script parses the old
+file into top-level items -- comment, `#define`, declaration, definition --
+assigns each to a file by line range, and emits the seventeen sources plus
+the header, keeping the original blank-line spacing so that a doc comment
+still sits against the routine it documents. The check that it lost nothing
+is a token-level diff of the old file against the new ones: 138,137 tokens
+in, and the only thing missing on the other side is the word `static`,
+thirteen times.
+
+Those thirteen are eleven routines that turned out to have callers in more
+than one file -- `stitch_record`, `stitch_work`, `service_tick`,
+`service_hook`, `build_tables`, `buffer_fill`, `splash_and_config`,
+`display_init_223010`, `module_link_quiet`, `f2u` and `u2f` -- plus the
+`STUB` macro, whose two stand-ins are called from two files each.
+
+### The trap: `--gc-sections`
+
+One object file became eighteen, and that changes what `--gc-sections` can
+do. Without `-ffunction-sections` the linker collects whole `.text` sections,
+one per object; with everything in a single `app.o` there was nothing it
+could drop, because `_start` reached into that one section. Split up, an
+object whose routines are all reached from the *original's* jump tables --
+never from anything the linker can see -- is unreferenced, and goes.
+
+Measured rather than assumed. Without `KEEP`:
+
+    without KEEP:  115,328 bytes,  42 of 572 case symbols missing
+    with KEEP:     124,448 bytes,   0 of 572 case symbols missing
+
+So `app.ld` now `KEEP`s the application's own objects by name and leaves
+`--gc-sections` to do what it was there for in the first place, which is to
+drop the parts of libgcc the application does not use.
+
+### What it cost
+
+Nothing, and 280 bytes. The image went from 124,728 bytes to 124,448 --
+smaller, because the eleven routines that stopped being `static` stopped
+being inlined into several callers apiece. **All 4,457 cases still pass over
+all 572 routines**, which is the only check that matters: the harness
+resolves every case through `app.sym`, so a routine that had been dropped,
+renamed or quietly changed would show up as a failure rather than as a
+smaller binary.
+
 ## The parts, in order
 
 Ordered to reach a drawing screen as early as possible: until the display

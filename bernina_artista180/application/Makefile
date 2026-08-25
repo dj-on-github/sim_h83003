@@ -14,12 +14,19 @@ CFLAGS  = -mh -mint32 -Os -ffreestanding -fno-builtin -Wall -Wextra \
 LDFLAGS = -mh -mint32 -nostdlib -nostartfiles -T app.ld -Wl,--gc-sections
 LDLIBS  = -lgcc
 
-OBJS = vectors.o app.o
+# The reconstruction, split by what a routine is for. app.h holds what they
+# share: the addresses, and every routine one file offers another.
+SRCS = app_boot.c app_flash.c app_motor.c app_stitch.c app_queue.c \
+       app_sew.c app_screen.c app_service.c app_isr.c app_hitbox.c \
+       app_module.c app_modmath.c app_body.c app_press.c app_sci.c \
+       app_panel.c app_queuerec.c
+
+OBJS = vectors.o $(SRCS:.c=.o)
 
 all: app.bin app.sym mergeapp
 
 %.o: %.S ; $(CC) $(CFLAGS) -c $< -o $@
-%.o: %.c ../bootrom/h8_3003.h ; $(CC) $(CFLAGS) -c $< -o $@
+%.o: %.c app.h ../bootrom/h8_3003.h ; $(CC) $(CFLAGS) -c $< -o $@
 
 app.elf: $(OBJS) app.ld
 	$(CC) $(LDFLAGS) $(OBJS) -o $@ $(LDLIBS)

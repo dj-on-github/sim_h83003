@@ -26,8 +26,15 @@ SECTIONS {
     .apptable : { KEEP(*(.apptable)) } > apptable
     .appinfo  : { KEEP(*(.appinfo))  } > appinfo
 
+    /* --gc-sections is here for libgcc's sake: it drops the arithmetic the
+       application does not use. The application's own objects are KEEPt,
+       because most of what they hold is reached from the original's jump
+       tables rather than from anything the linker can see. */
     .text : {
         *(.text.start)
+        KEEP(vectors.o(.text .text.*))
+        KEEP(app_*.o(.text .text.*))
+        KEEP(app_*.o(.rodata .rodata.*))
         *(.text .text.*)
         *(.rodata .rodata.*)
     } > code
