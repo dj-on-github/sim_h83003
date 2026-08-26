@@ -6073,7 +6073,7 @@ static u8 module_hoop_key_ready(u8 look_at_faults)
     }
     if (REG8(0x00114D9FUL) != 0) { (void)link_claim(0x07); return 0x00; }
     if (look_at_faults != 0) {
-        if (module_fault_report(0x80) != 0) return 0x00;
+        if (module_fault_report(0x81) != 0) return 0x00;
         if (module_nothing_to_report() == 0) return 0x00;
     }
     return 0x01;
@@ -6230,7 +6230,7 @@ void module_hoop_screen(void)
         pattern_slot_begin();
         REG8(0x0011A41DUL + module_slot12()) = REG8(0x00114DA1UL);
         REG8(0x0011A41FUL + module_slot12()) =
-            (u8)((u16)REG8(0x00114D8CUL) / 0x1C);
+            (u8)((u16)REG8(0x00114D8CUL) / 0x1B);
 
         /* The message only goes out when the link is quiet and there is
          * something to send; the screen changes either way. */

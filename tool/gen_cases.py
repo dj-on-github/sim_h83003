@@ -5959,6 +5959,26 @@ hoopscr('the size up one below its ceiling',
 hoopscr('the size up with the second at its ceiling',
         sewboth(sewpress(0x01, 0x07),
                 _half(b8(0x0011A25B + 0x10*MOD_SLOT, 0x64))))
+# Exactly on the ceiling on one of the two and one below it on the other, in
+# a hoop the bigger size still fits: the only shape in which widening either
+# test by one shows.
+hoopscr('the size up with the first exactly on its ceiling',
+        sewboth(sewpress(0x01, 0x07),
+                dict(list(b8(0x0011A25A + 0x10*MOD_SLOT, 0x64).items()) +
+                     list(b8(0x0011A25B + 0x10*MOD_SLOT, 0x63).items()))),
+        small=True)
+hoopscr('the size up with the second exactly on its ceiling',
+        sewboth(sewpress(0x01, 0x07),
+                dict(list(b8(0x0011A25A + 0x10*MOD_SLOT, 0x63).items()) +
+                     list(b8(0x0011A25B + 0x10*MOD_SLOT, 0x64).items()))),
+        small=True)
+# The two percentages kept apart, so which of them is put by in H'11F299 and
+# which in H'11F29A is visible at all.
+hoopscr('the size back to a hundred with the two apart',
+        sewboth(sewpress(0x01, 0x06),
+                dict(list(b8(0x0011A25A + 0x10*MOD_SLOT, 0x28).items()) +
+                     list(b8(0x0011A25B + 0x10*MOD_SLOT, 0x3C).items()))),
+        small=True)
 hoopscr('the size up, a state bit up',
         sewboth(sewpress(0x01, 0x07), _half(b8(0x00114D55, 0x02))))
 hoopscr('the size up, a busy link',
