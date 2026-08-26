@@ -42,6 +42,37 @@ class StackArg extends Placement {
   final int value;
 }
 
+/// A case's whole fill: its base from the spec's "fills" table with the
+/// case's own entries applied on top.
+///
+/// The fills in routines.json are shared out -- cases in a family have the
+/// same key order and differ only in a few values, so the file keeps one
+/// base per distinct key order and each case names it in "fillBase" and
+/// carries only its overrides. A key the base already has keeps its place in
+/// the order and takes the case's value; a key it does not have goes on the
+/// end. Dart's maps keep insertion order and assigning to a key already
+/// present leaves its place alone, which is the rule the fills were built
+/// under -- and the order matters, because the same address named twice
+/// takes the value named last.
+///
+/// A case with no "fillBase" carries its whole fill, as hand-written cases
+/// do, and comes back unchanged.
+Map<String, dynamic> composeFill(
+    Map<String, dynamic> c, Map<String, dynamic> fills) {
+  final over = c['fill'] as Map<String, dynamic>? ?? const {};
+  final baseName = c['fillBase'] as String?;
+  if (baseName == null) return over;
+  final base = fills[baseName] as Map<String, dynamic>?;
+  if (base == null) {
+    throw StateError('case "${c['name']}" names fill "$baseName", '
+        'which the spec does not have');
+  }
+  final out = <String, dynamic>{};
+  base.forEach((k, v) => out[k] = over.containsKey(k) ? over[k] : v);
+  over.forEach((k, v) => out.putIfAbsent(k, () => v));
+  return out;
+}
+
 /// A byte to place in memory before the call, on both sides.
 class Seed {
   const Seed(this.address, this.value);

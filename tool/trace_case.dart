@@ -258,7 +258,8 @@ void main(List<String> argv) {
   final out = <List<List<int>>>[];
   for (final path in [spec['originalImage'], spec['rebuiltImage']]) {
     final cpu = boot(path as String, bootSteps);
-    seedFill(cpu, c['fill'] as Map<String, dynamic>? ?? const {});
+    seedFill(cpu, composeFill(
+        c, spec['fills'] as Map<String, dynamic>? ?? const {}));
     final side = buildSide(
         c[path == spec['originalImage'] ? 'original' : 'rebuilt']
             as Map<String, dynamic>,

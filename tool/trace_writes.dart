@@ -195,7 +195,8 @@ void main(List<String> argv) {
         (which == 'original' ? spec['originalImage'] : spec['rebuiltImage'])
             as String;
     final cpu = boot(path, bootSteps);
-    seedFill(cpu, c['fill'] as Map<String, dynamic>? ?? const {});
+    seedFill(cpu, composeFill(
+        c, spec['fills'] as Map<String, dynamic>? ?? const {}));
     final side = buildSide(c[which] as Map<String, dynamic>, symbols);
     final rows = traceWrites(cpu, side, seed, 40000000, from, len, keep);
     print('$which: ${rows.length} writes into ${h6(from)}');

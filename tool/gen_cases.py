@@ -22,7 +22,8 @@ import json, collections, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 P='bernina_artista180/application/routines.json'
-d=json.load(open(P))
+import spec_fills
+d=spec_fills.load(P)          # fills expanded: BASE below wants a whole one
 cases=d['cases']
 # By name, not by position: once the generated cases are in the file the
 # last one is one of them, and every fill would be built on itself.
@@ -6067,6 +6068,17 @@ hoopscr('the hoop moved, the module going home',
         sewboth(sewpress(0x01, 0x0E),
                 dict(list(b8(0x00FFFEC0, 0x04).items()) +
                      list(b8(0x00114D66, 0x01).items()))))
+# The two bits H'11F2A2 carries are both nought in the fill, so neither the
+# one the nudge sets nor the one it clears has anywhere to show unless the
+# byte starts with both up.
+hoopscr('the hoop moved with both of its bits already up',
+        sewboth(sewpress(0x01, 0x0E),
+                dict(list(b8(0x00FFFEC0, 0x04).items()) +
+                     list(b8(0x0011F2A2, 0xFF).items()))))
+hoopscr('the hoop put back with both of its bits already up',
+        sewboth(sewpress(0x01, 0x12),
+                dict(list(b8(0x00FFFEC0, 0x04).items()) +
+                     list(b8(0x0011F2A2, 0xFF).items()))))
 hoopscr('the hoop moved, a busy link',
         sewboth(sewpress(0x01, 0x0E),
                 dict(list(b8(0x00FFFEC0, 0x04).items()) +
@@ -6105,6 +6117,24 @@ hoopscr('turned on past the top, the key held',
         sewboth(sewpress(0x01, 0x18),
                 dict(list(b8(0x0011A260 + 0x10*MOD_SLOT, 0x45).items()) +
                      list(b8(0x00114DB6, 0x01).items()))), small=True)
+# A hoop the design only just turns in, where six steps do not fit and five
+# do. That is the only shape in which the six the held key tries is visible
+# as a number rather than as the step it then takes.
+def _tight(rot, ex=None):
+    d = collections.OrderedDict()
+    d.update(w16(0x00104CCE + 2*MOD_DESIGN, 0x003C))
+    d.update(w16(0x00104D06 + 2*MOD_DESIGN, 0x0050))
+    d.update(w16(0x0011A626, 0x00C8))
+    d.update(w16(0x0011A628, 0x00C8))
+    d.update(b8(0x0011A260 + 0x10*MOD_SLOT, rot))
+    d.update(b8(0x00114DB6, 0x01))
+    if ex: d.update(ex)
+    return d
+
+hoopscr('turned back six in a hoop only five fit in',
+        sewboth(sewpress(0x01, 0x17), _tight(0x08)))
+hoopscr('turned on six in a hoop only five fit in',
+        sewboth(sewpress(0x01, 0x18), _tight(0x0A)))
 hoopscr('turned on to a label that needs the whole turn added',
         sewboth(sewpress(0x01, 0x18), b8(0x0011A260 + 0x10*MOD_SLOT, 0x25)),
         small=True)

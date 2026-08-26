@@ -264,6 +264,7 @@ void main(List<String> args) {
   final only = opt('--only');
   bootCache = !args.contains('--no-boot-cache');
   verifyRestore = args.contains('--verify-restore');
+  final fills = spec['fills'] as Map<String, dynamic>? ?? const {};
 
   var passed = 0, failed = 0, skipped = 0;
 
@@ -284,7 +285,15 @@ void main(List<String> args) {
     // before the call. Without it, a routine that recomputes what the dump
     // already holds writes nothing, and a comparison of what changed would
     // pass even if neither side did anything at all.
-    (c['fill'] as Map<String, dynamic>? ?? const {}).forEach((range, value) {
+    //
+    // The fill is applied in order -- the same address named twice takes the
+    // value named last -- so composing a case on its base has to give back
+    // the same sequence of pairs, not merely the same set. "fillBase" names
+    // a fill in the spec's "fills" table; a key the base already has keeps
+    // its place and takes the case's value, and a key it does not have goes
+    // on the end. A case with no "fillBase" carries its whole fill, as
+    // hand-written cases do.
+    (composeFill(c, fills)).forEach((range, value) {
       final p = range.split(':');
       final from = hex(p[0]), length = hex(p[1]);
       for (var i = 0; i < length; i++) {

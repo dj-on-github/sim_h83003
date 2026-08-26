@@ -6073,7 +6073,7 @@ static u8 module_hoop_key_ready(u8 look_at_faults)
     }
     if (REG8(0x00114D9FUL) != 0) { (void)link_claim(0x07); return 0x00; }
     if (look_at_faults != 0) {
-        if (module_fault_report(0x81) != 0) return 0x00;
+        if (module_fault_report(0x80) != 0) return 0x00;
         if (module_nothing_to_report() == 0) return 0x00;
     }
     return 0x01;

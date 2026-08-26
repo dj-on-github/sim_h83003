@@ -1,1 +1,8 @@
-bernina_artista180/application/routines.json filter=lfs diff=lfs merge=lfs -text
+# routines.json was put in Git LFS when it was 390 MB, which is past what
+# GitHub takes in a single object. Sharing the fills out (tool/spec_fills.py)
+# brought it to 30 MB, which git stores directly -- about 6 MB compressed,
+# and less again once consecutive versions delta against each other -- so it
+# is an ordinary tracked file from here.
+#
+# The two commits before this one still carry LFS pointers for it, from when
+# it was 390 MB; those objects are fixed history and are pushed once.

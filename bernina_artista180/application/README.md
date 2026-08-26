@@ -4961,6 +4961,190 @@ one of.
 **6,429 cases pass over 777 routines.** app.bin is 196,544 bytes. Six module
 screens are left: `H'15`, `H'14`, `H'13`, `H'12`, `H'11` and `H'09`.
 
+## 34. Screen H'15, where the design sits in the hoop
+
+Twenty-five keys again, but this time every one of the twenty-five has an arm
+of its own and every one can be reached.
+
+| | |
+|---|---|
+| `H'245848` `module_turn_fits` | whether a turn would still fit the hoop |
+| `H'22C24C` `module_hoop_screen` | twenty-five keys |
+| `H'2257A6` `screen_body_15` | the plain lay-out, and the press |
+
+Most of the press is shapes screen H'16 already had. Its value H'0C redraw is
+the same routine byte for byte; the two ways out differ only in the screen
+they go to; the start key is the same twelve steps. The nine keys that move
+the hoop are one helper with the direction as an argument -- H'0E to H'16
+carry H'08, H'01, H'02, H'07, H'09, H'03, H'06, H'05 and H'04, and the middle
+one, which puts the hoop back where it started, is the only one that does not
+count the step. The three size keys move both percentages together instead of
+one each, so the label shows their sum -- which is twice either one, the same
+doubled figure screen H'16 works out with a shift.
+
+### H'245848, the only new routine
+
+Eleven hundred and eighty bytes of floating point that answer one question:
+if the design were turned, would it still be inside the hoop?
+
+The design's width and height come from `H'104CCE` and `H'104D06`, scaled by
+the slot's two percentages. Those give a diagonal and the angle to its
+corner. The rotation to try is either the one the slot holds at `H'11A260` or
+that stepped by an argument -- five degrees a step, minus a hundred and
+eighty, into radians -- and `H'11A25F` turns it back the other way. The
+corner is then swung to each side of the angle and both corners are asked, on
+each axis, to keep clear of `H'11A626`/`H'11A628` by the design's own offset
+in tenths and two millimetres more.
+
+Two of its locals are never written on some paths -- the corner angle when
+the design has no width, and the rotation when the first argument is above
+one -- and the ROM reads whatever the stack held. Both start at nought here,
+the same hole and the same answer as `H'24217A` in part 21, and no caller
+goes to either.
+
+### Two mutations that cannot be killed, and why that is a finding
+
+Twenty-eight mutations on `H'245848`, twenty-six killed. The two that live
+are not gaps in the cases; they are equivalences in the routine, and both
+took an argument to see:
+
+* **`if (f2u(w) != 0) corner = float_atan(h / w);` against `f2u(h)`.** With a
+  width the two agree. With a height of nought the original still takes the
+  branch and `float_atan(0 / w)` is nought, which is what the mutant leaves
+  behind by not taking it. Only a width of nought separates them, and that is
+  the path where the ROM reads the stack.
+* **the mirror byte's test.** Turning the sign of the angle over swaps the
+  two corners: `cos(corner + a)` becomes `cos(corner - a)`, which is
+  `cos(a - corner)`, which is the other corner's. Both corners are tested
+  against the same limits, so the answer cannot change -- only the order in
+  which the four checks fail, which is a step count and not a result.
+
+The first twenty cases killed only fourteen of the twenty-eight. They all
+left the design a long way inside the hoop, where nothing much changes the
+answer. Eleven more, worked out from a model of the routine in Python that
+searched for parameters where each surviving mutation flips the result, took
+it to twenty-six. **A case that exercises a path is not the same as a case
+that can see it go wrong**: the four corner checks needed a design that is
+not square, a rotation that is not nought, and a hoop cut down until one step
+either way turns the answer over.
+
+That model then paid for itself twice. The press's own sweep left the six
+steps the held turn key tries alive -- `module_turn_fits(1, up, 6)` against
+`(1, up, 5)` -- because the six is only visible as a *number* where six
+would not fit and five would; everywhere else the step it goes on to take
+covers for it. The same search found the hoop: a sixty by eighty design in a
+two-hundred square.
+
+### The press's own mutations
+
+Fifty-three mutations, forty-nine killed. Five of the nine that survived the
+first pass were real gaps and closed with seven more cases:
+
+* the two ceilings on the size keys need the byte exactly on the limit on
+  *one* of the pair with the other below it, and a hoop the bigger size still
+  fits -- on both at the limit the second test hides the first;
+* `H'11F299` and `H'11F29A` need the two percentages kept apart before
+  anything can tell which is put by where;
+* the nudge's two bits in `H'11F2A2` need the byte to start with both up,
+  since the fill leaves it at nought and neither setting one nor clearing
+  another shows;
+* the held turn key's six, above.
+
+The four that remain are equivalent mutants, and three of them are one shape:
+
+* the hit test's range widened past the last box, which no value can reach --
+  the same equivalence screens H'4E and H'16 have;
+* the three rotation clamps -- `>= H'06` going down, `<= H'42` and `<= H'47`
+  going up -- each widened by one. At the boundary the step and the clamp
+  produce the same byte: `H'06` less six is nought, which is what the else
+  branch stores, and `H'42` plus six and `H'47` plus one are both `H'48`,
+  which the wrap turns into nought. **A clamp that fires on the value it
+  clamps to cannot be seen from outside**, and this routine has three.
+
+### The arm that cannot be tested from here
+
+Value H'0B calls `H'2431C2` when `H'114DA0` is nought, and that goes on into
+the stitch machinery, which the module screens' fill does not set up: the two
+images part company inside `H'11A67D` and the timers, not in anything the
+press does. All four cases for that key therefore have the talk already
+ended, which is the branch that skips the call. `H'2431C2` has six cases of
+its own under the stitch fill.
+
+**6,595 cases pass over 781 routines.** app.bin is 199,844 bytes -- past
+`H'230300`, so `mergeapp` now hands the rebuilt image everything up to
+`H'230CA3`. Five module screens are left: `H'14`, `H'13`, `H'12`, `H'11` and
+`H'09`.
+
+## 35. The fills shared out
+
+`routines.json` had grown to 391 MB, which is past what GitHub will take in a
+single object, and it grows again with every screen. Nearly all of it was one
+thing: **every case carried its own full copy of a fill it shared with its
+family.**
+
+A fill is a map from `ADDR:LENGTH` to a byte value, and the biggest of them
+runs to 11,716 entries -- the whole of the module screens' furniture. A
+family of cases is built from one of those with a handful of values changed
+on top, and each of the 6,595 cases was storing the lot. The mean case was
+36 KB and the largest 188 KB, against deltas that are usually under ten
+entries.
+
+The numbers said the shape of the fix outright:
+
+| | |
+|---|---|
+| cases with a fill | 6,544 |
+| distinct fills | 4,785 |
+| **distinct *ordered key sequences*** | **1,003** |
+
+Only a thousand distinct key orders across six and a half thousand cases:
+inside a family every case has not merely the same keys but the same keys in
+the same order, and differs only in values. So the file now keeps one base
+fill per distinct key order in a `fills` table, and each case names its base
+and carries only what it overrides:
+
+```json
+"fills": {"f000": {"11A25A:1": "32", ...}, ...},
+"cases": [{"name": "...", "fillBase": "f000", "fill": {"11A25A:1": "64"}}]
+```
+
+A case with no `fillBase` keeps its whole fill, so the hand-written cases
+needed nothing done to them.
+
+| | |
+|---|---|
+| before | 391 MB |
+| compact separators instead of `indent=2` | 241 MB |
+| fills shared out | **30.3 MB** |
+
+### Order is part of the meaning
+
+The one thing that could have gone quietly wrong here is the fill-ordering
+trap from part 17: fills apply **in order**, and an address named twice takes
+the value named last. Composing a case on its base therefore has to give back
+the same *sequence* of pairs, not merely the same set.
+
+Python's `dict.update` and Dart's `Map` both follow the same rule -- a key
+already present keeps its place and takes the new value, a key not present
+goes on the end -- which is the rule the fills were built under in the first
+place, so `compose` is that and nothing more. `tool/spec_fills.py` checks it
+per case while factoring: the base and the overrides put back together must
+equal the original pair list, order included, or that case keeps its fill
+whole. Nothing was quietly changed; the whole spec was reloaded and compared
+equal to the original, all 6,595 cases, before anything was written.
+
+Prefix-chaining the bases against each other was measured and dropped: it
+recovers 4.8 MB of the remaining 28.4 MB and would cost a recursive schema.
+
+### What it cost elsewhere
+
+`composeFill` went into `lib/routine_compare.dart` rather than into the
+comparison tool, because `tool/trace_case.dart` and `tool/trace_writes.dart`
+read `case['fill']` too and would otherwise have traced with only the
+overrides -- silently, and with a fill that reaches nothing. `subspec.py`
+prunes the `fills` table to what its chosen cases name, so a three-case
+mutation spec stays small instead of carrying all thirty megabytes.
+
 ## The tools
 
 Everything the comparison suite needs now lives in `tool/`, run from the
@@ -4973,6 +5157,7 @@ only copy of the thing that can rebuild `routines.json`.
 | `tool/lzwlib.py` | the LZW model the packed-picture cases encode with |
 | `tool/merge_cases.py` | folds those cases into `routines.json` |
 | `tool/subspec.py` | cuts the suite down to one routine's cases by name |
+| `tool/spec_fills.py` | shares the fills out, and puts them back together |
 | `tool/compare_routines.dart` | runs the cases |
 | `tool/mutate.sh` | runs a list of mutations against the chosen cases |
 | `tool/mutate_one.sh`, `tool/mutate_apply.py` | one mutation, and the edit itself |
