@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# The simulated machine's EEPROM contents, written by the EEPROM tab as the
+# firmware puts things in it. Session state, not source.
+eeprom.json

@@ -96,7 +96,23 @@ void queue_put_byte2(u16 rec, u8 v) { REG8(QREC(rec) + 2) = v; }  /* H'228DF8 */
 void queue_put_byte3(u16 rec, u8 v) { REG8(QREC(rec) + 3) = v; }  /* H'228E18 */
 void queue_put_byte5(u16 rec, u8 v) { REG8(QREC(rec) + 5) = v; }  /* H'228E9E */
 void queue_put_byte6(u16 rec, u8 v) { REG8(QREC(rec) + 6) = v; }  /* H'228EDA */
+u8 queue_get_byte5(u16 rec) { return REG8(QREC(rec) + 5); }      /* H'228EBE */
+u8 queue_get_byte6(u16 rec) { return REG8(QREC(rec) + 6); }      /* H'228EFA */
 void queue_put_byte10(u16 rec, u8 v) { REG8(QREC(rec) + 10) = v; } /* H'229054 */
+
+/* The readers that pair with the writers above. Each one is the same shape:
+ * the record's own byte, masked down to the field, and handed back with the
+ * field still in place rather than shifted down to zero -- except H'22902E,
+ * which is the one field wide enough to need shifting. */
+/* H'228D76 */ u8 queue_get_bit6(u16 rec)  { return (u8)(REG8(QREC(rec) + 1) & 0x40); }
+/* H'228DDA */ u8 queue_get_bit7(u16 rec)  { return (u8)(REG8(QREC(rec) + 1) & 0x80); }
+/* H'2290C2 */ u8 queue_get_top3(u16 rec)  { return (u8)(REG8(QREC(rec) + 4) & 0x80); }
+/* H'228F5C */ u8 queue_get_low2(u16 rec)  { return (u8)(REG8(QREC(rec) + 7) & 0x03); }
+/* H'228FC2 */ u8 queue_get_bit3(u16 rec)  { return (u8)(REG8(QREC(rec) + 7) & 0x08); }
+/* H'22902E */ u8 queue_get_high4(u16 rec)
+{
+    return (u8)((u8)(REG8(QREC(rec) + 7) >> 4) & 0x0F);
+}
 
 void queue_put_low6(u16 rec, u8 v)             /* H'228E38: byte 4 bits 0-5 */
 {
@@ -324,6 +340,22 @@ void queue_remove_record(u16 at)
             (u32)(long)(short)(u16)(13 * queue_entry_number_first()),
             0x00, 0x000D);
     queue_number_drop();
+}
+
+/* H'201698. Four of a pattern's parameters read out of the catalogue and
+ * put where the panel and the motors read them. The two that the knobs
+ * drive go through their own setters, which double them on the way in; the
+ * other two are stored as they come. Everything is read with the working
+ * copy *not* consulted, which is what makes this the "as the catalogue has
+ * it" version rather than "as the machine has it now". */
+void pattern_params_publish(u16 n)
+{
+    REG8(0x0011A69EUL) = stitch_param_1(n, 0x00);
+    sew_param_a_set(REG8(0x0011A69EUL));
+    REG8(0x0011A6A0UL) = stitch_param_2(n, 0x00);
+    sew_param_b_set(REG8(0x0011A6A0UL));
+    REG8(0x00FFFEEAUL) = stitch_param_4(n, 0x00);
+    REG8(0x00FFFEECUL) = stitch_param_5(n, 0x00);
 }
 
 /* H'20318C. A pattern taken up: its cached flags cleared down to bit 7, its
@@ -611,7 +643,7 @@ void stitch_working_save(u16 n)
     const u32 work = 0x000E4010UL + (u32)(u16)((u16)(n << 4));
     u8 one = 0x01;
 
-    REG8(0x00114DC7UL) |= 0x20;
+    FLASH_BUSY |= 0x20;
 
     rom_flash_write(&one, dst + 0, 1);
     rom_flash_write((const void *)(work + 0x01), dst + 1, 1);
@@ -624,7 +656,7 @@ void stitch_working_save(u16 n)
     rom_flash_write((const void *)(work + 0x06), dst + 8, 1);
     rom_flash_write((const void *)(work + 0x09), dst + 9, 1);
 
-    REG8(0x00114DC7UL) &= (u8)~0x20;
+    FLASH_BUSY &= (u8)~0x20;
 }
 
 /* H'213164. A run of boxes scrolled on by one entry.
@@ -760,7 +792,7 @@ static u8 queue_screen(u8 screen)
  * up -- that is, while the queue dialog is the thing showing. The first
  * test is on the low byte of the position alone, which is what the original
  * asks for. */
-static u8 picker_may_leave(void)
+u8 picker_may_leave(void)
 {
     if (picker_pos_low() == 0) return 0;
     if (picker_at_start() != 0) return 0;
@@ -1336,5 +1368,684 @@ u8 screen_touch(void)
         default:
             return 0;
         }
+    }
+}
+
+/* H'22B0C6. The entry under the cursor put back to its plain settings.
+ *
+ * Everything the panel can change goes back to nothing -- both mirror
+ * flags, the tie-off, the needle position and the stitch length -- except
+ * the field H'229074 writes, which goes to 4 rather than 0, and the byte at
+ * +H'0A, which is set to 1 for a category H'16 pattern and left alone for
+ * every other kind. The stitch length is then read back out of the
+ * catalogue, so the entry ends up holding what the pattern says rather than
+ * what the operator had made of it.
+ *
+ * The panel and the picture of the entry are drawn again at the end.
+ *
+ * The pattern number is the entry's own plus the offset byte, which is how
+ * a run of entries that share a number are told apart.
+ */
+void queue_entry_reset(void)
+{
+    pattern_params_publish((u16)(
+        queue_entry_offset(REG16(0x0011A1CCUL)) +
+        queue_entry_number(REG16(0x0011A1CCUL))));
+
+    queue_put_bit6(REG16(0x0011A1CCUL), 0x00);
+    queue_put_bit7(REG16(0x0011A1CCUL), 0x00);
+    queue_put_bit3(REG16(0x0011A1CCUL), 0x00);
+    queue_put_low2(REG16(0x0011A1CCUL), 0x00);
+    queue_put_high4(REG16(0x0011A1CCUL), 0x00);
+    queue_put_top3(REG16(0x0011A1CCUL), 0x04);
+
+    if (REG8(ITEM_TABLE + (u32)(long)(short)(u16)
+             (ITEM_STRIDE * queue_entry_number(REG16(0x0011A1CCUL))) +
+             ITEM_CATEGORY) == 0x16) {
+        queue_put_byte10(REG16(0x0011A1CCUL), 0x01);
+    }
+
+    queue_put_byte6(REG16(0x0011A1CCUL), 0x00);
+    queue_put_byte5(REG16(0x0011A1CCUL), 0x00);
+    queue_put_low6(REG16(0x0011A1CCUL), stitch_param_5((u16)(
+        queue_entry_offset(REG16(0x0011A1CCUL)) +
+        queue_entry_number(REG16(0x0011A1CCUL))), 0x00));
+
+    queue_panel_draw(0x0000);
+    picker_preview(0x008C, 0x0023, REG16(0x0011A1CCUL), 0x01);
+}
+
+/* H'222E2C. "Put this back to how it started", which means one of two
+ * things depending on what is showing.
+ *
+ * With the queue dialog up -- H'11A175 -- it is the entry under the cursor
+ * that goes back, and only when the picker will let it: the same three
+ * questions as everywhere else. Otherwise it is the pattern itself, taken
+ * up again from the catalogue with every panel flag put down.
+ *
+ * The second half is H'222F00 almost word for word, minus the needle
+ * picture and the last mask, and with the catalogue read rather than the
+ * flags simply cleared. H'FFFEF9 is anded with H'F0 and then with H'0F,
+ * which can only leave nothing; that is in the original, as it is there.
+ */
+void pattern_reset_current(void)
+{
+    if (REG8(0x0011A175UL) != 0) {
+        if (picker_may_leave()) queue_entry_reset();
+        return;
+    }
+
+    pattern_take_up((u16)(REG16(0x00FFFEE0UL) + REG8(0x00FFFEFDUL)));
+
+    REG8(0x00FFFEF5UL) &= (u8)~0x08;
+    REG8(0x00FFFEF5UL) &= (u8)~0x10;
+    REG8(0x00FFFEF6UL) &= (u8)~0x80;
+    REG8(0x00FFFEF6UL) &= (u8)~0x40;
+    REG8(0x00FFFEF6UL) &= (u8)~0x10;
+    REG8(0x00FFFEF5UL) &= (u8)~0x80;
+    REG8(0x00FFFEF9UL) = (u8)((u8)(REG8(0x00FFFEF9UL) & 0xF0) & 0x0F);
+    REG8(0x00FFFEF5UL) |= 0x04;
+
+    if (REG8(ITEM_TABLE +
+             (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) +
+             ITEM_CATEGORY) == 0x16) {
+        REG8(0x00FFFEFDUL) = 0x00;
+    }
+
+    REG8(0x00FFFEFCUL) = 0x00;
+    REG8(0x00FFFEFBUL) = 0x00;
+    REG8(0x0011A17BUL) = 0x01;
+}
+
+/* ---- the queue's list, edited ------------------------------------------
+ * H'2107D4 to H'210B58, and the press handler in app_body.c that drives
+ * them. Deleting one position from the queue moves three lists at once:
+ * H'11B212, which is what the strip shows; and H'11B11E and H'11B198, which
+ * are the patterns behind it and the slots they are written to.
+ */
+
+/* H'2107D4. What the runs at positions [first] to [last] cost beyond their
+ * own places: each run is queue_run_length long and one of that is the
+ * position itself. */
+u16 queue_run_extra(u16 first, u16 last)
+{
+    u16 total = 0x0000;
+    short at;
+
+    for (at = (short)first; at <= (short)last; at++) {
+        total = (u16)(total + (u16)(queue_run_length(
+            REG16(ITEM_LIST_OUT +
+                  (u32)(long)(short)(u16)((u16)((u16)at << 1)))) - 1));
+    }
+    return total;
+}
+
+/* H'210A22. One pattern's descriptor written over another's.
+ *
+ * The H'18 bytes are read into a frame first and the frame is what the boot
+ * ROM's writer is given -- it cannot read the flash it is programming. */
+void item_descriptor_copy(u16 from, u16 to)
+{
+    u32 rec[6];
+    u32 src = STITCH_TABLE + (u32)(long)(short)(u16)(ITEM_STRIDE * from);
+    u8 n;
+
+    for (n = 0; n < 6; n++) {
+        rec[n] = REG32(src);
+        src += 4;
+    }
+
+    FLASH_BUSY |= 0x20;
+    rom_flash_write(rec,
+                    STITCH_TABLE + (u32)(long)(short)(u16)(ITEM_STRIDE * to),
+                    0x18);
+    FLASH_BUSY &= (u8)~0x20;
+}
+
+/* H'2109AE. The patterns the queue names copied down onto the slots the
+ * display list gives them, descriptor and side records both.
+ *
+ * H'11B11E says which pattern each position is and H'11B198 says where it
+ * is to end up; the run length is set from H'11B11E's own count first, so
+ * that everything downstream agrees about how long the list is. */
+void queue_items_renumber(void)
+{
+    short i;
+
+    item_run_length_set(REG16(ITEM_LIST_IN));
+
+    for (i = 1; i <= (short)REG16(ITEM_LIST_IN); i++) {
+        const u32 o = (u32)(long)(short)(u16)((u16)((u16)i << 1));
+
+        item_descriptor_copy(REG16(ITEM_LIST_IN + o),
+                             REG16(ITEM_LIST_DISPLAY + o));
+        item_records_copy(REG16(ITEM_LIST_IN + o),
+                          REG16(ITEM_LIST_DISPLAY + o));
+    }
+}
+
+/* H'210B58. The position the cursor is on taken out of the queue.
+ *
+ * Position one is the queue itself and cannot go; the answer is zero and
+ * nothing moves. Otherwise the run at that position is measured, the
+ * position comes out of the strip's list, the run's worth of entries comes
+ * out of the two pattern lists at the place the runs before it have pushed
+ * them to, and every slot after that comes back by the run's length.
+ *
+ * The answer is the position, which is where the strip is filled from
+ * again. */
+u16 queue_entry_delete(void)
+{
+    u16 run;
+    short at;
+    short i;
+
+    if ((short)REG16(0x0011A186UL) <= 0x0001) return 0x0000;
+
+    run = queue_run_length(REG16(ITEM_LIST_OUT +
+        (u32)(long)(short)(u16)((u16)(REG16(0x0011A186UL) << 1))));
+
+    at = (short)(REG16(0x0011A186UL) +
+                 queue_run_extra(0x0001, (u16)(REG16(0x0011A186UL) - 1)));
+
+    list_delete((u16 *)ITEM_LIST_OUT, REG16(0x0011A186UL));
+
+    for (i = 1; i <= (short)run; i++) {
+        list_delete((u16 *)ITEM_LIST_IN, (u16)at);
+        list_delete((u16 *)ITEM_LIST_DISPLAY, (u16)at);
+    }
+
+    for (i = at; i <= (short)REG16(ITEM_LIST_DISPLAY); i++) {
+        const u32 o = (u32)(long)(short)(u16)((u16)((u16)i << 1));
+
+        REG16(ITEM_LIST_DISPLAY + o) =
+            (u16)(REG16(ITEM_LIST_DISPLAY + o) - run);
+    }
+
+    return REG16(0x0011A186UL);
+}
+
+/* H'22A570. The three live settings watched while the queue's editing panel
+ * is up, and any change written into the entry the cursor is on.
+ *
+ * [fresh] only takes a copy: H'11F282, H'11F284 and H'11F286 are what the
+ * settings were the last time this looked. After that one change is acted
+ * on per pass -- the width first, then the second parameter, then the first
+ * -- and H'11A184 goes up to say the queue has been altered.
+ *
+ * Nothing is written while the picker will not let the screen go, which is
+ * the same three questions asked everywhere else.
+ */
+void queue_settings_track(u8 fresh)
+{
+    if (fresh != 0) {
+        REG16(0x0011F282UL) = (u16)stitch_width_get();
+        REG16(0x0011F284UL) = (u16)sew_param_b_get();
+        REG16(0x0011F286UL) = (u16)sew_param_a_get();
+        return;
+    }
+
+    if (!picker_may_leave()) return;
+
+    if ((u16)stitch_width_get() != REG16(0x0011F282UL)) {
+        queue_put_mid4(PICK_POS, stitch_width_get());
+        REG16(0x0011F282UL) = (u16)stitch_width_get();
+        REG8(0x0011A184UL) = 0x01;
+        return;
+    }
+
+    if ((u16)sew_param_a_get() != REG16(0x0011F286UL)) {
+        queue_put_byte3(PICK_POS, sew_param_a_get());
+        REG16(0x0011F286UL) = (u16)sew_param_a_get();
+        REG8(0x0011A184UL) = 0x01;
+        return;
+    }
+
+    if ((u16)sew_param_b_get() != REG16(0x0011F284UL)) {
+        queue_put_byte2(PICK_POS, sew_param_b_get());
+        REG16(0x0011F284UL) = (u16)sew_param_b_get();
+        REG8(0x0011A184UL) = 0x01;
+    }
+}
+
+/* H'22AA8C. Screen H'42's press: the queue's editing panel.
+ *
+ * Eleven boxes, dispatched not by a jump table on the box but by a *search*
+ * -- twelve values in a table at H'22AB84, walked until one matches, and the
+ * answer used backwards as the index into a second table. The twelve are the
+ * two arrows, the delete, the two "add a marker" keys, and the six controls
+ * of the panel itself.
+ *
+ * Every one of the six controls asks the same three questions first and puts
+ * up the box's message and does nothing when the answer is no. Four of them
+ * are flags, toggled between zero and their own bit; the other two count
+ * round a ring -- one of four, one of six with the value one skipped.
+ */
+void queue_edit_screen(u8 fresh)
+{
+    u16 value = 0, index = 0;
+
+    if (fresh != 0) {
+        if (STITCH_SET == 0xB4) {
+            hitbox_blit(0x000A, LCD_FRAME_A, 0x0034EB35UL);
+        } else {
+            hitbox_set_state(0x000A, 0x000A, 0x02, 0);
+        }
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        REG8(0x0011F288UL) = 0x01;
+        queue_panel_draw(0x0000);
+    }
+
+    if (REG8(0x0011F288UL) == 0x01) {
+        queue_settings_track(0x01);
+        REG8(0x0011F288UL) = 0x00;
+    } else {
+        queue_settings_track(0x00);
+    }
+
+    if (touch_hit(0x000B, 0x0015, &value, &index) != 0x03) return;
+
+    switch (value) {
+    case 0x0040:                      /* a step back along the queue */
+        message_show_held(index);
+        picker_back(0x0001);
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        queue_panel_draw(0x0000);
+        REG8(0x0011F288UL) = 0x01;
+        break;
+
+    case 0x0041:                      /* and a step on */
+        message_show_held(index);
+        picker_forward(0x0001);
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        queue_panel_draw(0x0000);
+        REG8(0x0011F288UL) = 0x01;
+        break;
+
+    case 0x000E:                      /* this entry taken out */
+        message_show_held(index);
+        queue_delete_entry();
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        queue_panel_draw(0x0000);
+        break;
+
+    case 0x0080:                      /* the two markers, H'3FF and H'3FE */
+        message_show_held(index);
+        REG8(0x0011A1E1UL) = 0x01;
+        if (queue_add_entry(0x03FF, 0x0000) == 0) REG8(0x0011A1E1UL) = 0x00;
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        queue_panel_draw(0x0000);
+        break;
+
+    case 0x0082:
+        message_show_held(index);
+        REG8(0x0011A1E2UL) = 0x01;
+        if (queue_add_entry(0x03FE, 0x0000) == 0) REG8(0x0011A1E2UL) = 0x00;
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x00);
+        queue_panel_draw(0x0000);
+        break;
+
+    case 0x0005:                      /* the first mirror flag */
+        if (!picker_may_leave()) { message_show_held(index); break; }
+        if (pattern_not_16(queue_entry_number(PICK_POS)) != 0) {
+            if (queue_get_bit7(PICK_POS) != 0) queue_put_bit7(PICK_POS, 0x00);
+            else                               queue_put_bit7(PICK_POS, 0x80);
+        } else {
+            if (queue_get_bit6(PICK_POS) != 0) queue_put_bit6(PICK_POS, 0x00);
+            else                               queue_put_bit6(PICK_POS, 0x40);
+        }
+        queue_panel_draw(0x0001);
+        REG8(0x0011A184UL) = 0x01;
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x01);
+        break;
+
+    case 0x0006:                      /* and the second, the other way round */
+        if (!picker_may_leave()) { message_show_held(index); break; }
+        if (pattern_not_16(queue_entry_number(PICK_POS)) != 0) {
+            if (queue_get_bit6(PICK_POS) != 0) queue_put_bit6(PICK_POS, 0x00);
+            else                               queue_put_bit6(PICK_POS, 0x40);
+        } else {
+            if (queue_get_bit7(PICK_POS) != 0) queue_put_bit7(PICK_POS, 0x00);
+            else                               queue_put_bit7(PICK_POS, 0x80);
+        }
+        queue_panel_draw(0x0002);
+        REG8(0x0011A184UL) = 0x01;
+        picker_preview(0x008C, 0x0023, PICK_POS, 0x01);
+        break;
+
+    case 0x0003:                      /* the tie-off flag */
+        if (!picker_may_leave()) { message_show_held(index); break; }
+        if (queue_get_bit3(PICK_POS) != 0) queue_put_bit3(PICK_POS, 0x00);
+        else                               queue_put_bit3(PICK_POS, 0x10);
+        REG8(0x0011A184UL) = 0x01;
+        queue_panel_draw(0x0003);
+        break;
+
+    case 0x000C:                      /* the needle position, one of four */
+        message_show_held(index);
+        if (!picker_may_leave()) break;
+        queue_put_low2(PICK_POS,
+                       (u8)((short)((long)(short)(u16)
+                            ((u16)queue_get_low2(PICK_POS) + 1) % 4)));
+        REG8(0x0011A184UL) = 0x01;
+        queue_panel_draw(0x0004);
+        break;
+
+    case 0x0007:                      /* the stitch length, one of six with
+                                       * the value one left out */
+        message_show_held(index);
+        if (!picker_may_leave()) break;
+        {
+            u8 n = (u8)((short)((long)(short)(u16)
+                        ((u16)queue_get_high4(PICK_POS) + 1) % 6));
+
+            if (n == 0x01) n = 0x02;
+            queue_put_high4(PICK_POS, n);
+        }
+        REG8(0x0011A184UL) = 0x01;
+        queue_panel_draw(0x0005);
+        break;
+
+    case 0x0044:                      /* the box whose meaning the pattern
+                                       * decides: a flag here */
+        if (!picker_may_leave()) { message_show_held(index); break; }
+        if (queue_get_top3(PICK_POS) != 0) queue_put_top3(PICK_POS, 0x00);
+        else                               queue_put_top3(PICK_POS, 0x04);
+        REG8(0x0011A184UL) = 0x01;
+        queue_panel_draw(0x0006);
+        break;
+
+    case 0x0046:                      /* and a count of three there */
+        if (!picker_may_leave()) { message_show_held(index); break; }
+        {
+            const u8 n = (u8)((short)((long)(short)(u16)
+                          ((u16)queue_entry_offset(PICK_POS) + 1) % 3));
+
+            queue_put_byte10(PICK_POS, n);
+            queue_put_params(PICK_POS,
+                             (u16)(queue_entry_number(PICK_POS) + n));
+        }
+        REG8(0x0011A184UL) = 0x01;
+        queue_panel_draw(0x0006);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* H'228E80. The low six bits of a record's fifth byte -- the reader that
+ * pairs with H'228E38. */
+u8 queue_get_low6(u16 rec)
+{
+    return (u8)(REG8(QREC(rec) + 4) & 0x3F);
+}
+
+/* H'2298E4. The boxes of a run given their own numbers, drawn as digits in
+ * the top left of each. The number starts at [start] and counts on.
+ *
+ * The original copies the whole H'12-byte box entry into a frame first and
+ * works from the copy, which changes nothing outside it. */
+void hitbox_numbers_draw(u16 first, u16 last, u16 start)
+{
+    u16 n = start;
+    short i;
+
+    for (i = (short)first; i <= (short)last; i++) {
+        const u32 e = REG32(0x0011B0BAUL) +
+            (u32)(long)(short)(u16)(0x0012 * (u16)i);
+        const u16 bx = REG16(e + 0x00);
+        const u16 by = REG16(e + 0x02);
+        char text[4];
+
+        int_to_decimal((short)n, text);
+        n = (u16)(n + 1);
+        text_draw(text, (u16)(bx + 0x0E), (u16)(by + 0x01),
+                  (u16)(bx + 0x1F), (u16)(by + 0x08), 0x0001, 0x00,
+                  (const u8 *)0x00119DE6UL);
+    }
+}
+
+/* H'22A2BE. A run of boxes marked with whether the range they stand for is
+ * one entry or more. A box already in some state of its own is left alone. */
+void picker_range_mark(u16 first, u16 last, u16 which)
+{
+    u16 w = which;
+    short i;
+
+    if ((short)first < 1) return;
+
+    for (i = (short)first; i <= (short)last; i++, w = (u16)(w + 1)) {
+        if (hitbox_kind((u16)i) != 0) continue;
+
+        if (REG16(0x0011EE80UL + (u32)(long)(short)(u16)((u16)(w << 2))) ==
+            REG16(0x0011EE82UL + (u32)(long)(short)(u16)((u16)(w << 2)))) {
+            hitbox_paint((u16)i, 0x00);
+        } else {
+            hitbox_paint((u16)i, 0x01);
+        }
+    }
+}
+
+/* H'22A33C. One of the ranges closed up: every entry above its first taken
+ * out of the queue, the picker's ends brought back to it, the queue's ranges
+ * written down again and the picker rebuilt. */
+void picker_range_close(u16 box, u16 which)
+{
+    const u32 off = (u32)(long)(short)(u16)((u16)(which << 2));
+    u16 at;
+    short i;
+
+    if (REG16(0x0011EE80UL + off) == REG16(0x0011EE82UL + off)) return;
+
+    at = (u16)(REG16(0x0011EE80UL + off) + 1);
+
+    for (i = (short)at; i <= (short)REG16(0x0011EE82UL + off); i++) {
+        queue_remove_record(at);
+    }
+
+    REG16(0x0011A1D2UL) = REG16(0x0011EE80UL + off);
+    REG16(0x0011A1D0UL) = REG16(0x0011EE80UL + off);
+
+    queue_save_ranges();
+    picker_rebuild(which, 0x00, 0x01);
+    picker_range_mark(box, box, which);
+}
+
+/* H'22A400. The bar across the bottom of the module screens: how full the
+ * machine's own store is, as a percentage of a hundred, drawn from x H'2D to
+ * H'C4 in the back buffer. Anything outside nought to a hundred is left
+ * alone; nought and a hundred are the two ends drawn whole. */
+void percent_bar_draw(void)
+{
+    const float step = 1.5252523f;
+    const float base = 45.0f - 1.5252523f;
+    const u16 raw = (u16)(((u16)REG8(0x00578001UL) << 8) |
+                          (u16)REG8(0x00578000UL));
+    const short n = (short)((long)(short)raw / 10);
+    u16 x;
+
+    if (n < 0) return;
+    if (n > 0x0064) return;
+
+    if (n == 0x0064) {
+        draw_rect(0x002D, 0x0007, 0x00C4, 0x0025, LCD_FRAME_B, 0x02, 0x01);
+        return;
+    }
+
+    if (n == 0) {
+        draw_rect(0x002D, 0x0007, 0x00C4, 0x0025, LCD_FRAME_B, 0x00, 0x01);
+        return;
+    }
+
+    x = (u16)(int)((float)n * step + base + 0.5f);
+    draw_rect(0x002D, 0x0007, x, 0x0025, LCD_FRAME_B, 0x02, 0x01);
+    draw_rect((u16)(x + 1), 0x0007, 0x00C4, 0x0025, LCD_FRAME_B, 0x00, 0x01);
+}
+
+/* H'2299A6. The picker strip five screens share: fifteen numbered boxes with
+ * a page of the queue's ranges in them, two arrows, and the four keys along
+ * the bottom.
+ *
+ * [mode] 1 lays the whole thing out and 2 only puts the two marks back.
+ * H'11A1EC is which range the first box stands for and H'11A1EE which box
+ * the cursor is on; H'11F280 and H'11F281 remember whether each arrow has
+ * been drawn, so that reaching an end blanks one and leaving it puts it
+ * back.
+ *
+ * Paging is by five: H'17 goes back a page and H'18 on a page, and each
+ * scrolls the strip itself with a region copy in both buffers rather than
+ * drawing it again.
+ */
+void picker_strip_screen(u16 mode)
+{
+    u16 value = 0, index = 0;
+
+    if (mode == 0x0001) {
+        REG8(0x0011F280UL) = 0x00;
+        REG8(0x0011F281UL) = 0x01;
+        hitbox_blit(0x0010, LCD_FRAME_A, 0x0034E4A8UL);
+        REG16(0x0011A1EEUL) = 0x0001;
+        REG16(0x0011B3D4UL) = REG16(0x0011A1CEUL);
+        REG8(0x0011A1E4UL) = 0x01;
+
+        REG16(0x0011A1ECUL) = 0x0001;
+        picker_goto(0xFFFF);
+        picker_cursor(0x01);
+        REG16(0x0011A1CEUL) = 0x0001;
+        percent_bar_draw();
+
+        hitbox_numbers_draw(0x0001, 0x000F, REG16(0x0011A1ECUL));
+        picker_range_mark(0x0001, 0x000F, REG16(0x0011A1ECUL));
+        hitbox_set_state(0x0001, 0x0001, 0x01, 0);
+        picker_rebuild(0x0001, 0x00, 0x01);
+        screen_stack_push();
+    } else if (mode == 0x0002) {
+        percent_bar_draw();
+        picker_range_mark(0x0001, 0x000F, REG16(0x0011A1ECUL));
+        hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x00, 0);
+        hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x01, 0);
+    }
+
+    if (REG8(0x0011A1E3UL) != 0) {
+        picker_range_close(REG16(0x0011A1EEUL), REG16(0x0011A1CEUL));
+        REG8(0x0011A1E3UL) = 0x00;
+        percent_bar_draw();
+    }
+
+    if (touch_hit(0x0001, 0x0016, &value, &index) != 0x03) return;
+    if (hitbox_flag(index) != 0) {
+        /* One of the fifteen: the cursor moved to it. */
+        if (hitbox_kind(index) != 0) return;
+
+        hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x00, 0);
+        picker_range_mark(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL),
+                          REG16(0x0011A1CEUL));
+        hitbox_set_state(index, index, 0x01, 0);
+        REG16(0x0011A1EEUL) = index;
+        REG16(0x0011A1CEUL) = (u16)(REG16(0x0011A1ECUL) + index - 1);
+        picker_rebuild(REG16(0x0011A1CEUL), 0x00, 0x01);
+        return;
+    }
+
+    if (value == 0x0017) {
+        /* A page back. */
+        if ((short)REG16(0x0011A1ECUL) < 0x0006) return;
+        message_show_held(index);
+
+        region_copy(0x0008, 0x002C, 0x00C2, 0x0071, 0x0053,
+                    LCD_FRAME_A, LCD_FRAME_A);
+        if ((short)REG16(0x0011A1EEUL) <= 0x000F) {
+            hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x00, 0);
+        }
+        region_copy(0x0008, 0x002C, 0x00C2, 0x0071, 0x0053,
+                    LCD_FRAME_B, LCD_FRAME_B);
+        REG16(0x0011A1EEUL) = (u16)(REG16(0x0011A1EEUL) + 5);
+        if ((short)REG16(0x0011A1EEUL) <= 0x000F) {
+            hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x01, 0);
+        }
+        REG16(0x0011A1ECUL) = (u16)(REG16(0x0011A1ECUL) - 5);
+        hitbox_numbers_draw(0x0001, 0x0005, REG16(0x0011A1ECUL));
+        picker_range_mark(0x0001, 0x0005, REG16(0x0011A1ECUL));
+
+        if ((short)REG16(0x0011A1ECUL) < 0x0006) {
+            REG8(0x0011F280UL) = 0x00;
+            hitbox_blit(0x0010, LCD_FRAME_A, 0x0034E4A8UL);
+        }
+        if (REG8(0x0011F281UL) == 0) {
+            REG8(0x0011F281UL) = 0x01;
+            hitbox_blit(0x0011, LCD_FRAME_A, 0x0034E4E4UL);
+        }
+        return;
+    }
+
+    if (value == 0x0018) {
+        /* And a page on. */
+        if ((short)REG16(0x0011A1ECUL) >= 0x00F1) return;
+        message_show_held(index);
+
+        region_copy(0x0008, 0x0053, 0x00C2, 0x0098, 0x002C,
+                    LCD_FRAME_A, LCD_FRAME_A);
+        if ((short)REG16(0x0011A1EEUL) <= 0x000F) {
+            hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x00, 0);
+        }
+        region_copy(0x0008, 0x0053, 0x00C2, 0x0098, 0x002C,
+                    LCD_FRAME_B, LCD_FRAME_B);
+        REG16(0x0011A1EEUL) = (u16)(REG16(0x0011A1EEUL) - 5);
+        if ((short)REG16(0x0011A1EEUL) <= 0x000F) {
+            hitbox_set_state(REG16(0x0011A1EEUL), REG16(0x0011A1EEUL), 0x01, 0);
+        }
+        REG16(0x0011A1ECUL) = (u16)(REG16(0x0011A1ECUL) + 5);
+        hitbox_numbers_draw(0x000B, 0x000F, (u16)(REG16(0x0011A1ECUL) + 10));
+        picker_range_mark(0x000B, 0x000F, (u16)(REG16(0x0011A1ECUL) + 10));
+
+        if (REG16(0x0011A1ECUL) == 0x00F1) {
+            REG8(0x0011F281UL) = 0x00;
+            hitbox_blit(0x0011, LCD_FRAME_A, 0x0034E520UL);
+        }
+        if (REG8(0x0011F280UL) == 0) {
+            REG8(0x0011F280UL) = 0x01;
+            hitbox_blit(0x0010, LCD_FRAME_A, 0x0034E46CUL);
+        }
+        return;
+    }
+
+    if (value == 0x0040) {
+        if (REG8(0x0011B3D6UL) == 0) return;
+        message_show_held(index);
+        picker_back(0x0001);
+        return;
+    }
+
+    if (value == 0x0041) {
+        if (REG8(0x0011B3D7UL) == 0) return;
+        message_show_held(index);
+        picker_forward(0x0001);
+        return;
+    }
+
+    if (value == 0x000E) {
+        message_show_held(index);
+        dialog_show(0x0002);
+        return;
+    }
+
+    if (value == 0x0019) {
+        screen_stack_pop();
+        message_show_held(index);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        screen_from_slot(0x01);
+        REG8(0x0011B0A9UL) = 0x01;
+        dialog_backdrop_save(0x01);
+        REG8(0x0011A1E4UL) = 0x00;
+        return;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        screen_from_slot(0x01);
+        REG8(0x0011B0A9UL) = 0x01;
     }
 }

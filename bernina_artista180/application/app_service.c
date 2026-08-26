@@ -60,7 +60,6 @@ void machine_init(void)
  * machine running with a blank screen and no module, which is what a stub
  * has to do; nothing else in the loops depends on either one.
  */
-STUB(screen_dispatch, 22382A)
 STUB(embroidery_service, 2354AE)
 
 /* ---- the diagnostics screen -------------------------------------------

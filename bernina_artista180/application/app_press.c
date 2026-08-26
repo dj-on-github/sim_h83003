@@ -330,9 +330,19 @@ void screen_store1_clear(void)
     for (n = 0; n < 0x2580L; n++) { REG16(p) = 0x0000; p += 2; }
 }
 
-/* H'230EA8. The embroidery panel put away into the first store: a box from
- * H'26,H'53 to H'C1,H'EA, and only when H'11F4E6 says there is one. */
+/* H'230EA8 and H'230EF4. The embroidery panel put away into the first store:
+ * a box from H'26,H'53 to H'C1,H'EA, and only when H'11F4E6 says there is
+ * one. The ROM has it twice, byte for byte, the same way it has H'23521E and
+ * H'235230 -- so it is written twice here as well. */
 void embroidery_panel_save(void)
+{
+    if (REG8(0x0011F4E6UL) == 0) return;
+
+    region_copy(0x0026, 0x0053, 0x00C1, 0x00EA, 0x0053,
+                LCD_FRAME_A, 0x000ECB10UL);
+}
+
+void embroidery_panel_save_b(void)
 {
     if (REG8(0x0011F4E6UL) == 0) return;
 

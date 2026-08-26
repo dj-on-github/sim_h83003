@@ -284,6 +284,34 @@ void sew_flag_copy_6(void)
 u8 bus_byte_10(void) { return REG8(0x0E0010UL); }
 u8 bus_byte_11(void) { return REG8(0x0E0011UL); }
 
+/* H'20669A and H'2066CC. The stitch length as the operator sees it.
+ *
+ * H'11A7AC holds it in fifteenths of the machine's own unit and offset by
+ * the block byte at H'0E0010; the screen works in whole units. The two are
+ * the round trip: fifteen-hundredths out with rounding, and back the other
+ * way with the flags that say the pattern has been changed.
+ */
+u8 stitch_length_shown(void)
+{
+    const short scaled =
+        (short)((short)(0x0F * (u16)REG8(0x0011A7ACUL)) + 0x0032);
+
+    return (u8)((u8)((short)scaled / 100) - bus_byte_10());
+}
+
+void stitch_length_choose(u8 shown)
+{
+    const u8 raw = (u8)(shown + bus_byte_10());
+    const short scaled = (short)((short)(0x64 * (u16)raw) + 0x0007);
+
+    REG8(0x0011A7ACUL) = (u8)((u8)((short)scaled / 15) + 0xFE);
+
+    REG8(0x00114DC6UL) |= 0x08;
+    REG8(0x00FFFEFAUL) |= 0x80;
+    REG8(0x00FFFEF7UL) &= (u8)~0x08;
+    REG8(0x00FFFEF5UL) |= 0x40;
+}
+
 /* H'2023BA. The pattern's copy out to the live parameters. */
 void sew_params_publish(void)
 {
@@ -396,6 +424,7 @@ void sew_mode_arbitrate(void)
         REG8(0xFFFEF8UL) = (u8)(v | 0x10);
         if (REG8(0x11A7BDUL) & 0x02) REG8(0x114DCEUL) |= 0x40;
         else                         REG8(0x114DCEUL) &= (u8)~0x40;
+        return;                 /* and not on into the test below */
     }
 
     if (REG8(0x114DCEUL) & 0x40) REG8(0xFFFEF8UL) |=        0x10;

@@ -20,6 +20,7 @@ import 'emb_server.dart';
 import 'flash.dart';
 import 'h8300h.dart';
 import 'hex_files.dart';
+import 'i2c_eeprom.dart';
 import 'itu.dart';
 import 'lcd.dart';
 import 'sci.dart';
@@ -239,6 +240,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   bool _viewTrace = false;
   bool _viewProfile = false;
   bool _viewFlash = false;
+  bool _viewEeprom = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
   /// switches between the tabbed and side-by-side arrangements.
@@ -252,6 +254,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _traceKey = GlobalKey();
   final GlobalKey _profKey = GlobalKey();
   final GlobalKey _flashKey = GlobalKey();
+  final GlobalKey _eepromKey = GlobalKey();
 
   /// SCI tab, host serial bridge. One simulated channel can be joined to a
   /// real port on this machine, so the software that talks to a Bernina can
@@ -312,6 +315,23 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// rather than as the two devices concatenated. Shown in the table.
   bool _flashAddressed = false;
 
+  /// EEPROM tab. The machine keeps its settings in a serial EEPROM on two
+  /// port pins; with the model off those pins are ordinary port bits and
+  /// the firmware's writes go nowhere. The array is kept in a JSON file so
+  /// that what the machine wrote in one session is there in the next.
+  static const String _eepromDefaultFile = 'eeprom.json';
+  final I2cEeprom _eeprom = I2cEeprom();
+  bool _eepromOn = false;
+  final TextEditingController _eepromPathCtl =
+      TextEditingController(text: _eepromDefaultFile);
+  String _eepromStatus = '';
+
+  /// Set when the machine has written and the file has not caught up yet.
+  /// A write arrives from inside CPU execution, so the file is written
+  /// after the fact rather than in the middle of a step.
+  bool _eepromSaving = false;
+  bool _eepromSaveAgain = false;
+
   /// True only when [c] is attached to exactly one scrollable.
   bool _attached(ScrollController c) => c.positions.length == 1;
 
@@ -338,7 +358,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 10, vsync: this);
+    _tab = TabController(length: 11, vsync: this);
     _serialPorts = SerialLink.availablePorts();
     _serialPortLabels = SerialLink.describePorts(_serialPorts);
     _loadDemo();
@@ -391,6 +411,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     unawaited(_detachNetwork());
     _runTimer?.cancel();
     _tab.dispose();
+    _eepromPathCtl.dispose();
     _memScroll.removeListener(_onMemScroll);
     _memScroll.dispose();
     _disasmScroll.dispose();
@@ -1546,6 +1567,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             Tab(text: 'Trace'),
             Tab(text: 'Profile'),
             Tab(text: 'Flash'),
+            Tab(text: 'EEPROM'),
           ],
         ),
         Expanded(
@@ -1569,6 +1591,8 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _profKey, child: _KeepAlive(child: _profileView())),
               KeyedSubtree(
                   key: _flashKey, child: _KeepAlive(child: _flashView())),
+              KeyedSubtree(
+                  key: _eepromKey, child: _KeepAlive(child: _eepromView())),
             ],
           ),
         ),
@@ -1653,6 +1677,13 @@ class _SimulatorPageState extends State<SimulatorPage>
           flex: 1,
           width: null
         ),
+      if (_viewEeprom)
+        (
+          pane: KeyedSubtree(
+              key: _eepromKey, child: _KeepAlive(child: _eepromView())),
+          flex: 1,
+          width: null
+        ),
     ];
     if (entries.isEmpty) {
       return const Center(child: Text('Select a view above'));
@@ -1718,29 +1749,26 @@ class _SimulatorPageState extends State<SimulatorPage>
   }
 
   /// Toggles selecting which views are shown in the wide layout.
+  ///
+  /// A Wrap rather than a Row: there are more views than fit across a narrow
+  /// window, and a second line of toggles is better than a clipped one.
   Widget _viewToggles() {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
+    return Wrap(
+      spacing: 4,
+      runSpacing: 4,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         _viewToggle('MEM', _viewMem, (v) => _viewMem = v),
-        const SizedBox(width: 4),
         _viewToggle('DIS', _viewDis, (v) => _viewDis = v),
-        const SizedBox(width: 4),
         _viewToggle('SCR', _viewScr, (v) => _viewScr = v),
-        const SizedBox(width: 4),
         _viewToggle('SCI', _viewSci, (v) => _viewSci = v),
-        const SizedBox(width: 4),
         _viewToggle('ITU', _viewItu, (v) => _viewItu = v),
-        const SizedBox(width: 4),
         _viewToggle('DMA', _viewDma, (v) => _viewDma = v),
-        const SizedBox(width: 4),
         _viewToggle('IO', _viewIo, (v) => _viewIo = v),
-        const SizedBox(width: 4),
         _viewToggle('TRACE', _viewTrace, (v) => _viewTrace = v),
-        const SizedBox(width: 4),
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
-        const SizedBox(width: 4),
         _viewToggle('FLASH', _viewFlash, (v) => _viewFlash = v),
+        _viewToggle('EEPROM', _viewEeprom, (v) => _viewEeprom = v),
       ],
     );
   }
@@ -1756,7 +1784,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         (_viewIo ? 1 : 0) +
         (_viewTrace ? 1 : 0) +
         (_viewProfile ? 1 : 0) +
-        (_viewFlash ? 1 : 0);
+        (_viewFlash ? 1 : 0) +
+        (_viewEeprom ? 1 : 0);
     return Tooltip(
       message: enabled
           ? 'Show the $label view'
@@ -4465,6 +4494,357 @@ class _SimulatorPageState extends State<SimulatorPage>
           ),
         ),
       );
+
+
+  // ---- the serial EEPROM on port 4 --------------------------------------
+  //
+  // The machine bit-bangs I2C at a small serial EEPROM on two port pins and
+  // keeps its presser-foot calibration there. With the model off those pins
+  // are ordinary port bits and the firmware's writes go nowhere; with it on
+  // the device answers, and the array is kept in a JSON file so that what
+  // one session wrote is there in the next.
+
+  Future<void> _setEepromOn(bool on) async {
+    if (!on) {
+      cpu.detachEeprom();
+      _eeprom.onCommit = null;
+      setState(() {
+        _eepromOn = false;
+        _eepromStatus = 'Off. The two pins are ordinary port bits again, and '
+            'what the machine writes goes nowhere.';
+      });
+      return;
+    }
+    await _loadEepromFile(attach: true);
+  }
+
+  /// Reads the file, and with [attach] puts the device on the bus.
+  ///
+  /// A file that is not there yet is not an error: the array starts blank and
+  /// the file is written the first time the machine puts something in it, so
+  /// a fresh tree needs no setting up. A file that is there but cannot be
+  /// read *is* an error, and stops the model being switched on, because
+  /// carrying on would overwrite it with a blank array on the next write.
+  Future<void> _loadEepromFile({bool attach = false}) async {
+    var path = _eepromPathCtl.text.trim();
+    if (path.isEmpty) {
+      path = _eepromDefaultFile;
+      _eepromPathCtl.text = path;
+    }
+
+    final bytes = await readBytesFromPath(path);
+    String note;
+    if (bytes == null) {
+      _eeprom.data.fillRange(0, _eeprom.size, 0xFF);
+      note = 'No file at "$path" yet. Starting blank; it will be written the '
+          'first time the machine puts something in.';
+    } else {
+      final failure =
+          _eeprom.fromJson(utf8.decode(bytes, allowMalformed: true));
+      if (failure != null) {
+        // The array is left as it was, but the device comes off the bus:
+        // leaving it on with the switch saying off would be a lie, and
+        // leaving it on with a file that cannot be read means the next
+        // write overwrites that file.
+        cpu.detachEeprom();
+        _eeprom.onCommit = null;
+        setState(() {
+          _eepromOn = false;
+          _eepromStatus = 'Could not read "$path": $failure  '
+              'Nothing has been changed.';
+        });
+        return;
+      }
+      note = 'Loaded ${_eeprom.size} bytes from "$path".';
+    }
+
+    if (attach) {
+      cpu.attachEeprom(_eeprom);
+      _eeprom.onCommit = _eepromCommitted;
+      _eeprom.log.clear();
+      _eeprom.writeCount = 0;
+      _eeprom.readCount = 0;
+    }
+    setState(() {
+      if (attach) _eepromOn = true;
+      _eepromStatus = note;
+    });
+  }
+
+  /// The machine has finished a write. This runs from inside a CPU step, so
+  /// it must not touch the widget tree; the file is written after the fact.
+  void _eepromCommitted() => unawaited(_writeEepromFile());
+
+  /// Writes the array out. Overlapping calls collapse into one more pass,
+  /// so a burst of writes cannot start a pile of overlapping file writes.
+  Future<void> _writeEepromFile() async {
+    if (_eepromSaving) {
+      _eepromSaveAgain = true;
+      return;
+    }
+    _eepromSaving = true;
+    try {
+      var again = true;
+      while (again) {
+        again = false;
+        final path = _eepromPathCtl.text.trim();
+        if (path.isEmpty) return;
+        await writeBytesToPath(path, utf8.encode(_eeprom.toJson()));
+        if (_eepromSaveAgain) {
+          _eepromSaveAgain = false;
+          again = true;
+        }
+      }
+    } finally {
+      _eepromSaving = false;
+    }
+  }
+
+  /// Locates the file. As on the flash tab it is the path that is kept, not
+  /// the bytes, so the file can be re-read after something else has changed
+  /// it -- and so the machine's own writes have somewhere to go.
+  Future<void> _pickEepromFile() async {
+    FilePickerResult? picked;
+    try {
+      picked = await FilePicker.pickFiles(type: FileType.any);
+    } catch (e) {
+      _showSnack('Could not open the file picker: $e');
+      return;
+    }
+    if (picked == null || picked.files.isEmpty) return; // cancelled
+
+    final path = picked.files.first.path;
+    if (path == null) {
+      _showSnack('That file has no path this platform can re-read.');
+      return;
+    }
+    _eepromPathCtl.text = path;
+    await _loadEepromFile(attach: _eepromOn);
+  }
+
+  /// Writes the array somewhere new, and keeps that as the file from now on.
+  Future<void> _saveEepromAs() async {
+    final doc = utf8.encode(_eeprom.toJson());
+    try {
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save EEPROM contents',
+        fileName: _eepromDefaultFile,
+        bytes: doc,
+      );
+      if (path == null) {
+        _showSnack('Save cancelled.');
+        return;
+      }
+      await writeBytesToPath(path, doc);
+      _eepromPathCtl.text = path;
+      setState(() => _eepromStatus = 'Wrote ${doc.length} bytes to $path.');
+    } catch (e) {
+      _showSnack('Save failed: $e');
+    }
+  }
+
+  /// Puts every byte back to H'FF, as an unwritten part reads.
+  Future<void> _eraseEeprom() async {
+    _eeprom.data.fillRange(0, _eeprom.size, 0xFF);
+    _eeprom.log.clear();
+    await _writeEepromFile();
+    setState(() => _eepromStatus = 'Erased: every byte back to H\'FF.');
+  }
+
+  static String _h2(int v) =>
+      (v & 0xFF).toRadixString(16).toUpperCase().padLeft(2, '0');
+
+  /// The array as a hex dump with the printable characters beside it.
+  String _eepromDump() {
+    final out = StringBuffer();
+    for (var a = 0; a < _eeprom.size; a += 16) {
+      out.write('${_h2(a)}  ');
+      for (var i = 0; i < 16; i++) {
+        out.write('${_h2(_eeprom.data[a + i])} ');
+        if (i == 7) out.write(' ');
+      }
+      out.write(' ');
+      for (var i = 0; i < 16; i++) {
+        final c = _eeprom.data[a + i];
+        out.write(c >= 0x20 && c < 0x7F ? String.fromCharCode(c) : '.');
+      }
+      if (a + 16 < _eeprom.size) out.writeln();
+    }
+    return out.toString();
+  }
+
+  Widget _eepromView() {
+    final fieldRows = <TableRow>[
+      TableRow(children: [
+        _flashCell('At', bold: true),
+        _flashCell('What it holds', bold: true),
+        _flashCell('Now', bold: true),
+      ]),
+    ];
+    for (final f in I2cEeprom.knownFields) {
+      fieldRows.add(TableRow(children: [
+        _flashCell("H'${_h2(f.address)}"),
+        _flashCell(f.name),
+        _flashCell(f.describe(_eeprom.data[f.address])),
+      ]));
+    }
+
+    final busy = _eeprom.phase != I2cPhase.idle;
+    final activity = _eeprom.log.isEmpty
+        ? 'Nothing on the bus yet.'
+        : _eeprom.log.reversed.map((t) => t.toString()).join('\n');
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Switch(
+              key: const Key('eepromEnableSwitch'),
+              value: _eepromOn,
+              onChanged: (v) => _setEepromOn(v),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _eepromOn
+                    ? 'EEPROM model on: the device answers on P4 bit 7 (SDA) '
+                        'and bit 6 (SCL), and every write is kept in the file '
+                        'below.'
+                    : 'EEPROM model off: both pins are ordinary port bits, '
+                        'and what the machine writes goes nowhere.',
+                style: TextStyle(fontFamily: _font, color: _ink),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                key: const Key('eepromPathField'),
+                controller: _eepromPathCtl,
+                style: TextStyle(fontFamily: _font, color: _ink),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                  labelText: 'EEPROM contents file (JSON)',
+                ),
+                onSubmitted: (_) => _loadEepromFile(attach: _eepromOn),
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              key: const Key('eepromBrowseButton'),
+              onPressed: _pickEepromFile,
+              child: const Text('Browse…'),
+            ),
+          ]),
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            OutlinedButton(
+              key: const Key('eepromReloadButton'),
+              onPressed: () => _loadEepromFile(attach: _eepromOn),
+              child: const Text('Reload'),
+            ),
+            OutlinedButton(
+              key: const Key('eepromSaveButton'),
+              onPressed: _saveEepromAs,
+              child: const Text('Save As…'),
+            ),
+            OutlinedButton(
+              key: const Key('eepromEraseButton'),
+              onPressed: _eraseEeprom,
+              child: const Text('Erase'),
+            ),
+          ]),
+          const SizedBox(height: 12),
+          Text(
+            _eepromStatus.isEmpty
+                ? 'The array lives in a JSON file -- sixteen bytes to a row, '
+                    'hexadecimal, meant to be readable and editable by hand. '
+                    'Switch the model on to load it; the machine\'s own '
+                    'writes are saved back as they happen.'
+                : _eepromStatus,
+            style: TextStyle(fontFamily: _font, color: _inkA(0.75)),
+          ),
+          const SizedBox(height: 16),
+          Text('What the firmware keeps here',
+              style: TextStyle(
+                  fontFamily: _font, color: _ink, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          Table(
+            columnWidths: const {
+              0: IntrinsicColumnWidth(),
+              1: IntrinsicColumnWidth(),
+              2: FlexColumnWidth(),
+            },
+            children: fieldRows,
+          ),
+          const SizedBox(height: 6),
+          for (final f in I2cEeprom.knownFields)
+            Padding(
+              padding: const EdgeInsets.only(left: 10, bottom: 6),
+              child: Text("H'${_h2(f.address)}: ${f.detail}",
+                  style: TextStyle(fontFamily: _font, color: _inkA(0.65))),
+            ),
+          const SizedBox(height: 10),
+          CheckboxListTile(
+            key: const Key('eepromVerifyFriendlyCheck'),
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            value: _eeprom.verifyFriendly,
+            onChanged: (v) =>
+                setState(() => _eeprom.verifyFriendly = v ?? false),
+            title: Text('Leave the address counter on the byte just written',
+                style: TextStyle(fontFamily: _font, color: _ink)),
+            subtitle: Text(
+                "A real part leaves it one further on, so the firmware's "
+                "write-and-verify reads the next byte and its check says no "
+                "-- which is why none of its twelve callers looks at the "
+                "answer. Tick this to make the verify agree instead.",
+                style: TextStyle(fontFamily: _font, color: _inkA(0.65))),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Bus: SCL ${_eeprom.sclHigh ? "high" : "low"}, '
+            'SDA ${_eeprom.sdaHigh ? "high" : "low"}, '
+            '${busy ? _eeprom.phase.name : "idle"}.  '
+            "Address counter H'${_h2(_eeprom.pointer)}.  "
+            '${_eeprom.writeCount} bytes written, '
+            '${_eeprom.readCount} read.',
+            style: TextStyle(fontFamily: _font, color: _inkA(0.75)),
+          ),
+          const SizedBox(height: 16),
+          Text('Contents',
+              style: TextStyle(
+                  fontFamily: _font, color: _ink, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: SelectableText(
+              _eepromDump(),
+              key: const Key('eepromDump'),
+              style: TextStyle(fontFamily: 'monospace', color: _inkA(0.9)),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text('On the bus, newest first',
+              style: TextStyle(
+                  fontFamily: _font, color: _ink, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Text(
+              activity,
+              style: TextStyle(fontFamily: 'monospace', color: _inkA(0.75)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _traceView() {
     return TraceView(

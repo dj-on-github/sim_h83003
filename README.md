@@ -61,6 +61,16 @@ the Artista 180 firmware dumped directly from an Artista 180.
   per `TCR`, compare match against `GRA`/`GRB` with the counter-clear modes,
   overflow, and the three interrupts per channel. External clock inputs
   (TCLKA–TCLKD) are not modelled, so a channel selecting one stays still.
+- **Serial EEPROM** — the artista 180 keeps its settings in a small 24Cxx-
+  style part hung off two port pins, and the firmware bit-bangs I2C at it:
+  SDA on P4 bit 7, SCL on bit 6. There is no I2C controller in the chip, so
+  every edge is a write to the port's data or direction register, and the
+  model answers from the bus side: start and stop conditions, the control
+  byte, the word address, page-buffered writes committed on the stop,
+  current-address and sequential reads, and the acknowledge -- which it
+  gives by pulling SDA down through the same external-pin layer a switch
+  would use, since SDA is open-drain and the CPU's own pull-up holds it up
+  otherwise. Off by default; see the EEPROM view below.
 - **Serial (SCI)** — both channels are simulated (manual section 13):
   registers at `H'FFFFB0`–`H'FFFFB5` and `H'FFFFB8`–`H'FFFFBD`, transmit
   timing derived from `BRR` and the clock select, clear-only status flags,
@@ -128,6 +138,34 @@ the Artista 180 firmware dumped directly from an Artista 180.
   pin are dimmed. Register values are read live from the on-chip register
   addresses (`H'FFFFC5`…`H'FFFFD7`), which a reset initializes to the
   manual's mode 3/4 values.
+- **EEPROM view** — the serial EEPROM on port 4. Switch the model on and the
+  device answers; leave it off and both pins are ordinary port bits, which
+  is how the simulator behaved before this existed.
+
+  The array is kept in a **JSON file**, `eeprom.json` by default, chosen with
+  Browse. It is written back whenever the machine commits a write, so what
+  one session put in is there in the next; it is meant to be read and edited
+  by hand, sixteen bytes to a row in hex, and a flat `{"bytes": {"A9": "3C"}}`
+  map is accepted as well for when only an address or two matters. A file
+  that is not there yet is not an error — the part starts blank and the file
+  appears on the first write — but a file that is there and cannot be parsed
+  stops the model coming on, rather than being overwritten with a blank
+  array.
+
+  The view shows the contents as a hex dump, the addresses the firmware is
+  known to use with what they mean and their values decoded, the live bus
+  state and address counter, and a log of what has gone past. Booting the
+  artista 180 firmware fills it in: `H'A9` and `H'AA` are the two end stops
+  of the presser-foot lift, written from the configuration block in flash at
+  start-up and again by the handwheel trim, which adds `H'28` before storing.
+
+  One thing the log makes plain: each write is followed by a read of the
+  address *after* the one written. The firmware's write-and-verify reads back
+  through the device's own address counter, and a real part leaves that one
+  past the byte just written — so the check compares the wrong byte and says
+  no, which is why none of its twelve callers looks at the answer. There is a
+  tick-box to leave the counter where the verify expects it, for when that
+  matters more than matching the datasheet.
 - **Profile view** — switch the profiler on (top bar), Run, and see the
   hottest data addresses and instructions.
 - **Responsiveness while running** — Run executes in short batches inside a
@@ -207,8 +245,12 @@ distribution, which the app is not aimed at.
 | `lib/itu.dart` | The 16-bit timer unit: five channels, prescalers, compare match |
 | `lib/dmac.dart` | The DMA controller: short and full address modes, activation sources |
 | `lib/adc.dart` | The A/D converter: eight inputs, conversion timing, ADI |
+| `lib/flash.dart` | JEDEC flash devices on the external bus: unlock sequences, program, erase |
+| `lib/i2c_eeprom.dart` | The bit-banged serial EEPROM on port 4, and the JSON file it lives in |
 | `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/screen/IO/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
+| `tool/compare_routines.dart` | Runs every case in a spec: one routine on both images, results and memory compared |
+| `tool/trace_case.dart` | One case's call sequence on both images, with arguments and a watched range, to find where two runs part company |
 | `tool/make_icons.py` | Regenerates the app icon and every platform variant |
 
 ## The icon

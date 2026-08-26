@@ -231,8 +231,9 @@ void port_shadows_init(void)
  * are the pair config_to_eeprom copies into the settings store.
  */
 
-/* The ROM's own strcmp. Returns zero, or the difference of the first pair
- * of bytes that differ, taken unsigned and widened to a signed word. */
+/* H'24AB2A. The ROM's own strcmp. Returns zero, or the difference of the
+ * first pair of bytes that differ, taken unsigned and widened to a signed
+ * word. */
 short str_compare(const char *a, const char *b)
 {
     while (*a == *b) {
@@ -535,4 +536,50 @@ void port_c_init(void)
     P4DDR_SHADOW = v;
 
     port_c_bits_high();
+}
+
+/* H'200D44. One pattern's three side records copied onto another's slot.
+ *
+ * A pattern carries three things besides its descriptor: a four-byte record
+ * at H'57B6D6, a ten-byte one at H'57C6D6 and the sixteen-byte working copy
+ * at H'0E4010. The first two are in flash and go back through the boot
+ * ROM's writer, so they are read into a frame first; the third is ordinary
+ * RAM and is copied straight across.
+ *
+ * H'114DC7 bit 5 is up while the flash is being written, which is what the
+ * millisecond handler looks at to leave the bus alone.
+ *
+ * Every index is multiplied as a word and used without sign extension, so a
+ * pattern number past H'0FFF wraps rather than running off the tables.
+ */
+void item_records_copy(u16 from, u16 to)
+{
+    u32 head;
+    u16 tail[5];
+    u32 at;
+    u8 n;
+
+    head = REG32(0x0057B6D6UL + (u32)(u16)((u16)(from << 2)));
+
+    at = 0x0057C6D6UL + (u32)(u16)((u16)(10 * from));
+    for (n = 0; n < 5; n++) {
+        tail[n] = REG16(at);
+        at += 2;
+    }
+
+    {
+        u32 src = STITCH_WORKING + (u32)(u16)((u16)(from << 4));
+        u32 dst = STITCH_WORKING + (u32)(u16)((u16)(to << 4));
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+    }
+
+    FLASH_BUSY |= 0x20;
+    rom_flash_write(&head, 0x0057B6D6UL + (u32)(u16)((u16)(to << 2)), 4);
+    rom_flash_write(tail, 0x0057C6D6UL + (u32)(u16)((u16)(10 * to)), 0x0A);
+    FLASH_BUSY &= (u8)~0x20;
 }

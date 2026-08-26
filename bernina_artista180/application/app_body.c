@@ -1635,3 +1635,3245 @@ u16 hitbox_list_scroll_back(u16 first, u16 last, u16 step)
     hitbox_redraw_run(first, last);
     return REG16(table + 0x1A);
 }
+
+/* ---- the screen bodies -------------------------------------------------
+ * H'22382A dispatches to one of seventy-one of them through a table of
+ * seventy-nine, and each is the whole of what one screen does on every pass:
+ * lay itself out the first time, then read the panel and keep itself up to
+ * date. They are written here as they are reconstructed.
+ */
+
+/* H'223A50. The sewing screen -- H'02, and H'07 which is the same screen
+ * with the queue's strip beside it.
+ *
+ * Three parts, and the first two only run when something has asked for
+ * them. H'11B0A8 means "just arrived": the four background pictures are
+ * copied out of H'116A1A, every box is put back to plain, the second buffer
+ * is wiped and the background is unpacked into the first, and then the
+ * pattern strip, the four category boxes and the arrows beside them are
+ * filled in. H'11B0A9 means "lay the panel out again", which is the two
+ * bars, the width strip and the six boxes of whichever strip the pattern
+ * calls for.
+ *
+ * The third part runs every pass: the two bars redrawn where they have
+ * moved, the press read, and the four things that keep themselves up to
+ * date given a chance to. A menu key waiting in H'11A170 is dealt with
+ * last, because it changes what the strip is showing.
+ */
+void screen_body_02(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00116A1AUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_FRAME_A);
+
+        hitbox_fill_from_list(0x0001, 0x000F, REG16(0x0011B108UL), MENU_LIST);
+        hitbox_fill_from_list(0x0016, 0x0019, 0x0001, 0x00115A06UL);
+        list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x01);
+        status_bar_refresh(0x01);
+
+        if (REG8(0x0011A174UL) != 0) {
+            pattern_strip_restore(0x07);
+            hitbox_select_current(0x0021, 0x0025);
+        }
+        needle_stop_picture();
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        hitbox_select_current(0x0001, 0x000F);
+
+        panel_strip_choose();
+        hitbox_fill_from_list(0x0010, 0x0015, REG16(0x0011B10CUL),
+                              REG32(0x0011A196UL));
+        panel_strip_draw(0x0010, 0x0015, 0x01);
+
+        if (REG8(0x0011A174UL) != 0) {
+            picker_strip_restore();
+            picker_cursor(0x03);
+            picker_arrows(0x001E, 0x001F, 0x01);
+        }
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+
+    screen_touch();
+
+    panel_strip_draw(0x0010, 0x0015, 0x00);
+    list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x00);
+    if (REG8(0x0011A169UL) == 0x07) picker_arrows(0x001E, 0x001F, 0x00);
+    width_strip_draw(0x00);
+    status_bar_refresh(0x00);
+
+    if (REG8(0x0011A170UL) != 0) menu_repick();
+}
+
+/* H'223CCA. The two menu screens -- H'03, and H'04 which is the same screen
+ * with the queue's strip beside it.
+ *
+ * The same three parts as H'223A50 above, and the same order, but a
+ * different screen: the background comes from H'116FD0, the strip is the
+ * twenty boxes H'01 to H'14 filled from the second menu list rather than
+ * fifteen from the first, the panel is the six boxes H'19 to H'1E, and the
+ * queue's arrows are H'23 and H'24.
+ *
+ * The one thing it does not do is take up a waiting menu key: H'223A50 ends
+ * by calling H'212C60 when H'11A170 is up, and this screen -- which *is* the
+ * menu -- has no strip to re-pick.
+ */
+void screen_body_03(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00116FD0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_FRAME_A);
+
+        hitbox_fill_from_list(0x0001, 0x0014, REG16(0x0011B108UL),
+                              REG32(0x0011B096UL));
+        hitbox_fill_from_list(0x0015, 0x0018, 0x0001, 0x00115A06UL);
+        list_arrows(0x0001, 0x0005, 0x0017, 0x0018, 0x01);
+        status_bar_refresh(0x01);
+
+        if (REG8(0x0011A174UL) != 0) pattern_strip_restore(0x04);
+        needle_stop_picture();
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        hitbox_select_current(0x0001, 0x0014);
+
+        panel_strip_choose();
+        hitbox_fill_from_list(0x0019, 0x001E, REG16(0x0011B10CUL),
+                              REG32(0x0011A196UL));
+        panel_strip_draw(0x0019, 0x001E, 0x01);
+
+        if (REG8(0x0011A174UL) != 0) {
+            picker_strip_restore();
+            picker_cursor(0x03);
+            picker_arrows(0x0023, 0x0024, 0x01);
+        }
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+
+    screen_touch();
+
+    panel_strip_draw(0x0019, 0x001E, 0x00);
+    list_arrows(0x0001, 0x0005, 0x0017, 0x0018, 0x00);
+    if (REG8(0x0011A169UL) == 0x04) picker_arrows(0x0023, 0x0024, 0x00);
+    width_strip_draw(0x00);
+    status_bar_refresh(0x00);
+}
+
+/* ---- the plain screens -------------------------------------------------
+ * The bodies from here down are shorter than the four above: most of them
+ * are a background unpacked once and a press handler run every pass, with
+ * nothing that keeps itself up to date in between.
+ */
+
+/* H'2239EC. Screen H'00, the touch calibration.
+ *
+ * It pushes the screen it came from -- the only way back is through the
+ * calibration finishing -- and it is the one body that unpacks its
+ * background straight into the front buffer and wipes the back one
+ * afterwards, rather than the other way round. There is no lay-out pass:
+ * H'22253E does the whole screen itself.
+ */
+void screen_body_00(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115CDEUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_FRAME_A);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    touch_cal_screen();
+}
+
+/* H'224220 and H'2242E8. The two category menus, H'05 and H'06.
+ *
+ * Both are the same shape: the background is unpacked into the scratch
+ * buffer and the piece of it the four words at H'11B0B2 describe is copied
+ * into the front one, so that a picture larger than its place on the screen
+ * can be cut down to it. The lay-out pass is one call -- the item preview --
+ * and the press is the screen's own handler.
+ */
+static void menu_screen_lay_out(u32 block)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = block;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        item_preview(REG16(0x00FFFEE0UL));
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+}
+
+void screen_body_05(void)
+{
+    menu_screen_lay_out(0x0011705EUL);
+    (void)menu_six_categories();
+}
+
+void screen_body_06(void)
+{
+    menu_screen_lay_out(0x00117146UL);
+    (void)menu_ten_categories();
+}
+
+/* H'2243B0 and H'224478, screens H'25 and H'26: the same again with their
+ * own backgrounds and their own press handlers. */
+void screen_body_25(void)
+{
+    menu_screen_lay_out(0x0011720AUL);
+    menu_category();
+}
+
+void screen_body_26(void)
+{
+    menu_screen_lay_out(0x0011721AUL);
+    (void)menu_five_categories();
+}
+
+/* H'224644, screen H'3E: a message put up and waited on.
+ *
+ * The picture is blitted into the scratch buffer, the same rectangle is
+ * blacked out in the back one, and the piece is copied into the front. It
+ * lowers H'11A179 -- "a message may go up" -- on the way in, so one message
+ * cannot land on top of another, and the wait only runs while H'11A17D is
+ * down.
+ */
+void screen_body_3E(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115D12UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011A179UL) = 0x00;
+    }
+
+    if (REG8(0x0011A17DUL) == 0) message_wait_screen();
+}
+
+/* H'224AC6, screen H'0D: one picture chosen out of seven, with the two bars
+ * beside it.
+ *
+ * The lay-out is the box blacked out first and the picture unpacked into
+ * the scratch buffer afterwards -- the other way round from H'3E above --
+ * and the panel's fresh call is the "everything zeroed" one, H'01 to H'01,
+ * rather than the run the pass itself draws.
+ */
+void screen_body_0D(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00116032UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        item_preview(REG16(0x00FFFEE0UL));
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        hitbox_fill_from_list(0x0009, 0x000A, 0x0001, 0x00115F44UL);
+        width_strip_draw(0x01);
+        panel_strip_draw(0x0001, 0x0001, 0x01);
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+    panel_strip_draw(0x0009, 0x000A, 0x00);
+    width_strip_draw(0x00);
+    picture_choice_screen();
+}
+
+/* H'224C98, screen H'0B: not a screen at all, but a fork.
+ *
+ * The two bits of H'FFFEFA that say which of the two needle-position
+ * settings is in force pick between screens H'0C and H'0D, and the body
+ * does nothing else -- it never draws, and the screen it chooses draws
+ * itself on the next pass. The three rotations and two masks are the
+ * original's own way of reaching bits 6 and 5.
+ */
+void screen_body_0B(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u8 which = REG8(0x00FFFEFAUL);
+        u8 i;
+
+        REG8(0x0011B0A8UL) = 0x00;
+
+        for (i = 0; i < 3; i++) {
+            which = (u8)((u8)(which << 1) | (u8)(which >> 7));
+        }
+        which = (u8)(which & 0x07);
+        which = (u8)(which & 0x03);
+
+        if (which == 0x01) screen_switch(0x0C, 0x01, 0x00);
+        else               screen_switch(0x0D, 0x01, 0x00);
+    }
+}
+
+/* H'224CE2, screen H'0E: one of the four "which screen" menus.
+ *
+ * The picture is not in the block this time -- the block is only the
+ * rectangle and the box table -- and comes from the sixth of the tables the
+ * display bring-up filled in, at +H'04. The one thing it does besides
+ * drawing is grey the first box out on a machine whose stitch data is the
+ * H'AA set rather than the H'B4 one.
+ */
+void screen_body_0E(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x0011609CUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(TABLE_SLOT_6 + 0x04), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        if (STITCH_SET == 0xAA) hitbox_set_state(0x0001, 0x0001, 0x02, 0);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)menu_four_screens();
+}
+
+/* H'224DB4, screen H'0F: twelve boxes filled from the eighth table, with
+ * arrows either side.
+ *
+ * The arrows are drawn fresh on the way in and again every pass, which is
+ * the only reason the lay-out and the pass are not the same code.
+ */
+void screen_body_0F(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x0011658EUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(TABLE_SLOT_6 + 0x08), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        hitbox_fill_from_list(0x0001, 0x000C, 0x0001, TABLE_SLOT_8);
+        list_arrows(0x0001, 0x0003, 0x000D, 0x000F, 0x01);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    list_arrows(0x0001, 0x0003, 0x000D, 0x000F, 0x00);
+    (void)pattern_list_screen();
+}
+
+/* ---- the four "pick one" screens ---------------------------------------
+ * H'2250FA, H'2252B6, H'22536A and H'22541E -- screens H'39, H'3B, H'3C and
+ * H'3D. One shape between them: the block, the picture taken from the table
+ * at H'11B2A6 at an offset of its own, and a press handler of its own that
+ * is called once with H'01 on the way in and once with H'00 every pass.
+ *
+ * H'39 is the one with something extra: two boxes greyed, and greyed again
+ * on the H'AA stitch set -- the second call changes nothing, because the
+ * first has already put them in that state, but it is what the original
+ * does.
+ */
+static void pick_screen_lay_out(u32 block, u16 offset)
+{
+    u32 src = block;
+    u32 dst = 0x0011B0AEUL;
+    u8 n;
+
+    for (n = 4; n != 0; n--) {
+        REG32(dst) = REG32(src);
+        src += 4;
+        dst += 4;
+    }
+
+    hitbox_reset_all();
+    lcd_buffer_fill(LCD_FRAME_B, 0x00);
+    image_load(REG32(REG32(0x0011B2A6UL) + (u32)offset), LCD_SCRATCH);
+    region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+}
+
+void screen_body_39(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        pick_screen_lay_out(0x00116184UL, 0x0004);
+        hitbox_set_state(0x0009, 0x000A, 0x02, 0);
+        if (STITCH_SET == 0xAA) hitbox_set_state(0x0009, 0x000A, 0x02, 0);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)pick_screen_1(0x01);
+    }
+    (void)pick_screen_1(0x00);
+}
+
+void screen_body_3B(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        pick_screen_lay_out(0x001162B2UL, 0x0008);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)pick_screen_2(0x01);
+    }
+    (void)pick_screen_2(0x00);
+}
+
+void screen_body_3C(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        pick_screen_lay_out(0x0011639AUL, 0x000C);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)pick_screen_3(0x01);
+    }
+    (void)pick_screen_3(0x00);
+}
+
+void screen_body_3D(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        pick_screen_lay_out(0x0011644CUL, 0x0010);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)pick_screen_4(0x01);
+    }
+    (void)pick_screen_4(0x00);
+}
+
+/* H'225FFA, screen H'19: the needle-position setting.
+ *
+ * The only body that picks its own picture rather than taking one out of a
+ * block: H'32B7D0 on the H'B4 machine and H'32CDA2 on the other. Both
+ * buffers are wiped first, which none of the others do -- there is no
+ * background to keep.
+ */
+void screen_body_19(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118280UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+
+        if (STITCH_SET == 0xB4) image_load(0x0032B7D0UL, LCD_SCRATCH);
+        else                    image_load(0x0032CDA2UL, LCD_SCRATCH);
+
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        speed_number_draw(0x01);
+        needle_number_draw();
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    speed_number_draw(0x00);
+    (void)needle_pos_screen();
+}
+
+/* H'2260E0 and H'22613A, screens H'1A and H'1B: the pedal test and the one
+ * that only leaves for H'77.
+ *
+ * Neither has a block at all: the picture is a constant and goes straight
+ * into the front buffer, with no rectangle copied out of the scratch one.
+ */
+static void plain_picture_lay_out(u32 picture)
+{
+    lcd_buffer_fill(LCD_FRAME_A, 0x00);
+    lcd_buffer_fill(LCD_FRAME_B, 0x00);
+    image_load(picture, LCD_FRAME_A);
+    speed_number_draw(0x01);
+}
+
+void screen_body_1A(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        plain_picture_lay_out(0x0032E100UL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    speed_number_draw(0x00);
+    (void)pedal_test_screen();
+}
+
+void screen_body_1B(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        plain_picture_lay_out(0x0032E610UL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    speed_number_draw(0x00);
+    (void)screen_only_77();
+}
+
+/* H'22623A, screen H'1D: the display test. Nothing but the back buffer
+ * wiped and the block copied; H'21BBE6 draws the whole thing itself. */
+void screen_body_1D(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x0011823AUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)display_test();
+}
+
+/* H'226282, screen H'1E: the version screen. Both buffers wiped and one
+ * picture blitted at coordinates of its own -- there is no block. */
+void screen_body_1E(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        bitmap_draw(0x000B, 0x0011, 0x0027, 0x0026,
+                    (const u8 *)0x0034C08CUL, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)version_screen();
+}
+
+/* H'226394, screen H'20: moving the hoop. The block's own picture, and the
+ * back buffer wiped after it rather than before. */
+void screen_body_20(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001183C0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)hoop_move_screen();
+}
+
+/* H'2264AE, screen H'22: the demonstration. Two wiped buffers and a step
+ * called once on the way in and once every pass, the same shape as the four
+ * "pick one" screens. */
+void screen_body_22(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)demo_screen_step(0x01);
+    }
+
+    (void)demo_screen_step(0x00);
+}
+
+/* H'2265F4, screen H'4A: four ways out, over a picture from the table at
+ * H'11B2AE. */
+void screen_body_4A(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118536UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(REG32(0x0011B2AEUL) + 0x0C), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)menu_four_ways();
+}
+
+/* H'2266A4, screen H'48: one of the module's choice screens. Its picture is
+ * blitted rather than unpacked -- it is already a bitmap, at +H'50 of the
+ * table at H'11B2A2 -- and the back buffer is blacked out over the same
+ * rectangle rather than wiped whole. */
+void screen_body_48(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118CFEUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    (const u8 *)REG32(REG32(0x0011B2A2UL) + 0x50), LCD_SCRATCH);
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)choice_screen_17A();
+}
+
+/* H'224ECC, screen H'10: twelve boxes and a picture chosen by H'11B0FE.
+ *
+ * The picture is the H'11B0FE'th pointer of the table at H'11B2C6, and its
+ * own header gives its size: it is drawn from H'61, H'BE outwards. A null
+ * pointer there simply leaves that part of the screen alone.
+ */
+void screen_body_10(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00116688UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        hitbox_set_state(0x0001, 0x000C, 0x00, 0);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(TABLE_SLOT_6 + 0x0C), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        if (REG32(TABLE_SLOT_10 +
+                  (u32)(long)(short)(u16)((u16)((u16)REG8(0x0011B0FEUL) << 2)))
+            != 0) {
+            const u32 picture = REG32(TABLE_SLOT_10 +
+                (u32)(long)(short)(u16)((u16)((u16)REG8(0x0011B0FEUL) << 2)));
+
+            bitmap_draw(0x0061, 0x00BE,
+                        (u16)(header_word_0((const u8 *)picture) + 0x0061),
+                        (u16)(header_word_1((const u8 *)picture) + 0x00BE),
+                        (const u8 *)picture, LCD_FRAME_A);
+        }
+
+        if (STITCH_SET == 0xAA) hitbox_set_state(0x000B, 0x000B, 0x02, 0);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)menu_twelve_choice();
+}
+
+/* H'2268A4, H'2269B6, screens H'49 and H'4C: two more of the module's
+ * choice screens, the same shape as H'48 with their own picture and their
+ * own press.
+ *
+ * H'49 is the one that ends two ways: with the module's bit up it goes
+ * through the tail that remembers where the machine is, and without it
+ * through the one that does not. The answer says which -- H'01 for the
+ * ordinary tail. */
+static void module_choice_lay_out(u32 block, u16 offset)
+{
+    u32 src = block;
+    u32 dst = 0x0011B0AEUL;
+    u8 n;
+
+    screen_stack_push();
+
+    for (n = 4; n != 0; n--) {
+        REG32(dst) = REG32(src);
+        src += 4;
+        dst += 4;
+    }
+
+    hitbox_reset_all();
+    bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                (const u8 *)REG32(REG32(0x0011B2A2UL) + (u32)offset),
+                LCD_SCRATCH);
+    draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+              REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+              LCD_FRAME_B, 0x00, 0x01);
+    region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+}
+
+u8 screen_body_49(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        module_choice_lay_out(0x00118D0EUL, 0x0048);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    if (REG8(0x00FFFEC4UL) & 0x01) {
+        (void)menu_embroidery();
+        return 0x01;
+    }
+
+    (void)choice_screen_1E3();
+    return 0x00;
+}
+
+void screen_body_4C(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        module_choice_lay_out(0x00118D1EUL, 0x004C);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)module_menu_screen();
+}
+
+/* H'226AB6 and H'226BA0, screens H'28 and H'29: two settings screens.
+ *
+ * Both wipe the two buffers *after* the picture has gone into the scratch
+ * one rather than before, which is only visible if something else was
+ * already there. H'28 takes a bitmap out of the table at H'11B2B2 and H'29
+ * an unpacked picture out of the one at H'11B2AE.
+ */
+void screen_body_28(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001185A0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    (const u8 *)REG32(REG32(0x0011B2B2UL) + 0x04),
+                    LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)setting_toggle_C7(0x01);
+    }
+
+    (void)setting_toggle_C7(0x00);
+}
+
+void screen_body_29(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001186ACUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(REG32(0x0011B2AEUL) + 0x04), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)beep_settings_screen(0x01);
+    }
+
+    (void)beep_settings_screen(0x00);
+}
+
+/* H'226C64 and H'226F16, screens H'2A and H'2C: the top speed and the foot
+ * pressure.
+ *
+ * Both take their bitmap out of the block itself and both stow the screen
+ * they came from in store H'03 on the way in -- these are the two settings
+ * that can be reached from more than one place.
+ */
+static void setting_screen_lay_out(u32 block)
+{
+    u32 src = block;
+    u32 dst = 0x0011B0AEUL;
+    u8 n;
+
+    for (n = 4; n != 0; n--) {
+        REG32(dst) = REG32(src);
+        src += 4;
+        dst += 4;
+    }
+
+    hitbox_reset_all();
+    bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+    screen_store(0x03, 0x00);
+    draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+              REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+              LCD_FRAME_B, 0x00, 0x01);
+    region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+}
+
+void screen_body_2A(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        setting_screen_lay_out(0x00118728UL);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)max_speed_screen(0x01);
+    }
+
+    (void)max_speed_screen(0x00);
+}
+
+void screen_body_2C(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        setting_screen_lay_out(0x0011880CUL);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)foot_pressure_screen(0x01);
+    }
+
+    (void)foot_pressure_screen(0x00);
+}
+
+/* H'224540, screen H'08: the big packed picture.
+ *
+ * The only screen that both remembers where it came from on the way in and
+ * draws its background with the LZW decoder. The picture goes into the
+ * scratch buffer, the same rectangle is filled black in the back one, and
+ * then the rectangle is copied to the front.
+ */
+void screen_body_08(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115D12UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        sew_picture_box();
+        bitmap_draw_lzw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                        REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                        (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011A179UL) = 0x00;
+    }
+
+    (void)message_wait_screen();
+}
+
+/* H'2251F0, screen H'3A: the other packed picture, and the whole screen of
+ * it -- H'0000 to H'013F across, which is the decoder's straight-run path. */
+void screen_body_3A(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001161B8UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        sew_picture_box();
+        bitmap_draw_lzw(0x0000, 0x0000, 0x013F, 0x00EF,
+                        (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)screen_back_one();
+}
+
+/* H'22711E, screen H'2E: the panel strip chosen. The block's own picture
+ * unpacked into the scratch buffer and the piece of it the four words at
+ * H'11B0B2 describe copied into the front one, with H'21E082 called once on
+ * the way in and once every pass. */
+void screen_body_2E(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118AC8UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        (void)panel_marks_screen(0x01);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)panel_marks_screen(0x00);
+}
+
+/* H'225C30 and H'225DC6, screens H'17 and H'18: the service screens.
+ *
+ * Both have the ordinary block-and-picture lay-out, both fill their boxes
+ * from the same two lists, and both draw the two bars, the width strip, the
+ * ten service marks and the speed number, all with the flag up; then every
+ * pass draws the marks, the number, the strip and the two bars again.
+ *
+ * H'17 is the main menu underneath; H'18 has the pattern strip as well, and
+ * its own press is the one that only answers H'77.
+ */
+void screen_body_17(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001181B0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        (void)hitbox_fill_from_list(0x0010, 0x0015, 0x0001, 0x00115A20UL);
+        (void)hitbox_fill_from_list(0x0016, 0x0017, 0x0001, 0x00115A06UL);
+
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        service_marks_draw(0x01);
+        speed_number_draw(0x01);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    service_marks_draw(0x00);
+    speed_number_draw(0x00);
+    width_strip_draw(0x00);
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+    (void)main_menu_screen();
+}
+
+void screen_body_18(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001181C0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+
+        (void)hitbox_fill_from_list(0x0001, 0x000F, 0x0001, 0x0011A88EUL);
+        (void)hitbox_fill_from_list(0x0010, 0x0015, 0x0001, 0x00115A20UL);
+        (void)hitbox_fill_from_list(0x0016, 0x0019, 0x0001, 0x00115A06UL);
+
+        list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x01);
+        hitbox_select_current(0x0001, 0x000F);
+        panel_strip_draw(0x0010, 0x0015, 0x01);
+
+        width_strip_draw(0x01);
+        service_marks_draw(0x01);
+        speed_number_draw(0x01);
+
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    service_marks_draw(0x00);
+    speed_number_draw(0x00);
+    width_strip_draw(0x00);
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+
+    (void)module_busy_screen();
+    panel_strip_draw(0x0010, 0x0015, 0x00);
+    list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x00);
+}
+
+/* H'227DBE, screen H'42: the queue's editing panel.
+ *
+ * The picture goes into the scratch buffer and the same rectangle -- the top
+ * H'9F rows from x H'5B across -- is blacked out in the back one and copied
+ * to the front. Then the two bars, the width strip, the arrows and the panel
+ * itself, all with their "draw the lot" flag up.
+ *
+ * Every pass after that draws the two bars again without the flag, runs the
+ * panel's press, and draws the arrows and the strip again.
+ */
+void screen_body_42(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00119194UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        draw_rect(0x005B, 0x0000, 0x013F, 0x009E, LCD_FRAME_B, 0x00, 0x01);
+        bitmap_draw(0x005B, 0x0000, 0x013F, 0x009E,
+                    (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(0x005B, 0x0000, 0x013F, 0x009E, 0x0000,
+                    LCD_SCRATCH, LCD_FRAME_A);
+
+        status_bar_refresh(0x01);
+        needle_stop_picture();
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        picker_arrows(0x000C, 0x000D, 0x01);
+        queue_edit_screen(0x01);
+        hitbox_set_state(0x0001, 0x0007, 0x00, 0);
+        hitbox_set_state(0x0001, 0x0007, 0x05, 0);
+        picker_cursor(0x03);
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    (void)screen_touch();
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+    queue_edit_screen(0x00);
+    picker_arrows(0x000C, 0x000D, 0x00);
+    width_strip_draw(0x00);
+    status_bar_refresh(0x00);
+}
+
+/* H'227FC4, screen H'43: the queue as a strip.
+ *
+ * The block's picture goes into the scratch buffer through the ordinary
+ * run-length decoder, the same rectangle is blacked out in the back one so
+ * the cursor has somewhere to be drawn, and the rectangle is copied to the
+ * front. The corners are constants here rather than the block's own.
+ */
+void screen_body_43(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001191ECUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        bitmap_draw(0x000B, 0x0010, 0x0134, 0x00DB,
+                    (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        draw_rect(0x000B, 0x0010, 0x0134, 0x00DB, LCD_FRAME_B, 0x00, 0x01);
+        region_copy(0x000B, 0x0010, 0x0134, 0x00DB, 0x0010,
+                    LCD_SCRATCH, LCD_FRAME_A);
+
+        picker_cursor(0x01);
+        queue_strip_screen(0x01);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) REG8(0x0011B0A9UL) = 0x00;
+
+    queue_strip_screen(0x00);
+}
+
+/* H'2280CA, screens H'46 and H'47: the number keypad.
+ *
+ * The lay-out is the ordinary block-and-picture one, and after it the
+ * keypad's own routine is called once to set the field up. What is extra is
+ * the second flag at H'11B0A9: on H'47, with a queue being built and no
+ * queue edit in progress, the pattern strip is put back and its two arrows
+ * drawn, and every pass after that the arrows are drawn again.
+ */
+void screen_body_46(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00119352UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        number_keypad_screen(0x01);
+
+        if (REG8(0x0011A174UL) != 0 && REG8(0x0011A178UL) == 0) {
+            pattern_strip_restore(0x47);
+        }
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        if (REG8(0x0011A174UL) != 0 && REG8(0x0011A178UL) == 0) {
+            picker_strip_restore();
+            picker_cursor(0x03);
+            picker_arrows(0x000E, 0x000F, 0x01);
+        }
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    (void)screen_touch();
+    number_keypad_screen(0x00);
+
+    if (REG8(0x0011A169UL) == 0x47) picker_arrows(0x000E, 0x000F, 0x00);
+}
+
+/* H'2271CC, screen H'2F: another toggle, with one of two pictures depending
+ * on the stitch set. */
+void screen_body_2F(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118B32UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+
+        if (STITCH_SET == 0xB4) {
+            bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                        REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                        (const u8 *)REG32(REG32(0x0011B2B2UL) + 0x08),
+                        LCD_SCRATCH);
+        } else {
+            bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                        REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                        (const u8 *)REG32(REG32(0x0011B2B2UL) + 0x0C),
+                        LCD_SCRATCH);
+        }
+
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        (void)setting_toggle_C6(0x01);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)setting_toggle_C6(0x00);
+}
+
+/* H'2272F6, screen H'01: the thread trimmer. The same lay-out as the two
+ * settings screens above, with the screen it came from pushed as well. */
+void screen_body_01(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        screen_stack_push();
+        setting_screen_lay_out(0x00118B9CUL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)trim_screen();
+}
+
+/* H'2273FC, screen H'32: three lists to choose between.
+ *
+ * The back buffer is wiped before the picture is unpacked rather than
+ * after, which is the other way round from the other menus, and the second
+ * and third boxes are greyed on the H'AA stitch set.
+ */
+void screen_body_32(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117272UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        if (STITCH_SET == 0xAA) hitbox_set_state(0x0002, 0x0003, 0x02, 0);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        item_preview(REG16(0x00FFFEE0UL));
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    (void)menu_three_lists();
+}
+
+/* H'2274EA, screens H'33, H'34, H'35 and H'36: the four alphabet screens.
+ *
+ * One body for four screens, and it tells them apart three times over: H'35
+ * and H'36 take their list from H'11B09A and the picture at H'300782, H'33
+ * and H'34 from H'11B09E and H'300A47; the pattern strip is put back with
+ * H'36 for the first pair and H'34 for the second; and each pair has its own
+ * "what has been typed" routine, run on the way in, again when the panel is
+ * laid out, and once more every pass.
+ *
+ * H'34 and H'36 are the two with the queue's arrows in the tail.
+ */
+static u8 alphabet_pair_a(void)
+{
+    return (u8)(REG8(0x0011A169UL) >= 0x35 && REG8(0x0011A169UL) <= 0x36);
+}
+
+static u8 alphabet_pair_b(void)
+{
+    return (u8)(REG8(0x0011A169UL) >= 0x33 && REG8(0x0011A169UL) <= 0x34);
+}
+
+void screen_body_33(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x0011749EUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_FRAME_A);
+
+        if (REG8(0x0011A169UL) == 0x35 || REG8(0x0011A169UL) == 0x36) {
+            hitbox_fill_from_list(0x0001, 0x0008, REG16(0x0011B108UL),
+                                  REG32(0x0011B09AUL));
+            bitmap_draw(0x005E, 0x005E, 0x00E8, 0x00C1,
+                        (const u8 *)0x00300782UL, LCD_FRAME_A);
+        } else {
+            hitbox_fill_from_list(0x0001, 0x0008, REG16(0x0011B108UL),
+                                  REG32(0x0011B09EUL));
+            bitmap_draw(0x005E, 0x005E, 0x00E8, 0x00C1,
+                        (const u8 *)0x00300A47UL, LCD_FRAME_A);
+        }
+
+        hitbox_fill_from_list(0x0009, 0x000C, 0x0001, 0x00115A06UL);
+        list_arrows(0x0001, 0x0002, 0x000B, 0x000C, 0x01);
+        hitbox_select_current(0x0001, 0x0008);
+        status_bar_refresh(0x01);
+
+        if (REG8(0x0011A174UL) != 0) {
+            if (REG8(0x0011A169UL) == 0x35 || REG8(0x0011A169UL) == 0x36) {
+                pattern_strip_restore(0x36);
+            }
+            if (REG8(0x0011A169UL) == 0x33 || REG8(0x0011A169UL) == 0x34) {
+                pattern_strip_restore(0x34);
+            }
+            hitbox_select_current(0x0013, 0x0014);
+        }
+
+        needle_stop_picture();
+
+        if (alphabet_pair_a())      (void)stroke_pick_screen_a(0x01);
+        else if (alphabet_pair_b()) (void)stroke_pick_screen_b(0x01);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+
+        panel_strip_choose();
+        hitbox_fill_from_list(0x000D, 0x0012, REG16(0x0011B10CUL),
+                              REG32(0x0011A196UL));
+        panel_strip_draw(0x000D, 0x0012, 0x01);
+        hitbox_select_current(0x0001, 0x0008);
+
+        if (alphabet_pair_a())      (void)stroke_pick_screen_a(0x01);
+        else if (alphabet_pair_b()) (void)stroke_pick_screen_b(0x01);
+
+        if (REG8(0x0011A174UL) != 0) {
+            picker_strip_restore();
+            picker_cursor(0x03);
+            picker_arrows(0x0019, 0x001A, 0x01);
+        }
+
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    list_arrows(0x0001, 0x0002, 0x000B, 0x000C, 0x00);
+
+    if (REG8(0x0011A169UL) == 0x36 || REG8(0x0011A169UL) == 0x34) {
+        picker_arrows(0x0019, 0x001A, 0x00);
+    }
+
+    width_strip_draw(0x00);
+    status_bar_refresh(0x00);
+    screen_touch();
+    panel_strip_draw(0x000D, 0x0012, 0x00);
+
+    if (alphabet_pair_a())      (void)stroke_pick_screen_a(0x00);
+    else if (alphabet_pair_b()) (void)stroke_pick_screen_b(0x00);
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+}
+
+/* H'226194, screen H'1C: the motor test. The back buffer is wiped before
+ * the picture is unpacked rather than after. */
+void screen_body_1C(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118206UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)variant_screen();
+}
+
+/* H'2264EE, screen H'27: the queue's own menu.
+ *
+ * Box H'0B is greyed either way; on the H'AA stitch set box H'06 goes with
+ * it and H'0B is greyed a second time, which changes nothing.
+ */
+void screen_body_27(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001184CCUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(REG32(0x0011B2AEUL) + 0x08), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        hitbox_set_state(0x000B, 0x000B, 0x02, 0);
+        if (STITCH_SET == 0xAA) {
+            hitbox_set_state(0x0006, 0x0006, 0x02, 0);
+            hitbox_set_state(0x000B, 0x000B, 0x02, 0);
+        }
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)settings_menu_screen(0x01);
+    }
+
+    (void)settings_menu_screen(0x00);
+}
+
+/* H'2248F4, screen H'0C: the needle position, with the two bars beside it.
+ *
+ * Almost the same as H'0D above -- the box blacked out, the picture
+ * unpacked into the scratch buffer, the piece copied across, and the item
+ * preview drawn -- but its panel run is H'07 to H'08 rather than H'09 to
+ * H'0A, and the fresh panel call is H'01 to H'01 as it is there.
+ */
+void screen_body_0C(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115F4AUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        item_preview(REG16(0x00FFFEE0UL));
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        hitbox_fill_from_list(0x0007, 0x0008, 0x0001, 0x00115F44UL);
+        width_strip_draw(0x01);
+        panel_strip_draw(0x0001, 0x0001, 0x01);
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+    panel_strip_draw(0x0007, 0x0008, 0x00);
+    width_strip_draw(0x00);
+    (void)needle_choice_screen();
+}
+
+/* H'227942, screen H'4B: another of the module's screens, the plain
+ * block-and-picture shape with its press called once on the way in and once
+ * every pass. */
+void screen_body_4B(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00118CB8UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)module_version_screen(0x01);
+    }
+
+    (void)module_version_screen(0x00);
+}
+
+/* H'2267A4, screen H'4D: the module choice shape again, at +H'58, with the
+ * press that leaves for whatever H'11B11A names. */
+void screen_body_4D(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        module_choice_lay_out(0x00118D2EUL, 0x0058);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    screen_slot_two_screen();
+}
+
+/* H'2279F4, screen H'3F: the length and width of one stitch.
+ *
+ * Two shapes. A group pattern has both numbers and a picture H'BB wide
+ * beside them; anything else has one number and a picture that runs the
+ * whole width. Which it is goes into H'11B0AC, and H'21D88A reads it again
+ * for the number of boxes to hit-test.
+ *
+ * Where the pattern comes from depends on H'11A175: with the queue being
+ * edited it is the record at H'FFFEFE, otherwise the machine's own
+ * H'FFFEE0. The two run their index through the multiply differently -- the
+ * queue's is sign-extended and the machine's is not -- which is faithful
+ * rather than meaningful, since neither can be negative.
+ */
+void screen_body_3F(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src;
+        u32 dst;
+        u8 n;
+
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+
+        if (REG8(0x0011A175UL) != 0) {
+            const u16 at = (u16)queue_entry_offset(REG16(0x00FFFEFEUL));
+            const u16 no = queue_entry_number(REG16(0x00FFFEFEUL));
+
+            REG8(0x0011B0ACUL) = pattern_is_group((u16)(at + no));
+        } else {
+            REG8(0x0011B0ACUL) = (u8)(REG8(0x00FFFEE2UL) & 0x04);
+        }
+
+        src = (REG8(0x0011B0ACUL) != 0) ? 0x00118DCEUL : 0x00118E4AUL;
+        dst = 0x0011B0AEUL;
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        if (REG8(0x0011B0ACUL) != 0) {
+            image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+
+            if (REG8(0x0011A175UL) != 0) {
+                const u16 at = (u16)queue_entry_offset(REG16(0x00FFFEFEUL));
+                const u16 no = queue_entry_number(REG16(0x00FFFEFEUL));
+
+                bitmap_draw(0x0004, 0x0028, 0x00BB, 0x00C7,
+                            (const u8 *)REG32(ITEM_TABLE +
+                                (u32)(long)(short)(u16)(ITEM_STRIDE * (u16)(at + no)) + 0x10),
+                            LCD_SCRATCH);
+            } else {
+                const u16 k = (u16)(REG16(0x00FFFEE0UL) +
+                                    (u16)REG8(0x00FFFEFDUL));
+
+                bitmap_draw(0x0004, 0x0028, 0x00BB, 0x00C7,
+                            (const u8 *)REG32(ITEM_TABLE +
+                                (u32)(u16)(ITEM_STRIDE * k) + 0x10),
+                            LCD_SCRATCH);
+            }
+        } else {
+            image_load(0x0030ADC0UL, LCD_SCRATCH);
+
+            if (REG8(0x0011A175UL) != 0) {
+                bitmap_draw(0x0004, 0x0028, 0x0114, 0x00C7,
+                            (const u8 *)REG32(ITEM_TABLE +
+                                (u32)(long)(short)(u16)(ITEM_STRIDE *
+                                    queue_entry_number(REG16(0x00FFFEFEUL))) + 0x10),
+                            LCD_SCRATCH);
+            } else {
+                bitmap_draw(0x0004, 0x0028, 0x0114, 0x00C7,
+                            (const u8 *)REG32(ITEM_TABLE +
+                                (u32)(u16)(ITEM_STRIDE * REG16(0x00FFFEE0UL)) + 0x10),
+                            LCD_SCRATCH);
+            }
+        }
+
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        hitbox_reset_all();
+        REG8(0x0011B0A8UL) = 0x00;
+        stitch_size_screen(0x01);
+    }
+
+    stitch_size_screen(0x00);
+}
+
+/* H'224846, screen H'0A: the stitch length. The plain block-and-picture
+ * shape, with H'218FCE called once on the way in and once every pass. */
+void screen_body_0A(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115E80UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)stitch_length_screen(0x01);
+    }
+
+    (void)stitch_length_screen(0x00);
+}
+
+/* H'22643A, screen H'21: the module's version. Two wiped buffers, one
+ * picture at coordinates of its own, and the press that draws the text and
+ * waits for the way out. */
+void screen_body_21(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        bitmap_draw(0x0008, 0x0013, 0x0024, 0x0025,
+                    (const u8 *)0x0034C0C9UL, LCD_FRAME_A);
+
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)module_version_press(0x01);
+    }
+
+    (void)module_version_press(0x00);
+}
+
+/* H'22301A. What a press does on the queue's editing screen, H'44.
+ *
+ * Two presses in one. The strip of fifteen boxes the queue is shown in is
+ * only looked at when the screen's leave check says H'03 and hands back
+ * H'77, which is what that strip's press comes back as; anything else falls
+ * through to the three keys beside it, H'26 to H'28.
+ *
+ * On the strip the box pressed is found by the item it carries, the
+ * position the cursor is on is deleted, and the strip is filled again --
+ * from the box pressed when it is past the first, from the page the walk is
+ * on when the first box is a plain one, and from H'11B108 when the search
+ * came back with nothing. The original writes the same six-call tail out
+ * twice, once for each way in; it is written once here.
+ *
+ * The three keys are H'19 -- done, which goes back to H'27 with the cursor
+ * put where the queue's own numbering says -- H'10, which writes the
+ * patterns the list names down onto their slots, and H'0D, which goes to
+ * H'46.
+ */
+void queue_edit_press(void)
+{
+    u16 hit[2];
+
+    if (screen_leave_check(&hit[0], 0x00) == 0x03 && hit[0] == 0x0077) {
+        const u16 box  = hitbox_find(0x0001, 0x000F, REG16(0x00FFFEE0UL), 0x01);
+        const u16 from = queue_entry_delete();
+
+        if (from == 0) return;
+
+        if ((short)box < 0x0001) {
+            hitbox_fill_from_list(0x0001, 0x000F, REG16(0x0011B108UL),
+                                  ITEM_LIST_OUT);
+        } else if ((short)box == 0x0001 && hitbox_kind(0x0002) == 0x02) {
+            hitbox_fill_from_list(0x0001, 0x000F, list_page_start(),
+                                  ITEM_LIST_OUT);
+        } else {
+            hitbox_fill_from_list(box, 0x000F, from, ITEM_LIST_OUT);
+        }
+
+        if ((short)REG16(0x0011A186UL) > (short)REG16(ITEM_LIST_OUT)) {
+            REG16(0x0011A186UL) = (u16)(REG16(0x0011A186UL) - 1);
+        }
+        REG16(0x00FFFEE0UL) = REG16(ITEM_LIST_OUT +
+            (u32)(long)(short)(u16)((u16)(REG16(0x0011A186UL) << 1)));
+        hitbox_select_current(0x0001, 0x000F);
+        return;
+    }
+
+    if (touch_hit(0x0026, 0x0028, &hit[0], &hit[1]) != 0x03) return;
+
+    message_show_held(hit[1]);
+
+    if (hit[0] == 0x0019) {
+        screen_stack_pop();
+        display_init_223010();
+
+        if (REG16(0x00FFFEE0UL) > REG16(ITEM_BASE_INDEX)) {
+            REG16(0x0011A186UL) =
+                (u16)(REG16(0x00FFFEE0UL) - REG16(ITEM_BASE_INDEX));
+        } else {
+            REG16(0x0011A186UL) = 0x0000;
+        }
+
+        screen_switch(0x27, 0x01, 0x00);
+        REG8(0x0011A178UL) = 0x00;
+    } else if (hit[0] == 0x0010) {
+        queue_items_renumber();
+        display_init_223010();
+
+        if (REG16(0x0011A186UL) != 0) {
+            REG16(0x00FFFEE0UL) = REG16(ITEM_LIST_OUT +
+                (u32)(long)(short)(u16)((u16)(REG16(0x0011A186UL) << 1)));
+        }
+    } else if (hit[0] == 0x000D) {
+        screen_switch(0x46, 0x01, 0x00);
+    }
+}
+
+/* H'223F2A. The queue's three screens -- H'30, H'44 and H'45.
+ *
+ * The same three parts again, over the queue's list at H'11B212 rather than
+ * a menu. H'44 is the editing screen and the one that differs: it starts
+ * the strip at the page the walk is on rather than wherever it was, it
+ * pushes the screen it came from and puts up its own three keys, it has no
+ * pattern strip beside it, and its press goes to H'22301A above. H'45 is
+ * the one with the queue's arrows in the tail.
+ */
+void screen_body_30(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00116D0CUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(0x0011B0AEUL), LCD_FRAME_A);
+
+        if (REG8(0x0011A169UL) == 0x44) {
+            REG16(0x0011B10AUL) = list_page_start();
+        }
+
+        hitbox_fill_from_list(0x0001, 0x000F, REG16(0x0011B10AUL),
+                              ITEM_LIST_OUT);
+        hitbox_fill_from_list(0x0016, 0x0019, 0x0001, 0x00115A06UL);
+
+        if (REG8(0x0011A169UL) == 0x44) {
+            screen_stack_push();
+            hitbox_fill_boxed_from_list(0x0026, 0x0028, 0x0001, 0x00116D1CUL);
+        }
+
+        list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x01);
+        status_bar_refresh(0x01);
+
+        if (REG8(0x0011A174UL) != 0 && REG8(0x0011A169UL) != 0x44) {
+            pattern_strip_restore(0x45);
+            hitbox_select_current(0x0021, 0x0025);
+        }
+        needle_stop_picture();
+
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        hitbox_select_current(0x0001, 0x000F);
+
+        panel_strip_choose();
+        hitbox_fill_from_list(0x0010, 0x0015, REG16(0x0011B10CUL),
+                              REG32(0x0011A196UL));
+        panel_strip_draw(0x0010, 0x0015, 0x01);
+
+        if (REG8(0x0011A174UL) != 0 && REG8(0x0011A169UL) != 0x44) {
+            picker_strip_restore();
+            picker_cursor(0x03);
+            picker_arrows(0x001E, 0x001F, 0x01);
+        }
+        REG8(0x0011B0A9UL) = 0x00;
+
+        /* Still inside the lay-out: the "queue is full" message, which
+         * H'210AB2 raises and only this screen puts up. */
+        if (REG8(0x0011A169UL) == 0x44 && REG8(0x0011A18AUL) != 0) {
+            message_show(0x0015);
+            REG8(0x0011A18AUL) = 0x00;
+        }
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+
+    screen_touch();
+    if (REG8(0x0011A169UL) == 0x44) queue_edit_press();
+
+    panel_strip_draw(0x0010, 0x0015, 0x00);
+    list_arrows(0x0001, 0x0005, 0x0018, 0x0019, 0x00);
+    if (REG8(0x0011A169UL) == 0x45) picker_arrows(0x001E, 0x001F, 0x00);
+    width_strip_draw(0x00);
+    status_bar_refresh(0x00);
+}
+
+/* H'227CC6, H'227898 and H'2262EE, screens H'41, H'31 and H'1F: the three
+ * that lay their background out the plain way -- a run-length picture into
+ * the scratch buffer, the back buffer wiped, and the rectangle the block
+ * names copied forward.
+ *
+ * The block is four longs at a fixed address, copied into H'11B0AE first:
+ * the picture, then the three words of the rectangle.
+ */
+static void plain_screen_lay_out(u32 block)
+{
+    u32 src = block;
+    u32 dst = 0x0011B0AEUL;
+    u8 n;
+
+    for (n = 4; n != 0; n--) {
+        REG32(dst) = REG32(src);
+        src += 4;
+        dst += 4;
+    }
+
+    hitbox_reset_all();
+    lcd_buffer_fill(LCD_FRAME_B, 0x00);
+    image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+    region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+}
+
+/* H'227CC6, screen H'41: the picker strip on its own.
+ *
+ * H'11B0A9 is the second flag, set when something else has changed the list
+ * out from under the screen: the strip is laid out again and the cursor put
+ * back, but the background is left alone.
+ */
+void screen_body_41(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        plain_screen_lay_out(0x00118FF8UL);
+        REG8(0x0011B0A8UL) = 0x00;
+        picker_arrows(0x0012, 0x0013, 0x01);
+        picker_strip_screen(0x0001);
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        picker_strip_screen(0x0002);
+        picker_cursor(0x03);
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    picker_strip_screen(0x0003);
+    picker_arrows(0x0012, 0x0013, 0x00);
+}
+
+/* H'227898, screen H'31: the hoop moved by hand. The screen it came from is
+ * pushed, because the way out is back to it. */
+void screen_body_31(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        screen_stack_push();
+        plain_screen_lay_out(0x00118C84UL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)hoop_nudge_screen();
+}
+
+/* H'2262EE, screen H'1F: the module's own settings. The picture is unpacked
+ * before the back buffer is wiped, the other way round from H'41 and H'31 --
+ * the two do not touch the same buffer, so it makes no difference, but it is
+ * what the original does. */
+void screen_body_1F(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001182FCUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    (void)module_settings_screen();
+}
+
+/* H'226D6E, screen H'2B: the three sewing settings with both bars and the
+ * width strip beside them.
+ *
+ * The background comes out of the block as a bitmap, not a run-length
+ * picture, and the screen it came from goes into store H'03 -- the same
+ * shape as H'2A and H'2C, but with the bars, the strip and the preview
+ * drawn over the top, and the flag cleared last rather than first.
+ */
+void screen_body_2B(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        setting_screen_lay_out(0x00118780UL);
+        bar_width((u16)REG8(0x00FFFEE7UL), 0x01, LCD_FRAME_A, 0x03);
+        bar_length((u16)REG8(0x00FFFEE4UL), 0x01, LCD_FRAME_A, 0x03);
+        width_strip_draw(0x01);
+        item_preview(REG16(0x00FFFEE0UL));
+        (void)sew_settings_screen(0x01);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    bar_width((u16)REG8(0x00FFFEE7UL), 0x00, LCD_FRAME_A, 0x03);
+    bar_length((u16)REG8(0x00FFFEE4UL), 0x00, LCD_FRAME_A, 0x03);
+    width_strip_draw(0x00);
+    (void)sew_settings_screen(0x00);
+}
+
+/* H'227020, screen H'2D: the needle stop position. The same bitmap
+ * background as H'2B, without the store and without anything drawn over
+ * it. */
+void screen_body_2D(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001187FCUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        bitmap_draw(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    (const u8 *)REG32(0x0011B0AEUL), LCD_SCRATCH);
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+        (void)needle_position_screen(0x01);
+    }
+
+    (void)needle_position_screen(0x00);
+}
+
+/* H'22382A. What the machine does with a pass: the screen it is on, run.
+ *
+ * The four things that come first are the same whichever screen it is --
+ * the cursor blinked, a parked screen change taken up, a held message given
+ * its time, and the panel read -- and then the screen number picks one of
+ * seventy-one bodies out of a table of seventy-nine.
+ *
+ * Two of those four can end the pass early. A message still being held ends
+ * it without remembering where the machine is; a settled touch with nothing
+ * asked for ends it after remembering. So does a screen number above H'4E,
+ * which the table does not cover.
+ *
+ * Fifty-three screens have their body written so far. The other eighteen fall
+ * through the switch and reach the tail, which is not what
+ * the original does -- it jumps to a body for every screen it knows -- but
+ * is what a partly-written table can do. Each body added takes one more
+ * screen out of the default.
+ */
+void screen_dispatch(void)
+{
+    picker_cursor(0x04);
+    if (REG8(0x0011B29CUL) != 0) screen_restore_pending();
+
+    if (message_hold_done() == 0) return;
+
+    key_scan();
+
+    if (touch_settled() == 0 && REG16(0x0011B10EUL) == 0xFFFF) {
+        REG16(0x0011A17EUL) = REG16(0x0011B10EUL);
+        return;
+    }
+
+    if (REG8(0x0011A16EUL) != 0) {
+        foot_switch_screen();
+        REG8(0x0011A16EUL) = 0x00;
+    }
+
+    screen_request();
+    screen_put_away();
+
+    if (REG8(0x0011A169UL) <= 0x4E) {
+        switch (REG8(0x0011A169UL)) {
+        case 0x02:
+        case 0x07:
+            screen_body_02();
+            break;
+        case 0x03:
+        case 0x04:
+            screen_body_03();
+            break;
+        case 0x30:
+        case 0x44:
+        case 0x45:
+            screen_body_30();
+            break;
+        case 0x00:
+            screen_body_00();
+            break;
+        case 0x05:
+            screen_body_05();
+            break;
+        case 0x06:
+            screen_body_06();
+            break;
+        case 0x25:
+            screen_body_25();
+            break;
+        case 0x26:
+            screen_body_26();
+            break;
+        case 0x3E:
+            screen_body_3E();
+            break;
+        case 0x0D:
+            screen_body_0D();
+            break;
+        case 0x0B:
+            screen_body_0B();
+            break;
+        case 0x0E:
+            screen_body_0E();
+            break;
+        case 0x0F:
+            screen_body_0F();
+            break;
+        case 0x39:
+            screen_body_39();
+            break;
+        case 0x3B:
+            screen_body_3B();
+            break;
+        case 0x3C:
+            screen_body_3C();
+            break;
+        case 0x3D:
+            screen_body_3D();
+            break;
+        case 0x19:
+            screen_body_19();
+            break;
+        case 0x1A:
+            screen_body_1A();
+            break;
+        case 0x1B:
+            screen_body_1B();
+            break;
+        case 0x1D:
+            screen_body_1D();
+            break;
+        case 0x1E:
+            screen_body_1E();
+            break;
+        case 0x20:
+            screen_body_20();
+            break;
+        case 0x22:
+            screen_body_22();
+            break;
+        case 0x4A:
+            screen_body_4A();
+            break;
+        case 0x48:
+            screen_body_48();
+            break;
+        case 0x10:
+            screen_body_10();
+            break;
+        case 0x49:
+            /* The one body with two ways out: zero means the pass ends
+             * without remembering where the machine is. */
+            if (screen_body_49() == 0) return;
+            break;
+        case 0x4C:
+            screen_body_4C();
+            break;
+        case 0x28:
+            screen_body_28();
+            break;
+        case 0x29:
+            screen_body_29();
+            break;
+        case 0x2A:
+            screen_body_2A();
+            break;
+        case 0x08:
+            screen_body_08();
+            break;
+        case 0x2C:
+            screen_body_2C();
+            break;
+        case 0x2B:
+            screen_body_2B();
+            break;
+        case 0x2D:
+            screen_body_2D();
+            break;
+        case 0x1F:
+            screen_body_1F();
+            break;
+        case 0x31:
+            screen_body_31();
+            break;
+        case 0x41:
+            screen_body_41();
+            break;
+        case 0x38:
+            screen_body_38();
+            break;
+        case 0x37:
+            screen_body_37();
+            break;
+        case 0x24:
+            screen_body_24();
+            break;
+        case 0x23:
+            screen_body_23();
+            break;
+        case 0x4E:
+            screen_body_4E();
+            break;
+        case 0x15:
+            screen_body_15();
+            break;
+        case 0x16:
+            screen_body_16();
+            break;
+        case 0x2E:
+            screen_body_2E();
+            break;
+        case 0x3A:
+            screen_body_3A();
+            break;
+        case 0x17:
+            screen_body_17();
+            break;
+        case 0x18:
+            screen_body_18();
+            break;
+        case 0x42:
+            screen_body_42();
+            break;
+        case 0x43:
+            screen_body_43();
+            break;
+        case 0x46:
+        case 0x47:
+            screen_body_46();
+            break;
+        case 0x2F:
+            screen_body_2F();
+            break;
+        case 0x01:
+            screen_body_01();
+            break;
+        case 0x32:
+            screen_body_32();
+            break;
+        case 0x1C:
+            screen_body_1C();
+            break;
+        case 0x27:
+            screen_body_27();
+            break;
+        case 0x0C:
+            screen_body_0C();
+            break;
+        case 0x4B:
+            screen_body_4B();
+            break;
+        case 0x4D:
+            screen_body_4D();
+            break;
+        case 0x3F:
+            screen_body_3F();
+            break;
+        case 0x0A:
+            screen_body_0A();
+            break;
+        case 0x21:
+            screen_body_21();
+            break;
+        case 0x33:
+        case 0x34:
+        case 0x35:
+        case 0x36:
+            screen_body_33();
+            break;
+        case 0x40:
+            break;              /* its table entry *is* the tail */
+        default:
+            break;              /* the other eighteen, not written yet */
+        }
+    }
+
+    REG16(0x0011A17EUL) = REG16(0x0011B10EUL);
+}
+
+/* ---- going to a pattern by its number ---------------------------------
+ * H'212A44, H'21A246, H'24B10A and H'22323A. Screens H'46 and H'47 are the
+ * keypad the operator types a pattern number into; these four are what turns
+ * the typed number into a screen.
+ */
+
+/* H'212A44. Which of the three lists holds the pattern whose *number* --
+ * the word at offset H'14 of its descriptor, not its position -- is
+ * [number], and where in that list it is.
+ *
+ * The three are looked at in turn: the menu list at H'11A88E and then the
+ * two the block pointers at H'11B09A and H'11B09E name. The list that had
+ * it goes back through [which], and the position in it is the answer; zero
+ * and a null pointer mean none of them did.
+ */
+u16 list_holding(u16 number, u32 *which)
+{
+    static const u32 heads[3] = { 0x0011A88EUL, 0x0011B09AUL, 0x0011B09EUL };
+    u8 k;
+
+    for (k = 0; k < 3; k++) {
+        const u32 list = (k == 0) ? heads[0] : REG32(heads[k]);
+        short i;
+
+        for (i = 1; i <= (short)REG16(list); i++) {
+            const u32 entry = ITEM_TABLE +
+                (u32)(long)(short)(u16)((u16)(REG16(list +
+                    (u32)(long)(short)(u16)((u16)((u16)i << 1))) * ITEM_STRIDE));
+
+            if (REG16(entry + 0x14) != number) continue;
+            *which = list;
+            return (u16)i;
+        }
+    }
+
+    *which = 0x00000000UL;
+    return 0x0000;
+}
+
+/* H'21A246. The pattern with that number made current, and the screen that
+ * shows its category gone to. Answers zero when no list has it.
+ *
+ * H'11B108 is which page of five the pattern sits on, counted from the
+ * first of its own category: the difference rounded down to a multiple of
+ * five and put back on. */
+u8 goto_pattern_number(u16 number)
+{
+    u32 list = 0;
+    u16 at = list_holding(number, &list);
+    u16 first;
+    u8 category;
+
+    if (at == 0) return 0x00;
+
+    category = REG8(ITEM_TABLE +
+        (u32)(long)(short)(u16)((u16)(REG16(list +
+            (u32)(long)(short)(u16)((u16)(at << 1))) * ITEM_STRIDE)) +
+        ITEM_CATEGORY);
+
+    first = first_item_of_category(category, list);
+    REG16(0x0011B108UL) =
+        (u16)((u16)((short)((long)(short)(u16)(at - first) / 5) * 5) + first);
+    REG16(0x00FFFEE0UL) =
+        REG16(list + (u32)(long)(short)(u16)((u16)(at << 1)));
+
+    if (category == 0x11)      screen_switch(0x35, 0x01, 0x00);
+    else if (category == 0x10) screen_switch(0x33, 0x01, 0x00);
+    else                       screen_switch(0x02, 0x01, 0x00);
+
+    return 0x01;
+}
+
+/* H'24B10A. The ROM's own strtol, and the only place the character-class
+ * table at H'250783 is used from the application.
+ *
+ * Everything the C library asks of it is here: the leading space skipped,
+ * an optional sign, base zero working the prefix out for itself, "0x"
+ * allowed when the base is sixteen, and a value that would not fit clamped
+ * with H'22 -- ERANGE -- left in H'11F5A6.
+ *
+ * Two details are its own. The class table is indexed by the character
+ * *signed*, so anything above H'7F reads below the table; and [endptr] is
+ * set back to where the string began not only when no digit was found but
+ * also when the value overflowed.
+ */
+#define CTYPE_TABLE   0x00250783UL
+#define CTYPE_UPPER   0x01
+#define CTYPE_ALNUM   0x07
+#define CTYPE_DIGIT   0x04
+#define CTYPE_SPACE   0x08
+
+static u8 char_class(u8 c)
+{
+    return REG8(CTYPE_TABLE + (u32)(long)(short)(signed char)c);
+}
+
+long str_to_long(const char *nptr, const char **endptr, short base)
+{
+    const char *p = nptr;
+    const char *digits;
+    u32 value = 0, acc = 0;
+    char sign;
+
+    while (char_class((u8)*p) & CTYPE_SPACE) p++;
+
+    if (*p == '+' || *p == '-') sign = *p++;
+    else                        sign = '+';
+
+    if ((short)base < 0 || base == 1 || (short)base > 0x24) {
+        if (endptr != 0) *endptr = nptr;
+        return 0;
+    }
+
+    if (base == 0) {
+        if (*p != '0') {
+            base = 10;
+        } else if (p[1] == 'x' || p[1] == 'X') {
+            base = 16;
+            p += 2;
+        } else {
+            base = 8;
+        }
+    } else if (*p == '0' && base == 16 && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+
+    while (*p == '0') p++;
+    digits = p;
+
+    for (;;) {
+        const u8 c = (u8)*p;
+        short d;
+
+        if ((char_class(c) & CTYPE_ALNUM) == 0) break;
+
+        if (char_class(c) & CTYPE_DIGIT) {
+            d = (short)((short)(signed char)c - 0x30);
+        } else if (char_class(c) & CTYPE_UPPER) {
+            d = (short)((short)(signed char)(u8)(c | 0x20) - 0x57);
+        } else {
+            d = (short)((short)(signed char)c - 0x57);
+        }
+
+        if (d >= (short)base) break;
+
+        value = (u32)((long)(short)base * (long)acc) + (u32)(long)d;
+        if (value < acc) { value = 0xFFFFFFFFUL; break; }
+        acc = value;
+        p++;
+    }
+
+    if (endptr != 0) *endptr = (digits == p) ? nptr : p;
+
+    if (value > 0x7FFFFFFFUL) {
+        REG16(0x0011F5A6UL) = 0x0022;
+        value = 0x7FFFFFFFUL;
+        if (endptr != 0) *endptr = nptr;
+        return (sign == '+') ? (long)value : (long)0x80000000UL;
+    }
+
+    return (sign == '+') ? (long)value : -(long)value;
+}
+
+/* The descriptor of a pattern, and the field the keypad draws into. */
+static u32 item_entry(u16 pattern)
+{
+    return ITEM_TABLE +
+        (u32)(long)(short)(u16)((u16)(pattern * ITEM_STRIDE));
+}
+
+static void number_field_draw(void)
+{
+    text_draw((const char *)0x0011A1C2UL, 0x0054, 0x0032, 0x00A1, 0x0043,
+              0x0002, 0x00, (const u8 *)0x0011936EUL);
+}
+
+/* H'22323A. Screens H'46 and H'47: the keypad.
+ *
+ * Thirteen boxes. H'1B to H'24 are the digits -- the value carried is the
+ * digit plus H'15, which is its ASCII code less H'15 again -- H'0E rubs one
+ * out, H'1A leaves, and H'19 is what acts on what was typed. Four digits at
+ * most, and a leading zero is refused because a zero can only be appended
+ * to something that is already there.
+ *
+ * The two screens differ in what H'19 does. On H'47 the number is looked up
+ * and, unless the pattern is one of the three kinds that cannot be queued,
+ * added to the queue; anywhere else it either goes to the pattern's own
+ * screen or, when a queue is being edited, makes room for it in the queue
+ * and goes to H'44.
+ */
+void number_keypad_screen(u8 fresh)
+{
+    char scratch[6];
+    u32 list = 0;
+    const char *rest = 0;
+    u16 value = 0, index = 0;
+    u16 length;
+    u16 number;
+    u8 k;
+
+    for (k = 0; k < 6; k++) scratch[k] = (char)REG8(0x00250770UL + k);
+
+    if (fresh != 0) {
+        screen_stack_push();
+        REG8(0x0011B3CCUL) = REG8(0x00FFFEFDUL);
+        REG8(0x00FFFEFDUL) = 0x00;
+        REG16(0x0011A1BEUL) = 0x0000;
+        (void)str_copy((char *)0x0011A1C2UL, (const char *)0x00250ADFUL);
+        return;
+    }
+
+    cursor_blink(0x00AB, 0x002E);
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return;
+    message_show_held(index);
+
+    length = (u16)str_length((const char *)0x0011A1C2UL);
+
+    if (value == 0x001B) {
+        /* A zero, which only goes on the end of something. */
+        if (length == 0 || (short)length >= 4) return;
+        scratch[0] = (char)(value + 0x15);
+        scratch[1] = 0;
+        (void)str_append((char *)0x0011A1C2UL, scratch);
+        number_field_draw();
+        return;
+    }
+
+    if ((short)value >= 0x001C && (short)value <= 0x0024) {
+        if ((short)length >= 4) return;
+        scratch[0] = (char)(value + 0x15);
+        scratch[1] = 0;
+        (void)str_append((char *)0x0011A1C2UL, scratch);
+        number_field_draw();
+        return;
+    }
+
+    if (value == 0x000E) {
+        /* One rubbed out: the front of the string copied over itself. */
+        if (length == 0) return;
+        (void)str_copy_n(scratch, (const char *)0x0011A1C2UL,
+                         (u32)(long)(short)(u16)(length - 1));
+        (void)str_copy((char *)0x0011A1C2UL, scratch);
+        number_field_draw();
+        return;
+    }
+
+    if (value == 0x001A) {
+        /* The way out, which is not the same one on the two screens. */
+        if (REG8(0x0011A169UL) == 0x47) {
+            dialog_backdrop_save(0x01);
+            screen_stack_pop();
+            if (REG16(0x0011A1BEUL) != 0) {
+                (void)goto_pattern_number(REG16(0x0011A1C0UL));
+            } else {
+                screen_switch(REG8(0x0011B0A5UL), 0x01, 0x00);
+                REG16(0x0011B108UL) = REG16(0x0011B118UL);
+            }
+        } else {
+            screen_stack_pop();
+            if (REG8(0x0011A178UL) != 0) {
+                screen_switch(0x44, 0x01, 0x00);
+            } else {
+                screen_switch(REG8(0x0011B0A5UL), 0x01, 0x00);
+                REG16(0x0011B108UL) = REG16(0x0011B118UL);
+            }
+        }
+        REG8(0x00FFFEFDUL) = REG8(0x0011B3CCUL);
+        return;
+    }
+
+    if (value != 0x0019) return;
+    if (length == 0) return;
+
+    number = (u16)str_to_long((const char *)0x0011A1C2UL, &rest, 0x000A);
+
+    if (REG8(0x0011A169UL) == 0x47) {
+        /* Adding to the queue: three kinds of pattern are refused. */
+        u16 at = list_holding(number, &list);
+        u16 pattern;
+
+        REG16(0x0011A1BEUL) = at;
+        if (at == 0) return;
+
+        REG16(0x0011A1C0UL) = number;
+        REG8(0x0011B3CCUL) = 0x00;
+
+        pattern = REG16(list + (u32)(long)(short)(u16)((u16)(at << 1)));
+        REG16(0x00FFFEE0UL) = pattern;
+
+        if (REG8(item_entry(pattern) + ITEM_CATEGORY) != 0x04 &&
+            REG16(item_entry(pattern) + 0x14) != 0x0016 &&
+            REG16(item_entry(pattern) + 0x14) != 0x0017) {
+            (void)queue_add_entry(pattern, 0x0000);
+        }
+        return;
+    }
+
+    if (REG8(0x0011A178UL) != 0 &&
+        REG8(0x0011A169UL) != 0x44 && REG8(0x0011A169UL) != 0x30) {
+        u16 at = list_holding(number, &list);
+        u8 category;
+
+        REG16(0x0011A1BEUL) = at;
+        category = REG8(item_entry(REG16(list +
+            (u32)(long)(short)(u16)((u16)(at << 1)))) + ITEM_CATEGORY);
+
+        if (category == 0x11 || category == 0x10) {
+            message_show(0x000A);
+            return;
+        }
+
+        if (REG16(0x0011A1BEUL) == 0) return;
+
+        REG16(0x00FFFEE0UL) = REG16(list +
+            (u32)(long)(short)(u16)((u16)(REG16(0x0011A1BEUL) << 1)));
+        screen_stack_pop();
+        queue_make_room(REG16(0x00FFFEE0UL));
+        screen_switch(0x44, 0x01, 0x00);
+        return;
+    }
+
+    if (goto_pattern_number(number) != 0) screen_stack_pop();
+    return;
+}
+
+/* H'21B682. Screen H'18's press, which is nothing of its own: the common
+ * press handler, and then the one way out. */
+u8 module_busy_screen(void)
+{
+    u16 to = 0;
+
+    (void)screen_touch();
+
+    if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
+    if (to != 0x0077) return 0x00;
+
+    REG8(0x00FFFEC5UL) = 0x00;
+    screen_switch(0x17, 0x01, 0x00);
+    return 0x00;
+}
+
+/* H'21CDA4. The screen that edits the three live settings and can put them
+ * back: the three are copied into H'11B37C on the way in, and the way out
+ * either keeps what has been done or writes the copies back over it.
+ *
+ * The hit test is over three boxes, and when it says "nothing" the panel is
+ * asked instead -- so the same keys reach it from the glass or from the
+ * buttons. Keys H'6E and H'6F are handed straight to the panel, which is how
+ * the width strip's two ends work here.
+ */
+u8 sew_settings_screen(u8 fresh)
+{
+    u16 value = 0, index = 0;
+    u8 r;
+
+    if (fresh != 0) {
+        screen_stack_push();
+        REG8(0x0011B37CUL) = sew_param_b_get2();
+        REG8(0x0011B37DUL) = sew_param_a_get2();
+        REG8(0x0011B37EUL) = stitch_width_get2();
+    }
+
+    r = touch_hit(0x0001, 0x0003, &value, &index);
+    if (r == 0x02) r = screen_leave_check(&value, 0x00);
+    if (r != 0x03) return 0x00;
+
+    if (value == 0x007F) {
+        message_show_held(index);
+        sew_param_b_load();
+        sew_param_a_load();
+        stitch_width_load();
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        message_show_held(index);
+        screen_stack_pop();
+        pattern_settings_store();
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if (value == 0x001A) {
+        message_show_held(index);
+        screen_stack_pop();
+        sew_param_b_put(REG8(0x0011B37CUL));
+        sew_param_a_put(REG8(0x0011B37DUL));
+        stitch_width_put(REG8(0x0011B37EUL));
+        screen_switch(0x27, 0x01, 0x00);
+        return 0x00;
+    }
+
+    if ((short)value >= 0x006E && (short)value <= 0x006F) {
+        (void)panel_switch((u8)value, index, 0x01, 0x00);
+    }
+
+    return 0x00;
+}
+
+/* H'21D264. The needle-position screen: a number from H'00 to H'28 with a
+ * bar beside it, taken either from the queue entry the machine is on or from
+ * the live setting, depending on whether the queue dialog is up.
+ *
+ * The limit the mark sits at comes from the pattern itself when the queue is
+ * showing and from H'FFFEED otherwise. H'11B384 is the value being edited and
+ * H'11B385 what it was on the way in, so that H'1A can put it back.
+ */
+u8 needle_position_screen(u8 fresh)
+{
+    u16 value = 0, index = 0;
+    u8 limit;
+
+    if (REG8(0x0011A175UL) != 0) {
+        limit = stitch_param_5(
+            (u16)(queue_entry_number(REG16(0x00FFFEFEUL)) +
+                  queue_entry_offset(REG16(0x00FFFEFEUL))), 0x00);
+    } else {
+        limit = (u8)(REG8(0x00FFFEEDUL) & 0x7F);
+    }
+
+    if (fresh != 0) {
+        screen_stack_push();
+
+        if (REG8(0x0011A175UL) != 0) {
+            const u8 v = queue_get_low6(REG16(0x00FFFEFEUL));
+
+            REG8(0x0011B384UL) = v;
+            REG8(0x0011B385UL) = v;
+        } else {
+            const u8 v = REG8(0x00FFFEECUL);
+
+            REG8(0x0011B384UL) = v;
+            REG8(0x0011B385UL) = v;
+        }
+
+        bar_needle((u16)REG8(0x0011B384UL), (u16)limit, 0x01,
+                   LCD_FRAME_A, 0x02);
+    }
+
+    bar_needle((u16)REG8(0x0011B384UL), (u16)limit, 0x00, LCD_FRAME_A, 0x02);
+
+    if (touch_hit(0x0001, 0x0005, &value, &index) != 0x03) return 0x00;
+    message_show_held(index);
+
+    if (value == 0x0017) {
+        if (REG8(0x0011B384UL) >= 0x28) return 0x00;
+        REG8(0x0011B384UL) = (u8)(REG8(0x0011B384UL) + 1);
+        if (REG8(0x0011A175UL) != 0) {
+            queue_put_low6(REG16(0x00FFFEFEUL), REG8(0x0011B384UL));
+        } else {
+            REG8(0x00FFFEECUL) = REG8(0x0011B384UL);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0018) {
+        if (REG8(0x0011B384UL) == 0) return 0x00;
+        REG8(0x0011B384UL) = (u8)(REG8(0x0011B384UL) - 1);
+        if (REG8(0x0011A175UL) != 0) {
+            queue_put_low6(REG16(0x00FFFEFEUL), REG8(0x0011B384UL));
+        } else {
+            REG8(0x00FFFEECUL) = REG8(0x0011B384UL);
+        }
+        return 0x00;
+    }
+
+    if (value == 0x007F) {
+        REG8(0x0011B384UL) = limit;
+        if (REG8(0x0011A175UL) != 0) {
+            queue_put_low6(REG16(0x00FFFEFEUL), limit);
+        } else {
+            REG8(0x00FFFEECUL) = limit;
+        }
+        return 0x00;
+    }
+
+    if (value == 0x0019) {
+        if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+
+        if (REG8(0x0011A175UL) != 0) {
+            screen_stack_pop();
+            REG8(0x0011A184UL) = 0x01;
+            screen_from_slot(0x01);
+            REG8(0x0011B0A9UL) = 0x01;
+            return 0x00;
+        }
+
+        screen_stack_clear();
+        screen_switch(REG8(0x0011A168UL), 0x01, 0x00);
+        REG16(0x0011B108UL) = REG16(0x0011B110UL);
+        if (REG8(0x00FFFEC4UL) & 0x01) REG8(0x0011A177UL) = 0x01;
+        return 0x00;
+    }
+
+    if (value != 0x001A) return 0x00;
+    if (REG8(0x00114DC6UL) & 0x80) return 0x00;
+
+    screen_stack_pop();
+
+    if (REG8(0x0011A175UL) != 0) {
+        queue_put_low6(REG16(0x00FFFEFEUL), REG8(0x0011B385UL));
+        screen_from_slot(0x01);
+        REG8(0x0011B0A9UL) = 0x01;
+        return 0x00;
+    }
+
+    REG8(0x00FFFEECUL) = REG8(0x0011B385UL);
+
+    if (screen_stack_depth() != 0) {
+        screen_switch(screen_stack_at(screen_stack_depth()), 0x01, 0x00);
+        return 0x00;
+    }
+
+    screen_switch(REG8(0x0011A168UL), 0x01, 0x00);
+    REG16(0x0011B108UL) = REG16(0x0011B110UL);
+    if (REG8(0x00FFFEC4UL) & 0x01) REG8(0x0011A177UL) = 0x01;
+    return 0x00;
+}
+
+/* H'21AC9E. The service screen's ten little marks and its two counters.
+ *
+ * Each mark is one bit of one input port: a three-by-three square filled in
+ * colour three when the bit is up and blacked out when it is down, and only
+ * drawn when it has changed. The ten remembered values are the words from
+ * H'11B342 up, and [fresh] puts them all to H'FFFF so that the whole lot is
+ * drawn again.
+ *
+ * The tenth is only looked at while H'FFFEC5 is zero. The two counters below
+ * are longwords in the settings window: the first shown in minutes, the
+ * second as it stands, and each remembered one higher than it is so that the
+ * first pass always draws them.
+ */
+static void service_mark(u32 seen, u16 now, u16 x0, u16 y0, u16 x1, u16 y1)
+{
+    if (REG16(seen) == now) return;
+
+    draw_rect(x0, y0, x1, y1, LCD_FRAME_A,
+              (u8)(now != 0 ? 0x03 : 0x00), 0x01);
+    REG16(seen) = now;
+}
+
+void service_marks_draw(u8 fresh)
+{
+    char text[12];
+
+    if (fresh != 0) {
+        REG16(0x0011B354UL) = 0xFFFF;
+        REG16(0x0011B352UL) = 0xFFFF;
+        REG16(0x0011B350UL) = 0xFFFF;
+        REG16(0x0011B34EUL) = 0xFFFF;
+        REG16(0x0011B34CUL) = 0xFFFF;
+        REG16(0x0011B34AUL) = 0xFFFF;
+        REG16(0x0011B348UL) = 0xFFFF;
+        REG16(0x0011B346UL) = 0xFFFF;
+        REG16(0x0011B344UL) = 0xFFFF;
+        REG16(0x0011B342UL) = 0xFFFF;
+        REG32(0x0011B356UL) = REG32(0x0057FF82UL) + 1;
+        REG32(0x0011B35AUL) = REG32(0x0057FF86UL) + 1;
+    }
+
+    service_mark(0x0011B342UL, (u16)(u8)(REG8(0x00FFFEC0UL) & 0x04),
+                 0x0005, 0x0018, 0x0007, 0x001A);
+    service_mark(0x0011B344UL, (u16)(u8)(REG8(0x00FFFEC0UL) & 0x02),
+                 0x0016, 0x0018, 0x0018, 0x001A);
+    service_mark(0x0011B346UL, (u16)(u8)(REG8(0x00FFFEC0UL) & 0x01),
+                 0x0027, 0x0018, 0x0029, 0x001A);
+    service_mark(0x0011B348UL, (u16)(u8)(REG8(0x00FFFEF8UL) & 0x04),
+                 0x0034, 0x0018, 0x0036, 0x001A);
+    service_mark(0x0011B34AUL, (u16)(u8)(REG8(0x00FFFEF8UL) & 0x08),
+                 0x0048, 0x0018, 0x004A, 0x001A);
+    service_mark(0x0011B34CUL, (u16)(u8)(REG8(0x00FFFEC1UL) & 0x02),
+                 0x0057, 0x0023, 0x0059, 0x0025);
+    service_mark(0x0011B34EUL, (u16)(u8)(REG8(0x00FFFEC7UL) & 0x01),
+                 0x006E, 0x0023, 0x0070, 0x0025);
+    service_mark(0x0011B350UL, (u16)(u8)(REG8(0x00FFFEC1UL) & 0x08),
+                 0x009B, 0x0023, 0x009D, 0x0025);
+    service_mark(0x0011B352UL, (u16)(u8)(REG8(0x00FFFEC1UL) & 0x04),
+                 0x00B0, 0x0023, 0x00B2, 0x0025);
+
+    if (REG8(0x00FFFEC5UL) != 0) return;
+
+    service_mark(0x0011B354UL, (u16)(u8)(REG8(0x00FFFEC4UL) & 0x10),
+                 0x011E, 0x00A5, 0x0120, 0x00A7);
+
+    if (REG32(0x0011B356UL) != REG32(0x0057FF82UL)) {
+        REG32(0x0011B356UL) = REG32(0x0057FF82UL);
+        long_to_decimal(REG32(0x0057FF82UL) / 0x3C, text);
+        text_draw(text, 0x00F0, 0x009B, 0x0108, 0x00A3, 0x0001, 0x02,
+                  (const u8 *)0x00119A66UL);
+    }
+
+    if (REG32(0x0011B35AUL) != REG32(0x0057FF86UL)) {
+        REG32(0x0011B35AUL) = REG32(0x0057FF86UL);
+        long_to_decimal(REG32(0x0057FF86UL), text);
+        text_draw(text, 0x0100, 0x00B9, 0x0130, 0x00C1, 0x0001, 0x02,
+                  (const u8 *)0x00119A66UL);
+    }
+}
+
+/* H'225B8A, screen H'38: the module's pattern list.
+ *
+ * The same plain lay-out as H'1F -- the picture unpacked before the back
+ * buffer is wiped -- and then the whole of the screen is H'2309EC.
+ */
+void screen_body_38(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117FF0UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_pattern_screen();
+}
+
+/* H'225AE4, screen H'37: the module sewing screen.
+ *
+ * The same plain lay-out as H'1F and H'38, with the block at H'117E54, and
+ * then the whole of the screen is H'23078A.
+ */
+void screen_body_37(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117E54UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_sew_screen();
+}
+
+
+/* H'225A3E, screen H'24: the design turned and mirrored.
+ *
+ * The same plain lay-out as H'1F, H'37 and H'38, with the block at
+ * H'117CB8, and then the whole of the screen is H'230110.
+ */
+void screen_body_24(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117CB8UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_turn_screen();
+}
+
+/* H'225998, screen H'23: the module's sewing panel.
+ *
+ * The same plain lay-out as H'1F, H'24, H'37 and H'38, with the block at
+ * H'117C60, and then the whole of the screen is H'22F962.
+ */
+void screen_body_23(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117C60UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_panel_screen();
+}
+
+/* H'2258F2, screen H'4E: the screen behind box ten of the sewing panel.
+ *
+ * The same plain lay-out as H'1F, H'23, H'24, H'37 and H'38, with the block
+ * at H'1177D4, and then H'22F82A -- which does nothing at all.
+ */
+void screen_body_4E(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001177D4UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_extra_screen();
+}
+
+/* H'22584C, screen H'16: the module's size and speed settings.
+ *
+ * The same plain lay-out as the rest of the cluster, with the block at
+ * H'117B78, and then the whole of the screen is H'22DBFA.
+ */
+void screen_body_16(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117B78UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_sizes_screen();
+}
+
+/* H'2257A6, screen H'15: where the design sits in the hoop.
+ *
+ * The same plain lay-out as the rest of the cluster, with the block at
+ * H'1179CA, and then the whole of the screen is H'22C24C.
+ */
+void screen_body_15(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001179CAUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_hoop_screen();
+}

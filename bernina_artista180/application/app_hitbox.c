@@ -261,6 +261,31 @@ u8 hitbox_kind(u16 index)
     return REG8(hitbox_at(index) + 0x10);
 }
 
+/* H'2114B0 and H'2114E8. Two questions about a pattern's category.
+ *
+ * The first is true for categories H'12 to H'19 with H'16 left out; the
+ * second is true for H'16 alone, which is the complement of what
+ * `pattern_not_16` answers and is written out again here because the
+ * original has both. */
+u8 pattern_category_12_to_19(u16 n)
+{
+    const u8 cat = REG8(ITEM_TABLE +
+        (u32)(long)(short)(u16)(ITEM_STRIDE * n) + ITEM_CATEGORY);
+
+    if (cat < 0x12) return 0x00;
+    if (cat == 0x16) return 0x00;
+    if (cat > 0x19) return 0x00;
+    return 0x01;
+}
+
+u8 pattern_is_16(u16 n)
+{
+    const u8 cat = REG8(ITEM_TABLE +
+        (u32)(long)(short)(u16)(ITEM_STRIDE * n) + ITEM_CATEGORY);
+
+    return (u8)((cat == 0x16) ? 0x01 : 0x00);
+}
+
 /* H'211B00. How a box is drawn. */
 u8 hitbox_style(u16 index)
 {
@@ -780,11 +805,11 @@ u16 hitbox_fill_from_list(u16 first, u16 last, u16 value, u32 list)
             REG32(e + 0x0C) = list;
             REG16(e + 0x08) = (u16)v;
 
-            if (REG16(list + (u32)(long)(short)(u16)((u16)v << 1)) == 0) {
+            if (REG16(list + (u32)(long)(short)(u16)((u16)v << 1)) == 0 ||
+                v > (short)length) {
                 hitbox_set_state((u16)i, (u16)i, 0x02, 0);
                 continue;
             }
-            if (v > (short)length) continue;    /* past the end: left alone */
 
             if (REG8(e + 0x11) != 0x04) {
                 const u16 pattern =
@@ -910,3 +935,337 @@ void hitbox_redraw_run(u16 first, u16 last)
 /* ---- five that most of the screens lean on ----------------------------- */
 
 void screen_store(u8 slot, u8 out);
+
+/* H'22A666. The six controls of the queue's editing panel, drawn from the
+ * entry the cursor is on.
+ *
+ * With [which] zero all six are done; with anything else just that one, so
+ * a control that has moved can be put right without repainting the panel.
+ *
+ * Zero also means "and check the queue is showing something": the same
+ * three questions the picker answers before it will let the screen go. When
+ * it will not -- no position, one position, or the cursor at the first --
+ * the three flag boxes go plain, the two picture boxes get the first
+ * picture of their list, and the last box is greyed, which is the panel
+ * with nothing in it.
+ *
+ * The six, in order: the two mirror flags, the tie-off flag, the needle
+ * position, the stitch length, and the box whose meaning depends on what
+ * kind of pattern the entry holds -- H'44 for the ones between category
+ * H'12 and H'19, H'46 for a category H'16, and greyed for anything else.
+ * That box's own value is written as well as its picture, because it is the
+ * message the box sends when it is pressed.
+ */
+void queue_panel_draw(u16 which)
+{
+    u16 first = 0x0001;
+    u16 last = 0x0006;
+    u16 i;
+
+    if (which != 0) {
+        first = which;
+        last = which;
+    } else if (!picker_may_leave()) {
+        hitbox_set_state(0x0011, 0x0011, 0x00, 0);
+        hitbox_set_state(0x0012, 0x0012, 0x00, 0);
+        hitbox_set_state(0x0010, 0x0010, 0x00, 0);
+        hitbox_blit(0x0013, LCD_FRAME_A, REG32(0x0011581EUL));
+        hitbox_blit(0x0014, LCD_FRAME_A, REG32(0x0011587AUL));
+        hitbox_set_state(0x0015, 0x0015, 0x02, 0);
+        return;
+    }
+
+    for (i = first; (short)i <= (short)last; i++) {
+        switch (i) {
+        case 0x0001: {
+            const u8 lit = pattern_not_16(queue_entry_number(REG16(0x0011A1CCUL)))
+                ? queue_get_bit7(REG16(0x0011A1CCUL))
+                : queue_get_bit6(REG16(0x0011A1CCUL));
+
+            hitbox_set_state(0x0011, 0x0011, 0x00, 0);
+            if (lit != 0) hitbox_set_state(0x0011, 0x0011, 0x01, 0);
+            break;
+        }
+
+        case 0x0002: {
+            /* The same pair of flags the other way round: which of the two
+             * is the one that mirrors depends on the pattern. */
+            const u8 lit = pattern_not_16(queue_entry_number(REG16(0x0011A1CCUL)))
+                ? queue_get_bit6(REG16(0x0011A1CCUL))
+                : queue_get_bit7(REG16(0x0011A1CCUL));
+
+            hitbox_set_state(0x0012, 0x0012, 0x00, 0);
+            if (lit != 0) hitbox_set_state(0x0012, 0x0012, 0x01, 0);
+            break;
+        }
+
+        case 0x0003:
+            hitbox_set_state(0x0010, 0x0010, 0x00, 0);
+            if (queue_get_bit3(REG16(0x0011A1CCUL)) != 0) {
+                hitbox_set_state(0x0010, 0x0010, 0x01, 0);
+            }
+            break;
+
+        case 0x0004:
+            hitbox_blit(0x0013, LCD_FRAME_A,
+                REG32(0x0011581EUL + (u32)(long)(short)(u16)
+                      ((u16)queue_get_low2(REG16(0x0011A1CCUL)) << 2)));
+            break;
+
+        case 0x0005:
+            hitbox_blit(0x0014, LCD_FRAME_A,
+                REG32(0x0011587AUL + (u32)(long)(short)(u16)
+                      ((u16)queue_get_high4(REG16(0x0011A1CCUL)) << 2)));
+            break;
+
+        case 0x0006:
+            if (pattern_category_12_to_19(
+                    queue_entry_number(REG16(0x0011A1CCUL)))) {
+                REG16(hitbox_at(0x0015) + 0x08) = 0x0044;
+                hitbox_set_state(0x0015, 0x0015, 0x00, 0);
+                hitbox_blit(0x0015, LCD_FRAME_A,
+                    queue_get_top3(REG16(0x0011A1CCUL)) != 0
+                        ? 0x0034E55CUL
+                        : 0x0034E5EDUL);
+            } else if (pattern_is_16(
+                    queue_entry_number(REG16(0x0011A1CCUL)))) {
+                REG16(hitbox_at(0x0015) + 0x08) = 0x0046;
+                hitbox_set_state(0x0015, 0x0015, 0x00, 0);
+                hitbox_blit(0x0015, LCD_FRAME_A,
+                    REG32(0x0011589AUL + (u32)(long)(short)(u16)
+                          ((u16)queue_entry_offset(REG16(0x0011A1CCUL)) << 2)));
+            } else {
+                hitbox_set_state(0x0015, 0x0015, 0x02, 0);
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+/* H'211A02. Whether the message being held has been up long enough.
+ *
+ * H'11A166 is how long, in the ticks H'114DE0 counts; zero means nothing is
+ * being held and the answer is yes. When the time is up the box the message
+ * lit goes back to plain, and -- if H'11A171 says the screen was covered --
+ * all three buffers are wiped, which is what takes the message away.
+ */
+u8 message_hold_done(void)
+{
+    if (REG16(0x0011A166UL) == 0) return 0x01;
+    if (REG16(0x00114DE0UL) < REG16(0x0011A166UL)) return 0x00;
+
+    REG16(0x0011A166UL) = 0x0000;
+
+    if (REG16(0x0011A180UL) != 0) {
+        hitbox_set_state(REG16(0x0011A180UL), REG16(0x0011A180UL), 0x00, 0);
+        REG16(0x0011A180UL) = 0x0000;
+    }
+
+    if (REG8(0x0011A171UL) != 0) {
+        REG8(0x0011A171UL) = 0x00;
+        lcd_buffer_fill(LCD_FRAME_A, 0x00);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        lcd_buffer_fill(LCD_SCRATCH, 0x00);
+    }
+    return 0x01;
+}
+
+/* H'212B5E. The menu list put into a run of boxes.
+ *
+ * H'211C38 does the same for any list; this one is hard-wired to the menu
+ * at H'11A88E and leaves out the state changes that one makes, so a box it
+ * has drawn keeps whatever state it was in. Boxes drawn in a style other
+ * than 3 are not drawn at all, and are greyed instead once the run goes
+ * past the end of the list.
+ *
+ * The coordinates go to the blitter as the box holds them, with the screen
+ * origin *not* added -- which is the same asymmetry H'211518 has.
+ *
+ * The answer is the value box one ended up with.
+ */
+u16 menu_list_fill(u16 first, u16 last, u16 value)
+{
+    const u16 length = REG16(MENU_LIST);
+    short i = (short)first;
+    short v = (short)value;
+
+    for (; i <= (short)last; i++, v++) {
+        const u32 e = HITBOX_TABLE +
+            (u32)(long)(short)(u16)(HITBOX_STRIDE * (u16)i);
+
+        REG32(e + 0x0C) = MENU_LIST;
+        REG16(e + 0x08) = (u16)v;
+
+        if (REG8(e + 0x11) != 0x03) {
+            /* Not ours to draw. Past the end of the list it goes grey, and
+             * the state byte is written straight rather than through
+             * H'211518, so nothing is repainted. */
+            if (v > (short)length) REG8(e + 0x10) = 0x02;
+            continue;
+        }
+
+        if (REG16(MENU_LIST + (u32)(long)(short)(u16)((u16)v << 1)) == 0 ||
+            v > (short)length) {
+            hitbox_set_state((u16)i, (u16)i, 0x02, 0);
+            continue;
+        }
+
+        {
+            const u16 pattern =
+                REG16(MENU_LIST + (u32)(long)(short)(u16)((u16)v << 1));
+            const u32 rec = ITEM_TABLE +
+                (u32)(long)(short)(u16)(ITEM_STRIDE * pattern);
+
+            bitmap_draw(REG16(e + 0x00), REG16(e + 0x02),
+                        REG16(e + 0x04), REG16(e + 0x06),
+                        (const u8 *)REG32(rec + 0x08), LCD_FRAME_A);
+        }
+    }
+
+    return REG16(hitbox_at(0x0001) + 0x08);
+}
+
+/* H'212C60. The strip filled again after a menu key has asked for a
+ * different category.
+ *
+ * H'11B28E is the category the key left behind; the first item of it is
+ * what the strip starts at. Nothing of that category means the request is
+ * simply dropped. The two sewing screens both fill the same run of boxes;
+ * H'07 also has the second run beside it, which is the same boxes copied
+ * along and drawn again.
+ *
+ * H'11A170 -- "a menu key is waiting" -- goes down whichever way it ends.
+ */
+void menu_repick(void)
+{
+    const u16 first = first_item_of_category(REG8(0x0011B28EUL), MENU_LIST);
+
+    if (first == 0) {
+        REG8(0x0011A170UL) = 0x00;
+        return;
+    }
+
+    if (REG8(0x0011A169UL) == 0x02) {
+        hitbox_set_state(0x0001, 0x000F, 0x00, 0);
+        REG16(0x0011B108UL) = menu_list_fill(0x0001, 0x000F, first);
+        hitbox_select_current(0x0001, 0x000F);
+    } else if (REG8(0x0011A169UL) == 0x07) {
+        hitbox_set_state(0x0001, 0x000F, 0x00, 0);
+        REG16(0x0011B108UL) = menu_list_fill(0x0001, 0x000F, first);
+        hitbox_run_shift(0x000B, 0x000F, 0x0021);
+        hitbox_set_state(0x0020, 0x0024, 0x03, 0);
+        hitbox_redraw_run(0x0021, 0x0025);
+        hitbox_select_current(0x0001, 0x000F);
+        hitbox_select_current(0x0021, 0x0025);
+    }
+
+    REG8(0x0011A170UL) = 0x00;
+}
+
+/* H'21148A. The flag byte of a box, at H'0A of its entry. */
+u8 hitbox_flag(u16 index)
+{
+    return REG8(hitbox_at(index) + 0x0A);
+}
+
+/* H'216FA4. The same digits as int_to_decimal, from a longword and without
+ * the sign: the divide is the unsigned one and the value can be four
+ * thousand million. */
+void long_to_decimal(u32 v, char *out)
+{
+    char *head = out;
+    char *tail = out;
+
+    do {
+        *tail++ = (char)((u8)(u32)(v % 10) + 0x30);
+        v = v / 10;
+    } while (v != 0);
+
+    *tail = 0;
+    tail--;
+
+    while (head < tail) {
+        const char t = *tail;
+
+        *tail = *head;
+        *head = t;
+        head++;
+        tail--;
+    }
+}
+
+/* H'20FCD6. The third bar: the needle position, drawn across rather than up
+ * and down. The same shape as the two above -- the whole thing on [fresh],
+ * only the difference otherwise, then the limit mark moved and taken off or
+ * put back -- with its own four remembered words at H'11A868.
+ *
+ * A value of H'28 is the top of it, and the scale is 3.2 pixels a step.
+ */
+#define BAR_N_X0    0x0094
+#define BAR_N_X1    0x00A6
+#define BAR_N_TOP   0x0021
+#define BAR_N_BASE  0x00A1
+
+static u16 bar_n_pixel(long v)
+{
+    return (u16)(BAR_N_BASE - (u16)(int)((float)v * 3.2f + 0.5f));
+}
+
+void bar_needle(u16 value, u16 limit, u8 fresh, u32 buffer, u8 colour)
+{
+    u16 y;
+
+    if (fresh != 0) {
+        y = bar_n_pixel((long)(short)value);
+        draw_rect(BAR_N_X0, y, BAR_N_X1, BAR_N_BASE, buffer, colour, 0x01);
+        if ((short)value < 0x0027) {
+            draw_rect(BAR_N_X0, BAR_N_TOP, BAR_N_X1, (u16)(y - 1),
+                      buffer, 0x00, 0x01);
+        }
+        REG16(0x0011A86AUL) = y;
+        REG16(0x0011A868UL) = value;
+        REG16(0x0011A86CUL) = 0xFFFF;
+        REG16(0x0011A86EUL) = 0xFFFF;
+        REG16(0x0011A870UL) = bar_n_pixel((long)(short)limit);
+    } else if (value != REG16(0x0011A868UL)) {
+        y = bar_n_pixel((long)(short)value);
+        if ((short)value > (short)REG16(0x0011A868UL)) {
+            draw_rect(BAR_N_X0, y, BAR_N_X1, (u16)(REG16(0x0011A86AUL) - 1),
+                      buffer, colour, 0x01);
+        } else {
+            draw_rect(BAR_N_X0, REG16(0x0011A86AUL), BAR_N_X1, (u16)(y - 1),
+                      buffer, 0x00, 0x01);
+        }
+        REG16(0x0011A86AUL) = y;
+        REG16(0x0011A868UL) = value;
+    }
+
+    if (REG16(0x0011A86CUL) != limit) {
+        if ((short)REG16(0x0011A870UL) >= (short)REG16(0x0011A86AUL)) {
+            if (REG16(0x0011A86EUL) == 0) {
+                draw_hline(BAR_N_X0, BAR_N_X1, REG16(0x0011A870UL),
+                           buffer, colour);
+            }
+        } else {
+            if (REG16(0x0011A86EUL) != 0) {
+                draw_hline(BAR_N_X0, BAR_N_X1, REG16(0x0011A870UL),
+                           buffer, 0x00);
+            }
+        }
+        REG16(0x0011A870UL) = bar_n_pixel((long)(short)limit);
+        REG16(0x0011A86CUL) = limit;
+    }
+
+    {
+        const u16 on = (u16)(u8)(REG8(0x00FFFEE5UL) & 0x80);
+
+        if (on != REG16(0x0011A86EUL)) {
+            draw_hline(BAR_N_X0, BAR_N_X1, REG16(0x0011A870UL), buffer,
+                       (u8)((REG8(0x00FFFEE5UL) & 0x80) ? colour : 0x00));
+            REG16(0x0011A86EUL) = (u16)(u8)(REG8(0x00FFFEE5UL) & 0x80);
+        }
+    }
+}

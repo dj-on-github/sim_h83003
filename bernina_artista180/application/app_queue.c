@@ -1845,3 +1845,160 @@ void needle_stop_service(void)
         stop_countdown_set(at_half);
     }
 }
+
+/* H'201506, H'20150E and H'201516. Three of the machine's live settings,
+ * read back one byte each. The routines that *set* them are H'20153E,
+ * H'20154A and H'201536 next door; these are the readers, and they are
+ * written out twice in the ROM -- H'20151E, H'201526 and H'20152E are the
+ * same three again. */
+u8 sew_param_a_get(void)
+{
+    return REG8(0x0011A69EUL);
+}
+
+u8 sew_param_b_get(void)
+{
+    return REG8(0x0011A6A0UL);
+}
+
+u8 stitch_width_get(void)
+{
+    return REG8(0x00FFFEEAUL);
+}
+
+/* H'2015EE, H'201628 and H'201662. The three settings taken from the row of
+ * the table at H'11A6E8 that H'11A7A8 picks, which is how a pattern brings
+ * its own defaults with it. The first two go through the knob setters as
+ * well as the byte; the third is masked to four bits. */
+static u32 sew_row(void)
+{
+    return REG32(0x0011A6E8UL +
+        (u32)(long)(short)(u16)((u16)((u16)REG8(0x0011A7A8UL) << 2)));
+}
+
+void sew_param_a_load(void)
+{
+    const u8 v = REG8(sew_row() + 0x09);
+
+    REG8(0x0011A69EUL) = v;
+    (void)sew_param_a_set(v);
+}
+
+void sew_param_b_load(void)
+{
+    const u8 v = REG8(sew_row() + 0x0B);
+
+    REG8(0x0011A6A0UL) = v;
+    (void)sew_param_b_set(v);
+}
+
+void stitch_width_load(void)
+{
+    REG8(0x00FFFEEAUL) = (u8)(REG8(sew_row() + 0x0D) & 0x0F);
+}
+
+/* H'20151E, H'201526 and H'20152E. The same three readers again -- the ROM
+ * has two copies of each -- and H'201536, H'20153E and H'20154A, the writers
+ * that pair with them. The first two writers put the value through the knob
+ * setters as well as the byte. */
+u8 stitch_width_get2(void)
+{
+    return REG8(0x00FFFEEAUL);
+}
+
+u8 sew_param_a_get2(void)
+{
+    return REG8(0x0011A69EUL);
+}
+
+u8 sew_param_b_get2(void)
+{
+    return REG8(0x0011A6A0UL);
+}
+
+void stitch_width_put(u8 v)
+{
+    REG8(0x00FFFEEAUL) = v;
+}
+
+void sew_param_a_put(u8 v)
+{
+    REG8(0x0011A69EUL) = v;
+    (void)sew_param_a_set(v);
+}
+
+void sew_param_b_put(u8 v)
+{
+    REG8(0x0011A6A0UL) = v;
+    (void)sew_param_b_set(v);
+}
+
+/* H'2012EC. One pattern's working copy written back into flash.
+ *
+ * The catalogue's own byte at H'16 gets bit 7 raised -- "this one has been
+ * changed" -- in the copy at H'0E4010 and in flash, and the four parameter
+ * bytes beside it go from the copy into the table at H'57B6D6. Then the
+ * three defaults are read back, which is what makes the change take.
+ */
+void pattern_settings_write(u16 n)
+{
+    const u32 entry = ITEM_TABLE + (u32)((u16)(n * ITEM_STRIDE));
+    const u32 copy  = 0x000E4010UL + (u32)((u16)(n << 4));
+    u8 mark = REG8(entry + 0x16);
+    u8 k;
+
+    FLASH_BUSY |= 0x20;
+
+    REG8(copy) = (u8)(REG8(copy) | 0x80);
+    mark = (u8)(mark | 0x80);
+    rom_flash_write(&mark, entry + 0x16, 1);
+
+    for (k = 0; k < 4; k++) {
+        rom_flash_write((const void *)(copy + 1 + k),
+                        0x0057B6D6UL + (u32)((u16)(n << 2)) + k, 1);
+    }
+
+    FLASH_BUSY &= (u8)~0x20;
+    pattern_defaults_load(n, 0x00);
+}
+
+/* H'20145E. The pattern the machine is on written back -- and with it every
+ * unlisted entry that belongs to it.
+ *
+ * The run is found by walking forward past the category-1 entries and then
+ * back again counting them; a category of H'10 means the whole run is one
+ * pattern and all of it is written, and anything else means only the one
+ * the machine is actually on.
+ */
+void pattern_settings_store(void)
+{
+    u16 at = (u16)(REG16(0x00FFFEE0UL) + (u16)REG8(0x00FFFEFDUL));
+    const u16 first = at;
+    u8 run = 0;
+    u8 cat;
+
+    cat = REG8(ITEM_TABLE + (u32)((u16)(at * ITEM_STRIDE)) + ITEM_CATEGORY);
+
+    do {
+        at = (u16)(at + 1);
+        cat = REG8(ITEM_TABLE + (u32)((u16)(at * ITEM_STRIDE)) + ITEM_CATEGORY);
+    } while (cat == 0x01);
+
+    do {
+        run = (u8)(run + 1);
+        at = (u16)(at - 1);
+        cat = REG8(ITEM_TABLE + (u32)((u16)(at * ITEM_STRIDE)) + ITEM_CATEGORY);
+    } while (cat == 0x01);
+
+    if (cat == 0x10) {
+        u8 k;
+
+        for (k = 0; k < run; k++) {
+            pattern_settings_write(at);
+            at = (u16)(at + 1);
+        }
+        return;
+    }
+
+    pattern_settings_write(first);
+}

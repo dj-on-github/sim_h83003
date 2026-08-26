@@ -20,6 +20,7 @@ import 'flash.dart';
 import 'adc.dart';
 import 'dmac.dart';
 import 'h8disasm.dart';
+import 'i2c_eeprom.dart';
 import 'itu.dart';
 import 'sci.dart';
 import 'sparse_memory.dart';
@@ -263,6 +264,29 @@ class H8Cpu {
     flash.add(f);
   }
 
+  /// The serial EEPROM the artista 180 bit-bangs on port 4, when one is
+  /// attached. Null by default: with nothing there the port behaves as it
+  /// always did, and the firmware's writes go nowhere.
+  I2cEeprom? eeprom;
+
+  /// Puts an EEPROM on the two port pins it listens to. It reads the port
+  /// registers as the CPU last wrote them -- the data register holds what
+  /// the master is driving, not what the pin is at -- and holds SDA through
+  /// the same external-pin layer a switch or a sensor would use.
+  void attachEeprom(I2cEeprom e) {
+    e.peek = mem.peek;
+    e.hold = setPin;
+    e.float = releasePin;
+    eeprom = e;
+    e.attach();
+  }
+
+  /// Takes it off again, letting SDA float back to the data register.
+  void detachEeprom() {
+    eeprom?.detach();
+    eeprom = null;
+  }
+
   final List<ExternalInputs> externalInputs = [
     ExternalInputs(name: 'digital inputs', base: 0x080000, size: 0x020000),
   ];
@@ -504,6 +528,10 @@ class H8Cpu {
       }
     }
     mem.poke(addr, value);
+    // A bit-banged bus has no controller to notice an edge, so the device
+    // has to be told whenever either of the two registers it watches moves.
+    final e = eeprom;
+    if (e != null && (addr == e.drAddr || addr == e.ddrAddr)) e.portWritten();
   }
 
   int readW(int addr) {
@@ -666,6 +694,9 @@ class H8Cpu {
       if (ddrAddr != null) mem.poke(ddrAddr, p.ddrReset);
       mem.poke(p.drAddr, p.drReset);
     }
+    // A device part-way through a transfer would still be holding SDA
+    // down, and the machine would never see the bus idle again.
+    eeprom?.reset();
     pc = _peekL(0) & 0xFFFFFF;
     cycles = 0;
     halted = false;

@@ -509,8 +509,15 @@ void speed_target_set(void)
             /* The fourth zone is the one that follows the pedal rather than
              * standing at a step: the reading is stretched from H'64..H'D2
              * onto H'19..H'DC. */
-            u16 t = (u16)(PEDAL_LAST - 0x64);
-            SPEED_TARGET = (u8)((short)((u32)t * 0xC3 / 0x6E) + 0x19);
+            /* The multiply is unsigned and the divide is signed, and
+             * between them the product is cut down to its low word and
+             * sign-extended -- so a reading below H'64, which makes the
+             * difference look like a large unsigned number, comes out
+             * negative here rather than enormous. */
+            const u16 t = (u16)(PEDAL_LAST - 0x64);
+            const short p = (short)(u16)((u16)t * 0xC3);
+
+            SPEED_TARGET = (u8)((u8)(short)((long)p / (short)0x6E) + 0x19);
         }
     } else if (mode == 0x05) {
         SPEED_TARGET = 0xDC;
@@ -1097,4 +1104,40 @@ void keys_scan_settled(void)
             REG8(0xFFFEC5UL) = 0x06;
         }
     }
+}
+
+/* H'209398 and H'209424. The presser-foot demand put aside and given back.
+ *
+ * H'FFFED0, H'FFFED2, H'FFFED4 and H'FFFED6 are the four things the machine
+ * can be part-way through; when any of them says it is busy -- the last one
+ * counting H'05 as busy too -- the demand byte at H'FFFEC1 is copied to
+ * H'11A810, three of its bits are taken down, and bit 7 of H'FFFEF7 is
+ * raised to say that it has been put aside. The second routine puts it back
+ * and lowers the flag.
+ *
+ * Nothing happens while the motor is running: bit 7 of H'114DC6.
+ */
+void foot_demand_hold(void)
+{
+    u8 idle = 0x01;
+
+    if (REG8(0x00FFFED0UL) == 0x01) idle = 0x00;
+    if (REG8(0x00FFFED2UL) == 0x01) idle = 0x00;
+    if (REG8(0x00FFFED4UL) == 0x01) idle = 0x00;
+    if (REG8(0x00FFFED6UL) == 0x01 || REG8(0x00FFFED6UL) == 0x05) idle = 0x00;
+
+    if (REG8(0x00114DC6UL) & 0x80) return;
+    if (idle == 0x01) return;
+
+    REG8(0x0011A810UL) = REG8(0x00FFFEC1UL);
+    REG8(0x00FFFEF7UL) |= 0x80;
+    REG8(0x00FFFEC1UL) &= (u8)~0x20;
+    REG8(0x00FFFEC1UL) &= (u8)~0x10;
+    REG8(0x00FFFEC1UL) &= (u8)~0x40;
+}
+
+void foot_demand_restore(void)
+{
+    REG8(0x00FFFEC1UL) = REG8(0x0011A810UL);
+    REG8(0x00FFFEF7UL) &= (u8)~0x80;
 }

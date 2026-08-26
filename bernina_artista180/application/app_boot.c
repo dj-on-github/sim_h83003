@@ -260,6 +260,32 @@ static void fill32(u32 start, u32 end)
     }
 }
 
+/* H'200376 and H'200382. Copies the bytes from [src] up to [end] to [dest].
+ *
+ * Two versions again, and for the same reason as the two fills: the first
+ * compares only the low half of the source pointer against the end, so it
+ * cannot cross a 64K boundary, and the second compares all 24 bits. The
+ * comparison comes before the first byte, so a range whose ends are equal
+ * copies nothing.
+ */
+static void copy16(u32 src, u16 end, u32 dest)
+{
+    while ((u16)src != end) {
+        *(volatile u8 *)dest = *(const volatile u8 *)src;
+        src++;
+        dest++;
+    }
+}
+
+static void copy32(u32 src, u32 end, u32 dest)
+{
+    while (src != end) {
+        *(volatile u8 *)dest = *(const volatile u8 *)src;
+        src++;
+        dest++;
+    }
+}
+
 /* H'2007AC. Decides whether this is a cold start.
  *
  * The original is two instructions: load 1, return. There is no test — every
@@ -299,6 +325,39 @@ void cold_start(void)
 
     fill32(0x00040000, 0x00044B00); /* frame buffer */
     fill32(0x00044B00, 0x00049600); /* and the second one */
+
+    /* And then the other half of a C runtime's start-up, which is where the
+     * variables that are not zero get their values.
+     *
+     * H'24B2D0 to H'250758 is the original's initialised data -- H'5488
+     * bytes of it -- and it goes to H'114DC2, which is exactly where the
+     * zero fill above stopped and exactly H'5488 below where the next one
+     * started. The reconstruction reads that RAM by absolute address, so it
+     * needs the same bytes in the same places; the block itself sits above
+     * everything rebuilt so far, so it is still the original's.
+     *
+     * Four of the six calls copy nothing, and the table walk between them
+     * has nothing in it. They are the original's, kept for the same reason
+     * the no-op fills above are kept. */
+    copy16(0x0024B2D0UL, 0xB2D0, 0x0011F5A8UL);   /* copies nothing */
+    copy16(0x0024B2D0UL, 0xB2D0, 0x0011F5A8UL);   /* copies nothing */
+    copy32(0x0024B2D0UL, 0x0024B2D0UL, 0x0011F5A8UL); /* nor this */
+
+    copy32(0x0024B2D0UL, 0x00250758UL, 0x00114DC2UL);
+
+    {
+        u32 at = 0x00250758UL;
+
+        while (at != 0x00250758UL) {
+            const u32 from = REG32(at);
+            const u32 to = REG32(at + 4);
+
+            at += 8;
+            fill32(from, to);
+        }
+    }
+
+    copy32(0x00250AE8UL, 0x00250AE8UL, 0x0011F5A8UL); /* nor this */
 }
 
 /* H'20E062. Fifteen register writes and no loops. The last one enables the
@@ -664,6 +723,19 @@ void mem_set(u32 dest, u8 value, u16 count)
     while (left != 0) {
         *p++ = value;
         left--;
+    }
+}
+
+/* H'20076C. The same byte fill as H'200762 above, entered with a longword
+ * count rather than a word one. The two share a loop in the original: the
+ * word entry widens its count and falls into this one. */
+void mem_set_long(u32 dest, u8 value, u32 count)
+{
+    volatile u8 *p = (volatile u8 *)dest;
+
+    while (count != 0) {
+        *p++ = value;
+        count--;
     }
 }
 

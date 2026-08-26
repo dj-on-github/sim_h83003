@@ -327,7 +327,12 @@ void main(List<String> args) {
       final from = hex(p[0]);
       excluded.add((from, from + hex(p[1])));
     }
-    final comparer = RoutineComparer(excluded: excluded);
+    // "steps": N raises the step limit for one case. The delays the module
+    // link waits out are longer than anything else in the application, and
+    // the default limit stops in the middle of one.
+    final stepLimit = (c['steps'] as int?) ?? 8000000;
+    final comparer =
+        RoutineComparer(excluded: excluded, stepLimit: stepLimit);
 
     final originalSide =
         buildSide(c['original'] as Map<String, dynamic>, symbols);
@@ -360,14 +365,16 @@ void main(List<String> args) {
     }
     final diffs = result.differences.entries.toList()
       ..sort((x, y) => x.key.compareTo(y.key));
-    for (final d in diffs.take(12)) {
+    final show = int.tryParse(
+        Platform.environment['COMPARE_SHOW_DIFFS'] ?? '') ?? 12;
+    for (final d in diffs.take(show)) {
       final (o, n) = d.value;
       print('        ${h6(d.key)}: original '
           '${o < 0 ? "unchanged" : h2(o)}, rebuild '
           '${n < 0 ? "unchanged" : h2(n)}');
     }
-    if (diffs.length > 12) {
-      print('        ... and ${diffs.length - 12} more addresses');
+    if (diffs.length > show) {
+      print('        ... and ${diffs.length - show} more addresses');
     }
   }
 

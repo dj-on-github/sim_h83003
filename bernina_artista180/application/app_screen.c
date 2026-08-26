@@ -392,6 +392,187 @@ void bitmap_draw(u16 x0, u16 y0, u16 x1, u16 y1, const u8 *src, u32 dst)
     }
 }
 
+/* ---- the packed pictures ------------------------------------------------
+ * H'20F866 and H'20F4DC. The second kind of picture in this ROM.
+ *
+ * bitmap_draw above takes a run-length source -- a byte at a time, six bits
+ * of count and two of colour. The two big pictures behind screens H'08 and
+ * H'3A are packed with LZW instead, over an alphabet of three: the pixel
+ * values H'00, H'02 and H'03, which are codes H'00, H'01 and H'02.
+ *
+ * The dictionary is H'101 entries of four bytes at H'0FF710 -- a prefix code
+ * and one character each -- and the H'100 bytes above it, H'0FFB14 to
+ * H'0FFC13, are where a step leaves the string it decoded. The string is
+ * built backwards from the top, so a step says where it *starts*: the
+ * caller reads from H'0FFB14 plus that offset upwards and asks for another
+ * step once it has passed H'0FFC12.
+ *
+ * Three words carry between steps: H'11A858 the position in the stream,
+ * H'11A85A the next code to hand out, H'11A85C the code the last step ended
+ * on. The stream's first four bytes are its header, so the first code is at
+ * offset four.
+ */
+#define LZW_DICT  0x000FF710UL      /* H'101 entries: prefix word, character */
+#define LZW_OUT   0x000FFB14UL      /* where a step leaves what it decoded */
+#define LZW_TOP   0x000FFC13UL      /* one past the last byte of that */
+
+#define LZW_POS   REG16(0x0011A858UL)
+#define LZW_NEXT  REG16(0x0011A85AUL)
+#define LZW_OLD   REG16(0x0011A85CUL)
+
+static u32 lzw_entry(u16 code)
+{
+    return LZW_DICT + (u32)(u16)((u16)(code << 2));
+}
+
+/* H'20F866. One code read, and the string it stands for left at the top of
+ * the buffer. [first] resets the dictionary to the three the alphabet starts
+ * with and takes the first code as itself. */
+void lzw_step(const u8 *stream, u16 *out, u8 first)
+{
+    u32 sp, entry;
+    u16 code, c;
+    u8  ch = 0;
+
+    if (first != 0) {
+        LZW_NEXT = 0x0003;
+        LZW_POS  = 0x0004;
+        LZW_OLD  = (u16)stream[4];
+
+        REG16(LZW_DICT + 0x00) = 0xFFFF;  REG8(LZW_DICT + 0x02) = 0x00;
+        REG16(LZW_DICT + 0x04) = 0xFFFF;  REG8(LZW_DICT + 0x06) = 0x02;
+        REG16(LZW_DICT + 0x08) = 0xFFFF;  REG8(LZW_DICT + 0x0A) = 0x03;
+
+        *out = 0x00FE;
+        REG8(LZW_TOP - 1) = REG8(LZW_DICT + 0x02 +
+            (u32)(long)(short)(u16)((u16)((u16)stream[4] << 2)));
+        return;
+    }
+
+    LZW_POS = (u16)(LZW_POS + 1);
+    code = (u16)stream[LZW_POS];
+
+    /* The entry this step makes: its prefix is the code the last one ended
+     * on, and its character is settled below -- it is the first character of
+     * whatever this step decodes. */
+    entry = lzw_entry(LZW_NEXT);
+    REG16(entry) = LZW_OLD;
+
+    if (code >= LZW_NEXT) {
+        /* The one case where the code read is the entry being made: what
+         * it stands for is the last string with its own first character put
+         * on the end, so the walk starts a byte lower and that byte is
+         * filled in afterwards. */
+        c  = LZW_OLD;
+        sp = LZW_TOP - 1;
+    } else {
+        c  = code;
+        sp = LZW_TOP;
+    }
+
+    do {
+        service_hook();
+        ch = REG8(lzw_entry(c) + 0x02);
+        REG8(--sp) = ch;
+        c = REG16(lzw_entry(c));
+    } while (c != 0xFFFF);
+
+    if (code >= LZW_NEXT) REG8(LZW_TOP - 1) = ch;
+    REG8(entry + 0x02) = ch;
+
+    *out = (u16)(sp - LZW_OUT);
+    LZW_OLD  = code;
+    LZW_NEXT = (u16)(LZW_NEXT + 1);
+    if (LZW_NEXT > 0x0100) LZW_NEXT = 0x0003;
+}
+
+/* The next pixel out of the buffer, with another step taken once the last
+ * byte of the one before has been used. */
+static u8 lzw_next(const u8 *src, u16 *pos)
+{
+    const u8 v = REG8(LZW_OUT + (u32)((*pos)++));
+
+    if (*pos > 0x00FE) lzw_step(src, pos, 0x00);
+    return v;
+}
+
+/* H'20F4DC. The same geometry as bitmap_draw above, pixel for pixel, with
+ * an LZW stream where that one has run lengths. */
+void bitmap_draw_lzw(u16 x0, u16 y0, u16 x1, u16 y1, const u8 *src, u32 dst)
+{
+    u16 lead = 0, trail = 0, mid;
+    u32 rowstart, rowend;
+    u8  sh0, sh1;
+    u8  acc = 0;
+    u16 pos = 0;
+    short x, y, i;
+    u32 p;
+
+    pixel_address(x0, y0, dst, &rowstart, &sh0);
+    lzw_step(src, &pos, 0x01);
+
+    if ((u16)((u16)x1 - (u16)x0) == 0x013F) {
+        u32 last_addr;
+        u8  last_sh;
+
+        pixel_address(x1, y1, dst, &last_addr, &last_sh);
+        for (p = rowstart; p <= last_addr; p++) {
+            service_hook();
+            for (i = 0; i < 4; i++) {
+                acc = (u8)((u8)(acc << 2) | lzw_next(src, &pos));
+            }
+            *(volatile u8 *)p = acc;
+        }
+        return;
+    }
+
+    pixel_address(x1, y0, dst, &rowend, &sh1);
+    mid = (u16)((u16)rowend - (u16)rowstart);
+
+    if (sh0 == 0 && sh1 == 0x03) {
+        mid = (u16)(mid + 1);
+    } else if (sh0 != 0 && sh1 != 0x03) {
+        if (mid == 0) {
+            lead = (u16)((u16)sh1 - (u16)sh0 + 1);
+        } else {
+            mid = (u16)(mid - 1);
+            lead  = (u16)(4 - (u16)sh0);
+            trail = (u16)((u16)sh1 + 1);
+        }
+    } else if (sh0 == 0) {
+        trail = (u16)((u16)sh1 + 1);
+    } else {
+        lead = (u16)(4 - (u16)sh0);
+    }
+
+    if (mid != 0) {
+        if (lead  != 0) rowstart += 1;
+        if (trail != 0) rowend   -= 1;
+    }
+
+    for (y = (short)y0; y <= (short)y1; y++) {
+        for (x = (short)x0; (short)((u16)x0 + lead) > x; x++) {
+            plot_pixel((u16)x, (u16)y, dst, lzw_next(src, &pos));
+        }
+
+        if (mid != 0) {
+            for (p = rowstart; p <= rowend; p++) {
+                service_hook();
+                for (i = 0; i < 4; i++) {
+                    acc = (u8)((u8)(acc << 2) | lzw_next(src, &pos));
+                }
+                *(volatile u8 *)p = acc;
+            }
+            rowstart += LCD_BYTES_PER_LINE;
+            rowend   += LCD_BYTES_PER_LINE;
+        }
+
+        for (x = (short)((u16)x1 - trail + 1); x <= (short)x1; x++) {
+            plot_pixel((u16)x, (u16)y, dst, lzw_next(src, &pos));
+        }
+    }
+}
+
 /* H'2102B8. A bitmap drawn mirrored.
  *
  * Mirroring is not done in the decoder: the bitmap is drawn into the third
@@ -1278,4 +1459,337 @@ void stitch_database_open(void)
 
     stitch_params_reload();
     stitch_state_init();
+}
+
+/* H'22B242. The big picture of one queue position, drawn at [x],[y].
+ *
+ * With nothing to show -- no position, only one position, or the cursor at
+ * the first -- the box is painted out instead, which is the same three
+ * questions in the same order that decide whether the picker will let the
+ * screen go.
+ *
+ * H'11F28A to H'11F290 remember the rectangle the last picture went in, so
+ * that it can be rubbed out before the new one is drawn; they are then set
+ * to the new one. The picture's own header gives its width and height, and
+ * it is blitted the way round the entry says.
+ *
+ * [redraw] also puts the strip itself back, starting far enough to the left
+ * that the picture's width is allowed for.
+ */
+void picker_preview(u16 x, u16 y, u16 pos, u8 redraw)
+{
+    u32 g;
+
+    if (!picker_may_leave()) {
+        draw_rect(x, y, (u16)(x + 0x0042), (u16)(y + 0x0029),
+                  LCD_FRAME_A, 0x00, 0x01);
+        return;
+    }
+
+    g = picker_thumb(pos);
+
+    draw_rect(REG16(0x0011F28AUL), REG16(0x0011F28CUL),
+              REG16(0x0011F28EUL), REG16(0x0011F290UL),
+              LCD_FRAME_A, 0x00, 0x01);
+
+    REG16(0x0011F28AUL) = x;
+    REG16(0x0011F28CUL) = y;
+    REG16(0x0011F28EUL) = (u16)(header_word_0((const u8 *)g) + x);
+    REG16(0x0011F290UL) = (u16)(header_word_1((const u8 *)g) + y);
+
+    bitmap_draw_mirrored(REG16(0x0011F28AUL), REG16(0x0011F28CUL),
+                         REG16(0x0011F28EUL), REG16(0x0011F290UL),
+                         (const u8 *)g, LCD_FRAME_A, queue_entry_facing(pos));
+
+    if (redraw != 0) {
+        picker_draw_range(
+            (u16)(REG16(0x0011A1C8UL) - header_word_0((const u8 *)g)),
+            pos, pos);
+    }
+}
+
+/* ---- screen H'43, the queue laid out as a strip ------------------------
+ * The queue seen all at once: every entry's picture drawn side by side,
+ * wrapping to a new row when the next one would pass the right edge, with a
+ * cursor under the current entry and an arrow at each end.
+ *
+ * Five words at H'11A1D4 describe the area it fills -- left, right, top,
+ * bottom and the height of one row -- and three at H'11B3CE carry where the
+ * drawing has got to: the x it will put the next picture at, the baseline of
+ * the row it is on, and which entry the cursor is under. H'11A1DF and
+ * H'11A1E0 remember which way each arrow is drawn.
+ */
+#define STRIP_X0    REG16(0x0011A1D4UL)
+#define STRIP_X1    REG16(0x0011A1D6UL)
+#define STRIP_Y0    REG16(0x0011A1D8UL)
+#define STRIP_Y1    REG16(0x0011A1DAUL)
+#define STRIP_ROW   REG16(0x0011A1DCUL)
+#define STRIP_X     REG16(0x0011B3CEUL)
+#define STRIP_Y     REG16(0x0011B3D0UL)
+#define STRIP_AT    REG16(0x0011B3D2UL)
+
+/* The picture the queue's [i]th entry stands for. */
+static u32 queue_strip_picture(u16 i)
+{
+    const u16 n = (u16)(REG16(PICK_CACHE +
+        (u32)(long)(short)(u16)((u16)((u16)i << 1))) + queue_entry_offset(i));
+
+    return REG32(ITEM_TABLE +
+        (u32)(long)(short)(u16)((u16)(n * ITEM_STRIDE)) + 0x0C);
+}
+
+/* H'22B4B4. Entries [first] to [last] drawn along the strip from wherever
+ * the caller says, wrapping to the next row down when one will not fit and
+ * stopping when the rows run out.
+ *
+ * [y] is the baseline: a picture is drawn upwards from it by its own
+ * height, and which way round it faces comes from the queue entry.
+ */
+void queue_strip_run_draw(u16 y, u16 first, u16 last)
+{
+    u16 x = STRIP_X0;
+    short i;
+
+    for (i = (short)first; i <= (short)last; i++) {
+        const u32 picture = queue_strip_picture((u16)i);
+        u16 right = (u16)(header_word_0((const u8 *)picture) + x);
+
+        if ((short)right > (short)STRIP_X1) {
+            x = STRIP_X0;
+            right = (u16)(header_word_0((const u8 *)picture) + x);
+            y = (u16)(y + STRIP_ROW);
+            if ((short)y > (short)STRIP_Y1) return;
+        }
+
+        bitmap_draw_mirrored(x, (u16)(y - header_word_1((const u8 *)picture)),
+                             right, y, (const u8 *)picture, LCD_FRAME_A,
+                             queue_entry_facing((u16)i));
+        x = (u16)(right + 1);
+    }
+}
+
+/* H'22B592. The two arrows, drawn again only when they change. The one at
+ * the end of the queue goes out when the cursor reaches the last entry and
+ * the one at the start when it reaches the first. */
+void queue_strip_arrows(void)
+{
+    if (STRIP_AT == PICK_LAST) {
+        if (REG8(0x0011A1E0UL) != 0) {
+            hitbox_blit(0x0002, LCD_FRAME_A, ARROW_ON_OFF);
+            REG8(0x0011A1E0UL) = 0x00;
+        }
+    } else if ((short)STRIP_AT < (short)PICK_LAST) {
+        if (REG8(0x0011A1E0UL) == 0) {
+            hitbox_blit(0x0002, LCD_FRAME_A, ARROW_ON_ON);
+            REG8(0x0011A1E0UL) = 0x01;
+        }
+    }
+
+    if (STRIP_AT == PICK_FIRST) {
+        if (REG8(0x0011A1DFUL) != 0) {
+            hitbox_blit(0x0001, LCD_FRAME_A, ARROW_BACK_OFF);
+            REG8(0x0011A1DFUL) = 0x00;
+        }
+    } else if ((short)STRIP_AT > (short)PICK_FIRST) {
+        if (REG8(0x0011A1DFUL) == 0) {
+            hitbox_blit(0x0001, LCD_FRAME_A, ARROW_BACK_ON);
+            REG8(0x0011A1DFUL) = 0x01;
+        }
+    }
+}
+
+/* H'22B8AE and H'22B94A. The whole strip moved one row up or one row down,
+ * with the row it leaves behind blacked out. */
+void queue_strip_scroll_up(void)
+{
+    region_copy(STRIP_X0, (u16)(STRIP_Y0 + 1), STRIP_X1, STRIP_Y1,
+                (u16)(STRIP_Y0 - STRIP_ROW + 1), LCD_FRAME_A, LCD_FRAME_A);
+    draw_rect(STRIP_X0, (u16)(STRIP_Y1 - STRIP_ROW + 1), STRIP_X1, STRIP_Y1,
+              LCD_FRAME_A, 0x00, 0x01);
+}
+
+void queue_strip_scroll_down(void)
+{
+    region_copy(STRIP_X0, (u16)(STRIP_Y0 - STRIP_ROW + 1), STRIP_X1,
+                (u16)(STRIP_Y1 - STRIP_ROW), (u16)(STRIP_Y0 + 1),
+                LCD_FRAME_A, LCD_FRAME_A);
+    draw_rect(STRIP_X0, (u16)(STRIP_Y0 - STRIP_ROW + 1), STRIP_X1, STRIP_Y0,
+              LCD_FRAME_A, 0x00, 0x01);
+}
+
+/* H'22B9E8. Walking back from entry [from], where the row it is on begins
+ * and how far along that row the walk got.
+ *
+ * The widths are added up backwards until one more would pass the right
+ * edge, or until the first entry of the queue is reached. The entry the row
+ * starts with goes back through [first]. */
+u16 queue_row_back(u16 *first, u16 from)
+{
+    u16 x = STRIP_X0;
+    short i = (short)from;
+
+    for (;;) {
+        const u32 picture = queue_strip_picture((u16)i);
+        const u16 right = (u16)(header_word_0((const u8 *)picture) + x);
+
+        if ((short)(u16)(right + 1) > (short)STRIP_X1 ||
+            (u16)(PICK_FIRST + 1) == (u16)i) {
+            if ((u16)(PICK_FIRST + 1) == (u16)i) {
+                *first = (u16)i;
+                return right;
+            }
+            *first = (u16)(i + 1);
+            return (u16)(x - 1);
+        }
+
+        x = (u16)(right + 1);
+        i--;
+    }
+}
+
+/* H'22BA86. Which entry the row that [upto] falls on begins with: the
+ * widths added up forwards from the first entry, and the answer moved on
+ * every time the row wraps. */
+u16 queue_row_first(u16 upto)
+{
+    u16 x = STRIP_X0;
+    u16 answer = (u16)(PICK_FIRST + 1);
+    short i;
+
+    for (i = (short)(u16)(PICK_FIRST + 1); i <= (short)upto; i++) {
+        const u32 picture = queue_strip_picture((u16)i);
+        u16 right = (u16)(header_word_0((const u8 *)picture) + x);
+
+        if ((short)right > (short)STRIP_X1) {
+            x = STRIP_X0;
+            right = (u16)(header_word_0((const u8 *)picture) + x);
+            answer = (u16)i;
+        }
+        x = (u16)(right + 1);
+    }
+
+    return answer;
+}
+
+/* H'22B698 and H'22B7B8. The cursor moved one entry on or one entry back.
+ *
+ * Both take the cursor out first and put it back at the end. Moving on past
+ * the right edge starts a new row, and past the bottom row scrolls the whole
+ * strip up and draws the new bottom row; moving back is the same the other
+ * way, except that where a row *starts* has to be worked out by walking the
+ * widths backwards.
+ */
+void queue_strip_forward(void)
+{
+    u32 picture;
+
+    if (STRIP_AT == PICK_LAST) return;
+
+    picker_cursor(0x00);
+    STRIP_AT = (u16)(STRIP_AT + 1);
+    picture = queue_strip_picture(STRIP_AT);
+    STRIP_X = (u16)(STRIP_X + header_word_0((const u8 *)picture) + 1);
+
+    if ((short)STRIP_X > (short)STRIP_X1) {
+        picture = queue_strip_picture(STRIP_AT);
+        STRIP_X = (u16)(header_word_0((const u8 *)picture) + STRIP_X0);
+
+        if ((short)(u16)(STRIP_Y + STRIP_ROW) > (short)STRIP_Y1) {
+            queue_strip_scroll_up();
+            queue_strip_run_draw(STRIP_Y, STRIP_AT, PICK_LAST);
+        } else {
+            STRIP_Y = (u16)(STRIP_Y + STRIP_ROW);
+        }
+    }
+
+    picker_cursor(0x01);
+}
+
+void queue_strip_back(void)
+{
+    u32 picture;
+    u16 first = 0;
+
+    if ((u16)(PICK_FIRST + 1) == STRIP_AT) return;
+
+    picker_cursor(0x00);
+    picture = queue_strip_picture(STRIP_AT);
+    STRIP_X = (u16)(STRIP_X - (header_word_0((const u8 *)picture) + 1));
+
+    if ((short)STRIP_X <= (short)STRIP_X0) {
+        STRIP_X = queue_row_back(&first, (u16)(STRIP_AT - 1));
+
+        if ((short)(u16)(STRIP_Y - STRIP_ROW) >= (short)STRIP_Y0) {
+            STRIP_Y = (u16)(STRIP_Y - STRIP_ROW);
+        } else {
+            queue_strip_scroll_down();
+            queue_strip_run_draw(STRIP_Y, first, STRIP_AT);
+        }
+    }
+
+    STRIP_AT = (u16)(STRIP_AT - 1);
+    picker_cursor(0x01);
+}
+
+/* H'22B3A2. Screen H'43 itself.
+ *
+ * The lay-out draws the row the cursor's entry is on and then steps the
+ * cursor forward to it one entry at a time, which is how the three words at
+ * H'11B3CE end up holding where it really is. Three boxes: the two arrows
+ * and the way out.
+ */
+void queue_strip_screen(u8 fresh)
+{
+    u16 value = 0, index = 0;
+
+    if (fresh != 0) {
+        u16 first;
+        short i;
+
+        REG8(0x0011A1E0UL) = 0x01;
+        REG8(0x0011A1DFUL) = 0x01;
+        STRIP_X = (u16)(STRIP_X0 - 1);
+        STRIP_Y = STRIP_Y0;
+
+        first = queue_row_first(PICK_POS);
+        queue_strip_run_draw(STRIP_Y0, first, PICK_LAST);
+        STRIP_AT = (u16)(first - 1);
+
+        for (i = (short)first; i <= (short)PICK_POS; i++) queue_strip_forward();
+
+        REG8(0x0011A1DEUL) = 0x01;
+    }
+
+    queue_strip_arrows();
+
+    if (touch_hit(0x0001, 0x0003, &value, &index) != 0x03) return;
+
+    if (value == 0x0040) {
+        if (REG8(0x0011A1DFUL) != 0) {
+            message_show_held(index);
+            queue_strip_back();
+        }
+        return;
+    }
+
+    if (value == 0x0041) {
+        if (REG8(0x0011A1E0UL) != 0) {
+            message_show_held(index);
+            queue_strip_forward();
+        }
+        return;
+    }
+
+    if (value == 0x001A) {
+        screen_stack_pop();
+        message_show_held(index);
+        screen_switch(REG8(0x0011B0A3UL), 0x01, 0x00);
+    }
+}
+
+/* H'21CF9C. The screen stack emptied. */
+void screen_stack_clear(void)
+{
+    REG8(0x0011A18BUL) = 0x00;
+    REG8(0x0011A17CUL) = 0x00;
 }

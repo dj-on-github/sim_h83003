@@ -45,7 +45,15 @@ void main(List<String> args) {
     if (t != null && t >= 0x200000 && t < 0x251000) entries.add(t); }
   final sorted = entries.toList()..sort();
   int limitFor(int e) { for (final s in sorted) { if (s > e) return s; } return e + 0x1000; }
-  final src = File('bernina_artista180/application/app.c').readAsStringSync();
+  // The reconstruction is split across app_*.c now, so every one of them is
+  // read; an address named in any of them counts as done.
+  final dir = Directory('bernina_artista180/application');
+  final src = dir
+      .listSync()
+      .whereType<File>()
+      .where((f) => f.path.endsWith('.c') || f.path.endsWith('.h'))
+      .map((f) => f.readAsStringSync())
+      .join('\n');
   final done = <int>{};
   for (final m in RegExp(r"H'(2[0-9A-F]{5})").allMatches(src)) {
     done.add(int.parse(m.group(1)!, radix: 16)); }

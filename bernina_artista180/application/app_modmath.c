@@ -1791,3 +1791,43 @@ void module_key(u8 key)
         return;
     }
 }
+
+
+/* H'231BB0. The two steps that put the module back to nothing, walked round
+ * until H'114D9C is nought again -- so one call is the whole walk, the same
+ * shape as the colour walks on screen H'37.
+ *
+ * Nothing happens at all unless H'114D9F says a reset is wanted. Step nought
+ * puts bit 3 of H'114D4F down and holds a pass open while the module comes
+ * to rest -- which is no wait at all when it is at rest already; step one
+ * waits for
+ * the link to go quiet, clears the buffers, goes to screen H'13 and puts the
+ * slot's own byte back. A link that stays busy at step one leaves the walk
+ * going round, which is why only the quiet way through can be run by a case.
+ */
+void module_reset_walk(void)
+{
+    if (REG8(0x00114D9FUL) == 0) return;
+
+    do {
+        const u8 st = REG8(0x00114D9CUL);
+
+        if (st == 0x00) {
+            REG8(0x00114D4FUL) &= (u8)~0x08;
+            REG8(0x00114D80UL) = 0x00;
+            module_wait_pass();
+            REG8(0x00114D9CUL) = (u8)(REG8(0x00114D9CUL) + 1);
+        } else if (st == 0x01) {
+            if (REG8(0x0011F29EUL) == 0 && REG8(0x0011F2B6UL) == 0) {
+                module_buffers_clear();
+                REG8(0x00114D7EUL) = 0x01;
+                screen_switch(0x13, 0x01, 0x00);
+                REG8(0x00114DA1UL) = 0x00;
+                REG8(0x0011A41DUL +
+                     (u32)(long)(short)(u16)(
+                         0x0012 * (u16)REG8(0x0011A660UL))) = 0x00;
+                REG8(0x00114D9CUL) = 0x00;
+            }
+        }
+    } while (REG8(0x00114D9CUL) != 0);
+}
