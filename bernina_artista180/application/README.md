@@ -5575,6 +5575,41 @@ ordering right those boxes survive, that case draws them, and it writes four
 and a half times as many bytes as it did. The workaround is gone and so is
 the name.
 
+## 43. What was left when the screens ran out
+
+All seventy-nine screens the dispatch table holds are reconstructed --
+`H'00` to `H'4E`, which is where the table stops; the entry after it is not a
+pointer at all. The `default` arm of the dispatch still said *the other
+eighteen, not written yet*, which had been true once and was not any more.
+
+What remains is the tail. Of the five hundred and twelve places the
+application calls into, four hundred and thirty-one have a case. Of the
+eighty-one that do not:
+
+* eight are the soft-float helpers -- `__mulsf3` alone is called from two
+  hundred and thirty-one places -- which are libgcc and never reconstructed;
+* four are above `H'250000`, which is data that happens to look like a call
+  target to a scan of the encoding;
+* one is `H'244ADA`, which cannot be reached in a comparison run at all;
+* **forty-seven are called from a single place each**, which is the long tail
+  the census describes: code down paths a boot never takes.
+
+`H'231F14` was the one worth doing next, being called from fourteen places
+and the most-called routine still without a case. It is the plain sister of
+`H'231F72` from part 36: a number centred in a box, in the other font, with
+no mark after it.
+
+It reads all four of its coordinates through **the same displacement**,
+`@(H'18,ER7)`, four times over -- each `PUSH` between them moves the stack
+pointer down two, so a fixed displacement walks up the caller's arguments a
+slot at a time. Read without `tool/frame.py` that looks like one value
+fetched four times; resolved, it is `L10, L8, L6, L4`, the push order
+backwards, and the arguments pass straight through.
+
+Nine cases, and all eight mutations killed -- including the three that swap
+the alignment, which is the one thing here that could have been misread and
+still drawn something plausible.
+
 ## The tools
 
 Everything the comparison suite needs now lives in `tool/`, run from the

@@ -7057,3 +7057,18 @@ void goto_number_screen(void)
         return;
     }
 }
+
+/* H'231F14. A number written centred in a box, in the font at H'119A66.
+ *
+ * The plain sister of H'231F72: no mark after it, centred rather than
+ * right-aligned, and the other font. H'11F2DB is cleared first so that a
+ * shorter number cannot leave a digit of the last one behind it. Fourteen
+ * places call this, which is more than call any other routine still without
+ * a case. */
+void module_number_centred(short n, u16 x0, u16 y0, u16 x1, u16 y1)
+{
+    REG8(0x0011F2DBUL) = 0x00;
+    int_to_decimal(n, (char *)0x0011F2D6UL);
+    text_draw((const char *)0x0011F2D6UL, x0, y0, x1, y1,
+              0x0001, 0x02, (const u8 *)0x00119A66UL);
+}

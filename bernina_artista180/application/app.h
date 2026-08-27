@@ -1386,6 +1386,7 @@ void module_arrow_10(u8 lit);
 void module_arrow_11(u8 lit);
 void module_stitch_marks_clear(void);
 void module_number_label(short n, u16 x0, u16 y0, u16 x1, u16 y1, u16 mark);
+void module_number_centred(short n, u16 x0, u16 y0, u16 x1, u16 y1);
 void embroidery_panel_save_b(void);
 u8 module_box10_live(void);
 void module_colours_dither(void);

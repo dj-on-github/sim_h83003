@@ -4075,7 +4075,7 @@ void screen_dispatch(void)
         case 0x40:
             break;              /* its table entry *is* the tail */
         default:
-            break;              /* the other eighteen, not written yet */
+            break;              /* nothing else: the table stops at H'4E */
         }
     }
 

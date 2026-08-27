@@ -6935,6 +6935,33 @@ for _nm, _arrived, _relayout, _ex in (
     new[-1]['steps'] = 60000000
     new[-1]['name'] = 'screen_body_09 (%s)' % _nm
 
+# ------------------------------------------------------------- H'231F14
+# The plain sister of H'231F72: a number centred in a box, in the font the
+# shared fill already puts at H'119A66. Only digits are drawn, which that
+# font has, so no glyph has to be lent to it the way H'6D was.
+def numcentred(nm, n, x0, y0, x1, y1):
+    e = collections.OrderedDict()
+    e['11F2D6:10'] = 'A5'
+    add('module_number_centred (%s)' % nm, base_fill(e),
+        {'addr': '231F14', 'regs': {'er6': '%04X' % (n & 0xFFFF)},
+         'stack': {'4': '2:%04X' % x0, '6': '2:%04X' % y0,
+                   '8': '2:%04X' % x1, '0A': '2:%04X' % y1}},
+        {'symbol': '_module_number_centred',
+         'regs': {'er0': '%04X' % (n & 0xFFFF), 'er1': '%04X' % x0,
+                  'er2': '%04X' % y0},
+         'stack': {'4': '4:%08X' % x1, '8': '4:%08X' % y1}},
+        steps=40000000)
+
+numcentred('one digit',            7,     0x64, 0x20, 0x8C, 0x30)
+numcentred('two digits',           42,    0x64, 0x20, 0x8C, 0x30)
+numcentred('three digits',         123,   0x64, 0x20, 0x8C, 0x30)
+numcentred('four digits',          1234,  0x64, 0x20, 0x8C, 0x30)
+numcentred('five digits',          12345, 0x64, 0x20, 0x8C, 0x30)
+numcentred('nought',               0,     0x64, 0x20, 0x8C, 0x30)
+numcentred('a box further over',   42,    0x78, 0x40, 0xA0, 0x50)
+numcentred('a narrow box',         42,    0x64, 0x20, 0x70, 0x30)
+numcentred('a box only just wide enough', 8, 0x64, 0x20, 0x68, 0x28)
+
 # A last look over every case for the fill-ordering trap.
 _seen = set()
 for c in new:
