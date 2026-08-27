@@ -1,0 +1,193 @@
+{
+  "image": "MemoryDump-SewingMachine-NMMV02.08-2026-08-26_20-18-31.bin",
+  "warmup": 1500000,
+  "settle": 200000,
+  "exchanges": [
+    {
+      "command": 71,
+      "reply": [
+        71,
+        79
+      ],
+      "state": 0
+    },
+    {
+      "command": 72,
+      "reply": [
+        72
+      ],
+      "state": 0
+    },
+    {
+      "command": 73,
+      "reply": [
+        73,
+        66,
+        69,
+        82,
+        78,
+        73,
+        78,
+        65,
+        32,
+        69,
+        108,
+        101,
+        99,
+        116,
+        114,
+        111,
+        110,
+        105,
+        99,
+        32,
+        65,
+        71,
+        13,
+        66,
+        105,
+        111,
+        115,
+        86,
+        101,
+        114,
+        115,
+        105,
+        111,
+        110,
+        58,
+        32,
+        49,
+        46,
+        49,
+        48,
+        13,
+        77,
+        97,
+        105,
+        32,
+        57,
+        55,
+        13
+      ],
+      "state": 0
+    },
+    {
+      "command": 74,
+      "reply": [
+        74
+      ],
+      "state": 40
+    },
+    {
+      "command": 75,
+      "reply": [
+        79
+      ],
+      "state": 0
+    },
+    {
+      "command": 76,
+      "reply": [
+        76
+      ],
+      "state": 200
+    },
+    {
+      "command": 77,
+      "reply": [
+        77
+      ],
+      "state": 140
+    },
+    {
+      "command": 78,
+      "reply": [
+        78
+      ],
+      "state": 240
+    },
+    {
+      "command": 80,
+      "reply": [
+        80
+      ],
+      "state": 90
+    },
+    {
+      "command": 82,
+      "reply": [
+        82
+      ],
+      "state": 1
+    },
+    {
+      "command": 83,
+      "reply": [
+        83
+      ],
+      "state": 0
+    },
+    {
+      "command": 84,
+      "reply": [
+        84
+      ],
+      "state": 190
+    },
+    {
+      "command": 86,
+      "reply": [
+        86,
+        48,
+        66
+      ],
+      "state": 0
+    },
+    {
+      "command": 87,
+      "reply": [
+        87
+      ],
+      "state": 9
+    },
+    {
+      "command": 88,
+      "reply": [
+        88,
+        66,
+        79,
+        83
+      ],
+      "state": 0
+    },
+    {
+      "command": 89,
+      "reply": [
+        89
+      ],
+      "state": 180
+    },
+    {
+      "command": 90,
+      "reply": [
+        90
+      ],
+      "state": 121
+    },
+    {
+      "command": 114,
+      "reply": [
+        114
+      ],
+      "state": 1
+    },
+    {
+      "command": 119,
+      "reply": [
+        119
+      ],
+      "state": 9
+    }
+  ]
+}
