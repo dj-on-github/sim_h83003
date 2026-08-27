@@ -100,6 +100,49 @@ def audit(case):
             bad.append((k, keys[cover[at]]))
     return bad
 
+def hoist_wipes(case):
+    """Every wide key that covers a narrow pin set before it, moved back to
+    just before the earliest pin it covers.
+
+    `move_wipe` does this for the catalogue zero by hand, and forty-five
+    cases call it. This is the same operation for every wide key and every
+    case: a wide zero that lands after the pins it covers wipes values the
+    case meant to set, which is the one mistake this file keeps making. Only
+    the ordering moves; no value changes, and a wide key that covers nothing
+    set before it stays where it is."""
+    f = case.get('fill')
+    if not f:
+        return
+    for _ in range(8):                      # a hoist can expose another
+        keys = list(f.keys())
+        cover = {}
+        for i, k in enumerate(keys):
+            a, span = k.split(':')
+            at, n = int(a, 16), int(span, 16)
+            for x in range(at, at + n):
+                cover[x] = i
+        move = {}
+        for i, k in enumerate(keys):
+            a, span = k.split(':')
+            if int(span, 16) != 1:
+                continue
+            j = cover[int(a, 16)]
+            if j != i and f[k] != f[keys[j]]:
+                move[j] = min(move.get(j, i), i)
+        if not move:
+            return
+        out = collections.OrderedDict()
+        pending = {}
+        for j, first in move.items():
+            pending.setdefault(first, []).append(keys[j])
+        for i, k in enumerate(keys):
+            for w in pending.get(i, ()):
+                out[w] = f[w]
+            if k not in out:
+                out[k] = f[k]
+        f = out
+        case['fill'] = dict(out)
+
 new=[]
 def add(name, fill, orig, rebuilt, seed=None, steps=None):
     c=collections.OrderedDict()
@@ -130,8 +173,11 @@ hold_case('time up, screen covered',  0x0040, 0x0100, 0x0005, 0x01)
 hold_case('time up, covered, no box', 0x0040, 0x0100, 0x0000, 0x01)
 
 # ---------------------------------------------------------------- H'212B5E
-# Boxes 5 to 9 rather than 1 to 5: the shared fill wipes the box table again
-# part-way through, so only the boxes defined after that survive it.
+# Boxes 5 to 9 were chosen here because the shared fill used to wipe the box
+# table part-way through and only the boxes defined after that survived it.
+# `hoist_wipes` puts every wide key before the pins it covers, so boxes 1 to
+# 5 now survive as well -- the case below that was named for their not being
+# drawn draws them, and writes four and a half times as much.
 LIST = collections.OrderedDict()
 LIST.update(w16(0x11A88E, 0x0004))      # four items
 LIST.update(w16(0x11A890, 0x0001))
@@ -164,7 +210,7 @@ fill_case('one box only', 6, 6, 2)
 fill_case('every one past the end', 5, 9, 0x000A)
 fill_case('a box in another style, in range', 5, 9, 1, STYLE7)
 fill_case('a box in another style, past the end', 5, 9, 5, STYLE7)
-fill_case('boxes 1 to 5, none of them drawn', 1, 5, 1)
+fill_case('boxes 1 to 5', 1, 5, 1)
 
 # ---------------------------------------------------------------- H'212C60
 # The queue screen's second run of boxes, H'20 to H'26, given a style and
@@ -898,6 +944,10 @@ def needle_case(name, x, y, to=0xFFFF, extra=None):
     add('needle_choice_screen (%s)'%name, f,
         {'addr':'21935E','result':'r6l'},
         {'symbol':'_needle_choice_screen','result':'r0l'})
+    # The base fill has this wide zero of its own, late, and a key already
+    # present keeps its place -- so without this the catalogue descriptors
+    # set just above are wiped again before the case runs.
+    move_wipe(new[-1])
 
 # Box one carries value H'83 and the rest H'84 up, so a press on box n picks
 # the n'th needle position.
@@ -1356,8 +1406,11 @@ def marks_extra(strip=0, set_b4=True, extra=None):
     # boxes are filled from a list that is not one of the pattern ones, so
     # each value is looked up there and a pointer left over from the boot
     # would be blitted from.
-    e['1158CE:200']='00'
-    for k in range(0x80):
+    # Seventy-eight entries: the dump has picture pointers up to H'4D, the
+    # highest key any real strip carries, and the list at H'115A06 directly
+    # after. H'200 of it ran over that list and the one at H'115A20.
+    e['1158CE:138']='00'
+    for k in range(78):
         e.update(w32(0x001158CE + 4*k, 0x0034C6CD))
     e['57EED6:EE']='00'         # the seven strips, in flash
     e['115A20:280']='00'        # what is shown, and the keys on offer
@@ -2149,8 +2202,10 @@ def edit_extra(pos=0x0004, extra=None):
         e.update(b8(EDIT_ITEMS + 0x18*r + 0x17,
                     (0x12, 0x16, 0x05)[r % 3]))
     # The three tables of pictures the panel's controls are drawn from.
-    e['11581E:100']='00'
-    for k in range(0x40):
+    # Forty-four entries, which is where the dump shows this table ending
+    # and H'1158CE's beginning; H'100 of it ran over the next table.
+    e['11581E:B0']='00'
+    for k in range(44):
         e.update(w32(0x0011581E + 4*k, 0x0034C6CD))
     # The width strip: eleven boxes in a row, and the picture that marks one.
     e['11524E:60']='00'
@@ -2393,8 +2448,8 @@ def service_extra(block_at=0x001181B0, extra=None):
         e.update(w32(SERVICE_ITEMS + 0x18*r + 0x0C, 0x0034C6CD))
         e.update(w16(SERVICE_ITEMS + 0x18*r + 0x14, 0x0100 + r))
         e.update(b8(SERVICE_ITEMS + 0x18*r + 0x17, (0x12, 0x10, 0x05)[r % 3]))
-    e['1158CE:400']='00'
-    for k in range(0x100):
+    e['1158CE:138']='00'
+    for k in range(78):
         e.update(w32(0x001158CE + 4*k, 0x0034C6CD))
     # The two lists the service screens fill their boxes from.
     e['115A06:40']='00'
@@ -6154,8 +6209,736 @@ for _nm, _arrived, _relayout, _ex in (
     new[-1]['steps'] = 60000000
     new[-1]['name'] = 'screen_body_15 (%s)' % _nm
 
+# ------------------------------------- screen H'14's smaller helpers
+# H'244ADA has no cases. It sends two messages one after the other and waits
+# on each, and the wait only ends when the SCI interrupt clears H'11F29E --
+# which nothing in a comparison run does, so both sides sit in the first wait
+# for ever. Tried and measured: at four hundred million steps neither side
+# has returned. There is no path through the routine that turns back before
+# the first send, which is what makes the other send-and-wait routines
+# testable, so this one is written from the listing and left uncovered.
+
+# H'249AEE and H'249B3A. The four arrows beside them are hand-written cases
+# on a fill whose box table stops short of box ten, where these two draw, so
+# these go on the module screens' furniture instead -- which has all
+# twenty-five boxes.
+for _a, _sym in (('249AEE', '_module_arrow_10'), ('249B3A', '_module_arrow_11')):
+    for _lit in (0x00, 0x01):
+        furn('%s lit=%02X' % (_sym[1:], _lit),
+             {'addr': _a, 'regs': {'er6': '%02X' % _lit}},
+             {'symbol': _sym, 'regs': {'er0': '%02X' % _lit}},
+             steps=40000000)
+
+# H'23A012. H'114D8B is the first pattern the page shows and H'0FFE80 how
+# many there are, so the answer turns over where the two meet.
+for _first, _count, _n, _nm in ((0x10, 0x20, 0x01, 'well inside the count'),
+                                (0x10, 0x20, 0x0F, 'one short of the count'),
+                                (0x10, 0x20, 0x10, 'exactly the count'),
+                                (0x10, 0x20, 0x11, 'one past the count'),
+                                (0x10, 0x20, 0x09, 'the middle of the grid'),
+                                (0x00, 0x00, 0x01, 'no patterns at all'),
+                                (0x00, 0x09, 0x09, 'the whole first page'),
+                                (0xFF, 0x20, 0x02, 'a page past the count'),
+                                (0x10, 0xFF, 0x09, 'the biggest count')):
+    add('module_pick_past_end (%s)' % _nm,
+        base_fill(dict(list(b8(0x00114D8B, _first).items()) +
+                       list(b8(0x000FFE80, _count).items()))),
+        {'addr': '23A012', 'result': 'r6l', 'regs': {'er6': '%02X' % _n}},
+        {'symbol': '_module_pick_past_end', 'result': 'r0l',
+         'regs': {'er0': '%02X' % _n}})
+
+# H'23A716. The stream buffer H'11F2C6 points at, and the marks around
+# H'104037 that say where the stream has got to. Everything it clears is set
+# to something else first, so that clearing it shows.
+STREAM_AT = 0x000E0000
+
+def marks_fill(extra=None):
+    e = collections.OrderedDict()
+    e.update(w32(0x0011F2C6, STREAM_AT))
+    e['%06X:A41' % STREAM_AT] = 'A5'
+    e['104037:30'] = '5A'
+    e['104046:15'] = '5A'
+    e['10405B:15'] = '5A'
+    if extra: e.update(extra)
+    return base_fill(e)
+
+add('module_stitch_marks_clear', marks_fill(),
+    {'addr': '23A716'}, {'symbol': '_module_stitch_marks_clear'},
+    steps=40000000)
+add('module_stitch_marks_clear (already clear)',
+    marks_fill(dict([('%06X:A41' % STREAM_AT, '00'), ('104037:30', '00'),
+                     ('104046:15', '00'), ('10405B:15', '00')])),
+    {'addr': '23A716'}, {'symbol': '_module_stitch_marks_clear'},
+    steps=40000000)
+add('module_stitch_marks_clear (the buffer somewhere else)',
+    base_fill(dict(list(w32(0x0011F2C6, 0x000EB000).items()) +
+                   [('0EB000:A41', 'A5'), ('104037:30', '5A'),
+                    ('104046:15', '5A'), ('10405B:15', '5A')])),
+    {'addr': '23A716'}, {'symbol': '_module_stitch_marks_clear'},
+    steps=40000000)
+
+# H'231F72. A third copy of the test font, at the address this one is given
+# as a constant.
+FONT3 = collections.OrderedDict()
+FONT3['119DE6:400'] = '00'
+for k, v in _td.items():
+    a, span = k.split(':')
+    at = int(a, 16)
+    if 0x0E1000 <= at < 0x0E1400:
+        FONT3['%06X:%s' % (0x00119DE6 + (at - 0x0E1000), span)] = v
+    elif 0x0E1500 <= at < 0x0E1700:
+        FONT3[k] = v
+
+# The test font defines only '!' and the ten digits. A table slot left
+# undefined is a pointer of nought, which text_draw follows into the code
+# region -- and the two images differ there by construction, so the drawing
+# would differ for reasons that have nothing to do with the routine. The two
+# other characters this routine can put on the screen are the mark at H'6D
+# and int_to_decimal's minus sign, so both are given '0''s glyph.
+_ZERO_GLYPH = [v for k, v in _td.items()
+               if 0x0E103C <= int(k.split(':')[0], 16) < 0x0E1040]
+for _ch in (0x2D, 0x6D):
+    for _i, _v in enumerate(_ZERO_GLYPH):
+        FONT3['%06X:1' % (0x00119DE6 + _ch * 4 - 0x84 + _i)] = _v
+
+def numlabel(nm, n, x0, y0, x1, y1, mark):
+    e = collections.OrderedDict(FONT3)
+    e['11F2D6:10'] = 'A5'
+    f = base_fill(e)
+    # This font sits high enough that its table runs over pins the shared
+    # fill has above H'11A000, which the other two copies are too low to
+    # reach. Every single byte inside the table's span goes back on the end,
+    # after the wide zero that would otherwise cover it.
+    _lo, _hi = 0x00119DE6, 0x00119DE6 + 0x400
+    for _k in [_k for _k in list(f) if _k.split(':')[1] == '1'
+               and _lo <= int(_k.split(':')[0], 16) < _hi]:
+        f[_k] = f.pop(_k)
+    add('module_number_label (%s)' % nm, f,
+        {'addr': '231F72', 'regs': {'er6': '%04X' % (n & 0xFFFF)},
+         'stack': {'4': '2:%04X' % x0, '6': '2:%04X' % y0,
+                   '8': '2:%04X' % x1, '0A': '2:%04X' % y1,
+                   '0C': '2:%04X' % mark}},
+        {'symbol': '_module_number_label',
+         'regs': {'er0': '%04X' % (n & 0xFFFF), 'er1': '%04X' % x0,
+                  'er2': '%04X' % y0},
+         'stack': {'4': '4:%08X' % x1, '8': '4:%08X' % y1,
+                   '0C': '4:%08X' % mark}},
+        steps=40000000)
+
+numlabel('one digit, no mark',      7,     0x64, 0x20, 0x8C, 0x30, 0x0000)
+numlabel('one digit and the mark',  7,     0x64, 0x20, 0x8C, 0x30, 0x0001)
+numlabel('three digits',            123,   0x64, 0x20, 0x8C, 0x30, 0x0000)
+numlabel('three digits and the mark', 123, 0x64, 0x20, 0x8C, 0x30, 0x0001)
+numlabel('nought',                  0,     0x64, 0x20, 0x8C, 0x30, 0x0001)
+# Nothing here goes below nought: int_to_decimal has no minus sign and a
+# negative turns into characters outside the digits, which is its own
+# business and has cases of its own.
+numlabel('two digits and the mark', 99,   0x64, 0x20, 0x8C, 0x30, 0x0001)
+numlabel('five digits',             12345, 0x64, 0x20, 0x8C, 0x30, 0x0000)
+numlabel('the mark asked for oddly', 9,    0x64, 0x20, 0x8C, 0x30, 0x00FF)
+numlabel('a box further over',      42,    0x78, 0x40, 0xA0, 0x50, 0x0001)
+
+# H'239390. One row of the picking grid. It draws through H'231F72, so the
+# font that routine is given has to be in place as well as the thumbnails.
+THUMB_RAM = 0x000E0200
+THUMB_ROM = 0x0010032E
+
+def gridrow(nm, row, first, count, from_ram, extra=None, src=None):
+    e = collections.OrderedDict(FONT3)
+    at = THUMB_RAM if from_ram == 0x01 else THUMB_ROM
+    # Laid down in H'20-byte bands of differing values rather than one flat
+    # byte: a uniform block reads the same at every offset, so it hides any
+    # mutation of the arithmetic that works out where to read.
+    if src is None:
+        for _o in range(0, 0x6E0, 0x20):
+            e['%06X:20' % (at + 0x022E * first + _o)] = \
+                '%02X' % ((0x11 + 7 * (_o // 0x20)) & 0xFF)
+    else:
+        e['%06X:6E0' % (at + 0x022E * first)] = src
+    e.update(b8(0x00114D8B, 0x00))
+    e.update(b8(0x00114D51, 0x00))
+    e.update(b8(0x000FFE80, 0x20))
+    e.update(b8(0x00100255, 0x20))
+    e.update(b8(0x00114DBC, 0x00))
+    e.update(b8(0x00114DBD, 0x00))
+    # The slot has to be pinned as well as its record byte: without it the
+    # routine reads a different slot's byte from the one the case sets.
+    e.update(b8(0x0011A660, MOD_SLOT))
+    e.update(b8(0x0011A41D + 0x12*MOD_SLOT, 0x00))
+    if extra: e.update(extra)
+    f = base_fill(e)
+    _lo, _hi = 0x00119DE6, 0x00119DE6 + 0x400
+    for _k in [_k for _k in list(f) if _k.split(':')[1] == '1'
+               and _lo <= int(_k.split(':')[0], 16) < _hi]:
+        f[_k] = f.pop(_k)
+    add('module_pick_row (%s)' % nm, f,
+        {'addr': '239390', 'regs': {'er6': '%02X' % row},
+         'stack': {'4': '2:%04X' % first, '6': '2:%04X' % count,
+                   '8': '2:%04X' % from_ram}},
+        {'symbol': '_module_pick_row',
+         'regs': {'er0': '%02X' % row, 'er1': '%04X' % first,
+                  'er2': '%04X' % count},
+         'stack': {'4': '4:%08X' % from_ram}},
+        steps=400000000)
+
+gridrow('the first row, all three cells', 0, 0, 3, 0x01)
+gridrow('the second row', 1, 0, 3, 0x01)
+gridrow('the third row', 2, 0, 3, 0x01)
+gridrow('no cells with a pattern', 0, 0, 0, 0x01)
+gridrow('one cell with a pattern', 0, 0, 1, 0x01)
+gridrow('two cells with a pattern', 0, 0, 2, 0x01)
+gridrow('more cells asked for than there are', 0, 0, 9, 0x01)
+gridrow('the thumbnails in the data, not in RAM', 0, 0, 3, 0x00)
+gridrow('a later thumbnail', 0, 1, 3, 0x01)
+gridrow('a page part way down the list', 0, 0, 3, 0x01,
+        extra=b8(0x00114D8B, 0x0C))
+gridrow('another bit pattern in the thumbnails', 0, 0, 3, 0x01, src='C3')
+gridrow('nothing set in the thumbnails', 0, 0, 3, 0x01, src='00')
+gridrow('every bit set in the thumbnails', 0, 0, 1, 0x01, src='FF')
+
+# Bit 1 of H'114D51 is the module having been asked how many it has, and
+# H'100255 against H'0FFE80 how many more that is than the machine knows.
+gridrow('the module asked, and none of them extra', 0, 0, 3, 0x01,
+        extra=b8(0x00114D51, 0x02))
+gridrow('the module asked, and some of them extra', 0, 0, 3, 0x01,
+        extra=dict(list(b8(0x00114D51, 0x02).items()) +
+                   list(b8(0x00100255, 0x1F).items())))
+gridrow('the module asked, all of them extra', 0, 0, 3, 0x01,
+        extra=dict(list(b8(0x00114D51, 0x02).items()) +
+                   list(b8(0x00100255, 0x00).items())))
+gridrow('the module asked, but the slot already has one', 0, 0, 3, 0x01,
+        extra=dict(list(b8(0x00114D51, 0x02).items()) +
+                   list(b8(0x00100255, 0x1F).items()) +
+                   list(b8(0x0011A41D + 0x12*MOD_SLOT, 0x01).items())))
+
+# H'239678 and H'2397D2. The two paging keys. H'114D8B is where the page
+# starts, H'114D8C the colour boundary behind it and H'0FFE80 how many
+# patterns there are; between them they decide whether the page moves or a
+# boundary stops it first.
+def pagecase(nm, which, first, bound, count, extra=None):
+    e = collections.OrderedDict(FONT3)
+    for _o in range(0, 0x2000, 0x20):
+        e['%06X:20' % (THUMB_ROM + _o)] = '%02X' % ((0x11 + 7 * (_o // 0x20)) & 0xFF)
+    for _r in range(0x20, 0xF0):
+        e['%06X:50' % (0x00040000 + 0x50 * _r)] = '%02X' % ((_r * 5) & 0xFF)
+    e.update(b8(0x00114D8B, first))
+    e.update(b8(0x00114D8C, bound))
+    e.update(b8(0x000FFE80, count))
+    e.update(b8(0x00114D87, 0x00))
+    e.update(b8(0x00114DAF, 0x00))
+    e.update(b8(0x00114D51, 0x00))
+    e.update(b8(0x00100255, count))
+    e.update(b8(0x0011A660, MOD_SLOT))
+    e.update(b8(0x0011A41F + 0x12*MOD_SLOT, 0x00))
+    e.update(b8(0x0011A41D + 0x12*MOD_SLOT, 0x00))
+    if extra: e.update(extra)
+    f = base_fill(e)
+    _lo, _hi = 0x00119DE6, 0x00119DE6 + 0x400
+    for _k in [_k for _k in list(f) if _k.split(':')[1] == '1'
+               and _lo <= int(_k.split(':')[0], 16) < _hi]:
+        f[_k] = f.pop(_k)
+    a, sym = ('239678', '_module_page_back') if which == 'back' \
+        else ('2397D2', '_module_page_on')
+    add('%s (%s)' % (sym[1:], nm), f, {'addr': a}, {'symbol': sym},
+        steps=400000000)
+
+# back: nothing to go back to, a plain step, and a boundary in the way
+pagecase('the page already at the top', 'back', 0x00, 0x00, 0x40)
+pagecase('a plain step back', 'back', 0x0C, 0x00, 0x40)
+pagecase('a step back with the list nearly done', 'back', 0x0C, 0x00, 0x0D)
+# The boundary only stops the page when H'114D8C is not already sitting on
+# it, so these carry a H'114D8C that is somewhere else.
+pagecase('a step back onto a boundary', 'back', 0x1B, 0x0C, 0x40)
+pagecase('a step back just under a boundary', 'back', 0x15, 0x00, 0x40)
+pagecase('a step back with the boundary already there', 'back',
+         0x1B, 0x00, 0x40, extra=b8(0x00114D8C, 0x00))
+pagecase('a step back onto the second boundary', 'back', 0x36, 0x0C, 0x60)
+pagecase('a step back from three', 'back', 0x03, 0x00, 0x40)
+# Exactly on the far edge of the window a boundary is looked for in, and
+# far enough down the list to need the last of the nine colours.
+pagecase('a step back seven under a boundary', 'back', 0x14, 0x0C, 0x40)
+pagecase('a step back near the ninth boundary', 'back', 0xF0, 0x00, 0xFF)
+# After the step this leaves exactly ten patterns to come, which is the
+# number the second arrow lights on.
+pagecase('a step back leaving exactly ten to come', 'back', 0x39, 0x00, 0x40)
+pagecase('a step back leaving nine to come', 'back', 0x3A, 0x00, 0x40)
+pagecase('a step back with only one row left to draw', 'back', 0x0C, 0x00, 0x0A)
+pagecase('a step back past the end of the list', 'back', 0x0C, 0x00, 0x06)
+
+# on: nothing left to go on to, a plain step, and a boundary in the way
+pagecase('no room to go on', 'on', 0x00, 0x00, 0x06)
+pagecase('exactly no room to go on', 'on', 0x00, 0x00, 0x09)
+pagecase('a plain step on', 'on', 0x00, 0x00, 0x40)
+pagecase('a step on into a boundary', 'on', 0x18, 0x00, 0x40)
+pagecase('a step on just short of a boundary', 'on', 0x11, 0x00, 0x40)
+pagecase('a step on with the boundary already there', 'on',
+         0x18, 0x1B, 0x40)
+pagecase('a step on with the list nearly done', 'on', 0x0C, 0x00, 0x16)
+pagecase('a step on with one row left to draw', 'on', 0x0C, 0x00, 0x13)
+pagecase('a step on onto the second boundary', 'on', 0x33, 0x1B, 0x60)
+pagecase('a step on nine under a boundary', 'on', 0x12, 0x0C, 0x40)
+pagecase('a step on near the ninth boundary', 'on', 0xE8, 0x0C, 0xFF)
+
+# ------------------------------------- screen H'14's own press, and its body
+# The hit test covers boxes one to H'0D but dispatches on the box's value,
+# which runs well past that: H'17 and H'18 page the grid, H'55 and H'1A are
+# the two ways out and one to nine are the cells.
+#
+# A cell that gets past all five of its guards ends in H'244ADA, which sends
+# and waits and never comes back in a comparison run -- so the cell cases
+# here are the five ways of being turned back, one for each guard, and the
+# rest of that arm is covered only by reading.
+def pickscr(nm, ex, steps=400000000):
+    e = collections.OrderedDict()
+    for _a in (0x00114D50, 0x00114D69, 0x00114D72, 0x00114D73, 0x00114D7E,
+               0x00114D7F, 0x00114D87, 0x00114D89, 0x00114D96, 0x00114D98,
+               0x00114D9B, 0x00114DA1, 0x00114DAF, 0x00114DB9, 0x0011F29E,
+               0x0011F2B6, 0x0011F4E6):
+        e.update(b8(_a, 0x00))
+    e.update(b8(0x00114D8E, 0x00))
+    e.update(b8(0x00114D8B, 0x00))
+    e.update(b8(0x00114D8C, 0x00))
+    e.update(b8(0x00114D51, 0x01))
+    e.update(w16(0x00114D4C, 0x0000))
+    e.update(w16(0x0011B106, 0x0000))
+    e.update(w16(0x0011F292, 0x0000))
+    e.update(w16(0x0011F4DC, 0x0000))
+    e.update(w16(0x0011F4DE, 0x0000))
+    e.update(b8(0x000FFE80, 0x40))
+    e.update(b8(0x00100255, 0x40))
+    e.update(b8(0x0011A41A + 0x12*MOD_SLOT, 0x00))
+    e.update(b8(0x0011A41D + 0x12*MOD_SLOT, 0x00))
+    e.update(b8(0x0011A41F + 0x12*MOD_SLOT, 0x00))
+    e.update(TURN_SMALL)
+    if ex: e.update(ex)
+    mod3('module_pick_screen (%s)' % nm, {'addr': '22BF8C'},
+         {'symbol': '_module_pick_screen'}, extra=e, steps=steps, pin=e)
+
+pickscr('nothing pressed', None)
+pickscr('the module busy', sewboth(sewpress(0x02), b8(0x00114DB9, 0x01)))
+pickscr('a value with no arm', sewpress(0x01, 0x20))
+pickscr('a value of nought', sewpress(0x01, 0x00))
+pickscr('a value just past the cells', sewpress(0x01, 0x0A))
+pickscr('a press on the last box the hit test covers',
+        sewpress(0x0D, 0x17))
+
+# The two paging keys and the two ways out.
+pickscr('the page back key', sewpress(0x01, 0x17))
+pickscr('the page back key with somewhere to go',
+        sewboth(sewpress(0x01, 0x17), b8(0x00114D8B, 0x0C)))
+pickscr('the page on key', sewpress(0x01, 0x18))
+pickscr('the page on key with nowhere to go',
+        sewboth(sewpress(0x01, 0x18), b8(0x000FFE80, 0x06)))
+pickscr('the first way out', sewpress(0x01, 0x55))
+pickscr('the second way out', sewpress(0x01, 0x1A))
+
+# A cell, turned back at each of its five guards in turn.
+pickscr('a cell past the end of the list',
+        sewboth(sewpress(0x01, 0x05), b8(0x000FFE80, 0x02)))
+pickscr('a cell with the bit up in H\'114D4C',
+        sewboth(sewpress(0x01, 0x05), w16(0x00114D4C, 0x4000)))
+pickscr('a cell with a busy link',
+        sewboth(sewpress(0x01, 0x05), b8(0x0011F29E, 0x01)))
+pickscr('a cell with the module not answering',
+        sewboth(sewpress(0x01, 0x05), b8(0x00114D51, 0x00)))
+pickscr('a cell with something already asked for',
+        sewboth(sewpress(0x01, 0x05), b8(0x00114D72, 0x01)))
+pickscr('the last cell, past the end of the list',
+        sewboth(sewpress(0x01, 0x09), b8(0x000FFE80, 0x02)))
+pickscr('the first cell, past the end of the list',
+        sewboth(sewpress(0x01, 0x01), b8(0x000FFE80, 0x00)))
+
+# H'2256AC
+for _nm, _arrived, _relayout, _ex in (
+        ('just arrived', 1, 0, None),
+        ('laid out again', 0, 1, None),
+        ('a plain pass', 0, 0, None)):
+    e = pat_extra(_ex)
+    dispatch_case(_nm, 0x14, _arrived, _relayout, 0, extra=e)
+    move_wipe(new[-1])
+    new[-1]['steps'] = 60000000
+    new[-1]['name'] = 'screen_body_14 (%s)' % _nm
+
+# ------------------------------------- screen H'13's own press, and its body
+# H'22BCCC is H'22BF8C over again with four things changed, so it gets the
+# same cases with the two that moved -- the H'55 key's guard, which the cell
+# arm no longer has -- covered both ways round.
+def pickscr_b(nm, ex, steps=400000000):
+    e = collections.OrderedDict()
+    for _a in (0x00114D50, 0x00114D69, 0x00114D72, 0x00114D73, 0x00114D7E,
+               0x00114D7F, 0x00114D87, 0x00114D89, 0x00114D96, 0x00114D98,
+               0x00114D9B, 0x00114DA1, 0x00114DAF, 0x00114DB9, 0x0011F29E,
+               0x0011F2B6, 0x0011F4E6):
+        e.update(b8(_a, 0x00))
+    e.update(b8(0x00114D8E, 0x00))
+    e.update(b8(0x00114D8B, 0x00))
+    e.update(b8(0x00114D8C, 0x00))
+    e.update(b8(0x00114D51, 0x01))
+    e.update(w16(0x00114D4C, 0x0000))
+    e.update(w16(0x0011B106, 0x0000))
+    e.update(w16(0x0011F292, 0x0000))
+    e.update(w16(0x0011F4DC, 0x0000))
+    e.update(w16(0x0011F4DE, 0x0000))
+    e.update(b8(0x000FFE80, 0x40))
+    e.update(b8(0x00100255, 0x40))
+    e.update(b8(0x0011A41A + 0x12*MOD_SLOT, 0x00))
+    e.update(b8(0x0011A41D + 0x12*MOD_SLOT, 0x00))
+    e.update(b8(0x0011A41F + 0x12*MOD_SLOT, 0x00))
+    e.update(TURN_SMALL)
+    if ex: e.update(ex)
+    mod3('module_pick_screen_b (%s)' % nm, {'addr': '22BCCC'},
+         {'symbol': '_module_pick_screen_b'}, extra=e, steps=steps, pin=e)
+
+pickscr_b('nothing pressed', None)
+pickscr_b('the module busy', sewboth(sewpress(0x02), b8(0x00114DB9, 0x01)))
+pickscr_b('a value with no arm', sewpress(0x01, 0x20))
+pickscr_b('a value of nought', sewpress(0x01, 0x00))
+pickscr_b('a value just past the cells', sewpress(0x01, 0x0A))
+pickscr_b('a press on the last box the hit test covers',
+          sewpress(0x0D, 0x17))
+
+pickscr_b('the page back key', sewpress(0x01, 0x17))
+pickscr_b('the page back key with somewhere to go',
+          sewboth(sewpress(0x01, 0x17), b8(0x00114D8B, 0x0C)))
+pickscr_b('the page on key', sewpress(0x01, 0x18))
+pickscr_b('the page on key with nowhere to go',
+          sewboth(sewpress(0x01, 0x18), b8(0x000FFE80, 0x06)))
+
+# The H'55 key is the one that wants the module answering here.
+pickscr_b('the first way out', sewpress(0x01, 0x55))
+pickscr_b('the first way out with the module not answering',
+          sewboth(sewpress(0x01, 0x55), b8(0x00114D51, 0x00)))
+pickscr_b('the second way out', sewpress(0x01, 0x1A))
+
+# ...and the cell arm no longer has it, so a cell with the module not
+# answering goes on to be turned back by something else instead.
+pickscr_b('a cell past the end of the list',
+          sewboth(sewpress(0x01, 0x05), b8(0x000FFE80, 0x02)))
+pickscr_b('a cell with the bit up in H\'114D4C',
+          sewboth(sewpress(0x01, 0x05), w16(0x00114D4C, 0x4000)))
+pickscr_b('a cell with a busy link',
+          sewboth(sewpress(0x01, 0x05), b8(0x0011F29E, 0x01)))
+pickscr_b('a cell with something already asked for',
+          sewboth(sewpress(0x01, 0x05), b8(0x00114D72, 0x01)))
+pickscr_b('a cell with the module not answering, which it does not look at',
+          sewboth(sewpress(0x01, 0x05),
+                  dict(list(b8(0x00114D51, 0x00).items()) +
+                       list(b8(0x00114D72, 0x01).items()))))
+pickscr_b('the last cell, past the end of the list',
+          sewboth(sewpress(0x01, 0x09), b8(0x000FFE80, 0x02)))
+
+# H'2255B2
+for _nm, _arrived, _relayout, _ex in (
+        ('just arrived', 1, 0, None),
+        ('laid out again', 0, 1, None),
+        ('a plain pass', 0, 0, None)):
+    e = pat_extra(_ex)
+    dispatch_case(_nm, 0x13, _arrived, _relayout, 0, extra=e)
+    move_wipe(new[-1])
+    new[-1]['steps'] = 60000000
+    new[-1]['name'] = 'screen_body_13 (%s)' % _nm
+
+# ------------------------------------- screen H'12's own press, and its body
+# Three boxes and only two arms: both ask the module to identify itself
+# first, and the second also wants bit 0 of H'114D51. What they differ in is
+# what they hand on -- H'114DA1 and the slot's H'11A41D, nought for screen
+# H'13 and one for H'14.
+def kindscr(nm, ex, steps=400000000):
+    e = collections.OrderedDict()
+    for _a in (0x00114D7E, 0x00114D9B, 0x00114DA1, 0x00114DB9, 0x0011A63C,
+               0x0011F4E6, 0x00114D50, 0x0011F29E, 0x0011F2B6):
+        e.update(b8(_a, 0x00))
+    e.update(b8(0x00114D8E, 0x00))
+    # Bit 7 is what H'24610A wants before it will call state H'01 anything
+    # but busy, and bit 0 is what the second key wants. Without bit 7 every
+    # one of these turns back at the busy test and the screen is never
+    # reached at all -- which the step counts say plainly, all identical.
+    e.update(b8(0x00114D51, 0x81))
+    e.update(b8(0x0011A640, 0x00))
+    e.update(b8(0x0011A41D + 0x12*MOD_SLOT, 0xFF))
+    e.update(b8(0x0011A41F + 0x12*MOD_SLOT, 0xFF))
+    if ex: e.update(ex)
+    mod3('module_kind_screen (%s)' % nm, {'addr': '22BB2A'},
+         {'symbol': '_module_kind_screen'}, extra=e, steps=steps, pin=e)
+
+kindscr('nothing pressed', None)
+kindscr('the module busy', sewboth(sewpress(0x02), b8(0x00114DB9, 0x01)))
+kindscr('the third box, which does nothing', sewpress(0x01, 0x03))
+kindscr('a value past the three', sewpress(0x01, 0x04))
+kindscr('a value of nought', sewpress(0x01, 0x00))
+kindscr('a press on the last box the hit test covers',
+        sewpress(0x03, 0x03))
+
+# H'249DE8 polls the module's reply buffer at H'104C90 for the five bytes of
+# the identity block at H'200103 -- "V03.0" -- two and a half thousand times
+# before giving up. Left empty it always gives up, which costs four and a
+# half million steps and makes every one of these cases the same case; with
+# the five bytes already there it matches on the first try.
+def _known(ex=None):
+    d = collections.OrderedDict()
+    for _i, _b in enumerate(('56', '30', '33', '2E', '30')):
+        d['%06X:1' % (0x00104C90 + _i)] = _b
+    if ex: d.update(ex)
+    return d
+
+def _unknown(ex=None):
+    d = _known()
+    d['%06X:1' % (0x00104C90 + 2)] = 'FF'      # one byte wrong is enough
+    if ex: d.update(ex)
+    return d
+
+kindscr('the first kind', sewboth(sewpress(0x01, 0x01), _known()))
+kindscr('the first kind with the module not saying what it is',
+        sewboth(sewpress(0x01, 0x01), _unknown()))
+kindscr('the first kind with the module not answering, which it ignores',
+        sewboth(sewpress(0x01, 0x01), _known(b8(0x00114D51, 0x80))))
+kindscr('the first kind with a slot to pick up',
+        sewboth(sewpress(0x01, 0x01), _known(b8(0x0011A640, 0x03))))
+kindscr('the second kind', sewboth(sewpress(0x01, 0x02), _known()))
+kindscr('the second kind with the module not saying what it is',
+        sewboth(sewpress(0x01, 0x02), _unknown()))
+kindscr('the second kind with the module not answering',
+        sewboth(sewpress(0x01, 0x02), _known(b8(0x00114D51, 0x80))))
+kindscr('the second kind with a slot to pick up',
+        sewboth(sewpress(0x01, 0x02), _known(b8(0x0011A640, 0x03))))
+
+# H'2254D2. The body raises H'11B0A9 as it lays out and draws the preview on
+# the same pass, so a case that arrives and one that is already laid out take
+# different routes through it.
+for _nm, _arrived, _relayout, _ex in (
+        ('just arrived', 1, 0, None),
+        ('laid out again', 0, 1, None),
+        ('a plain pass', 0, 0, None),
+        ('a preview still owed', 0, 0, b8(0x0011B0A9, 0x01))):
+    e = pat_extra(_ex)
+    dispatch_case(_nm, 0x12, _arrived, _relayout, 0, extra=e)
+    move_wipe(new[-1])
+    new[-1]['steps'] = 60000000
+    new[-1]['name'] = 'screen_body_12 (%s)' % _nm
+
+# ------------------------------------- screen H'11's helpers
+# H'2382EE. H'114D78 is H'EE while there is nothing to notice and H'FF once
+# there has been, so only the edge does anything.
+for _held, _pedal, _nm in ((0xEE, 0x01, 'already noticed'),
+                           (0x00, 0x00, 'the pedal up'),
+                           (0x00, 0x01, 'the pedal down'),
+                           (0xFF, 0x01, 'noticed once already'),
+                           (0x7F, 0x01, 'some other value in the byte'),
+                           (0xEE, 0x00, 'already noticed and the pedal up')):
+    add('module_pedal_pass (%s)' % _nm,
+        base_fill(dict(list(b8(0x00114D78, _held).items()) +
+                       list(b8(0x00FFFEC4, _pedal).items()))),
+        {'addr': '2382EE'}, {'symbol': '_module_pedal_pass'},
+        steps=40000000)
+
+# H'206724. Sixteen arguments: whether to mark the queue dirty, which record,
+# and seven flag-and-value pairs. Two of the seven fields move when bit 6 of
+# H'11A7BD is down, so every case is run both ways round.
+QREC = 0x000E4010
+
+def qrec(nm, mark, slot, pairs, bit6, rec0=0x00, extra=None):
+    e = collections.OrderedDict()
+    e['%06X:10' % (QREC + 0x10*slot)] = 'A5'
+    e.update(b8(QREC + 0x10*slot, rec0))
+    e.update(b8(0x0011A7BD, 0x40 if bit6 else 0x00))
+    e.update(b8(0x0011A6AE, 0x00))
+    e.update(b8(0x00114DCD, 0xFF))
+    if extra: e.update(extra)
+    o = {'4': '2:%04X' % slot}
+    r = {}
+    for _i, _v in enumerate(pairs):            # fourteen more, args 3..16
+        o['%X' % (6 + 2*_i)] = '2:%04X' % _v
+        if _i >= 1:                            # args 4..16 go on the stack
+            r['%X' % (4 + 4*(_i - 1))] = '4:%08X' % _v
+    add('queue_record_set (%s)' % nm, base_fill(e),
+        {'addr': '206724', 'regs': {'er6': '%02X' % mark}, 'stack': o},
+        {'symbol': '_queue_record_set',
+         'regs': {'er0': '%02X' % mark, 'er1': '%04X' % slot,
+                  'er2': '%02X' % pairs[0]},
+         'stack': r},
+        steps=40000000)
+
+_NONE = [0, 0xFF] * 7
+def _one(k, v):
+    p = list(_NONE)
+    p[2*k] = 0x01
+    p[2*k + 1] = v
+    return p
+
+for _b6 in (0, 1):
+    _w = 'bit six up' if _b6 else 'bit six down'
+    qrec('nothing set, %s' % _w, 0x01, 0x05, _NONE, _b6)
+    qrec('nothing set and no mark, %s' % _w, 0x00, 0x05, _NONE, _b6)
+    for _k in range(7):
+        qrec('only pair %d, %s' % (_k + 1, _w), 0x01, 0x05,
+             _one(_k, 0x30 + _k), _b6)
+    qrec('every pair set, %s' % _w, 0x01, 0x05,
+         [0x01, 0x40, 0x01, 0x41, 0x01, 0x42, 0x01, 0x43,
+          0x01, 0x44, 0x01, 0x45, 0x01, 0x46], _b6)
+    qrec('a record whose low bits are already nought, %s' % _w,
+         0x01, 0x05, _NONE, _b6, rec0=0x80)
+    qrec('a record with bit seven down, %s' % _w,
+         0x01, 0x05, _NONE, _b6, rec0=0x3F)
+    # Bit 6 is the only bit the two masks on byte nought disagree about.
+    qrec('a record with bit six up, %s' % _w,
+         0x01, 0x05, _NONE, _b6, rec0=0x40)
+    qrec('a record with bits six and seven up, %s' % _w,
+         0x01, 0x05, _NONE, _b6, rec0=0xC0)
+    qrec('another record, %s' % _w, 0x01, 0x11, _NONE, _b6)
+    qrec('record nought, %s' % _w, 0x01, 0x00, _NONE, _b6)
+
+# ------------------------------------- screen H'11's own press, and its body
+# H'21A070. The two digits index the word table H'11B2BA points at, and the
+# word there goes to H'21A246 -- which wants the item lists set up, so these
+# are built on the keypad fill its own cases use.
+GOTO_TABLE = 0x000E7000
+
+def gotoscr(nm, box, val, hi, lo, word, extra=None):
+    e = collections.OrderedDict()
+    e['%06X:100' % GOTO_TABLE] = '00'
+    e.update(w32(0x0011B2BA, GOTO_TABLE))
+    e.update(w16(GOTO_TABLE + 2*(10*hi + lo), word))
+    e.update(b8(0x0011B0FE, hi))
+    e.update(b8(0x0011B0FF, lo))
+    e.update(b8(0x00114DC6, 0x00))
+    e.update(b8(0x00114D78, 0xEE))
+    e.update(b8(0x00FFFEC4, 0x00))
+    e.update(b8(0x0011A7BD, 0x00))
+    e.update(b8(0x0011A6AE, 0x00))
+    e.update(b8(0x00114DCD, 0xFF))
+    e['%06X:400' % 0x000E4010] = 'A5'
+    bx = 0x0C + 0x10*((box - 1) % 12)
+    by = 0x24 + 0x10*((box - 1) // 12)
+    e.update(b8(0x00FFFED9, bx))
+    e.update(b8(0x00FFFEDA, by))
+    e.update(boxval(box, val))
+    if extra: e.update(extra)
+    f = keypad_fill()
+    f.update(e)
+    add('goto_number_screen (%s)' % nm, f,
+        {'addr': '21A070'}, {'symbol': '_goto_number_screen'},
+        steps=400000000)
+
+gotoscr('nothing pressed', 0x01, 0x01, 2, 5, 0x0101)
+gotoscr('a box with no arm', 0x09, 0x05, 2, 5, 0x0101)
+gotoscr('the number typed', 0x09, 0x19, 2, 5, 0x0101)
+gotoscr('the number typed, refused', 0x09, 0x19, 2, 5, 0x0101,
+        extra=b8(0x00114DC6, 0x80))
+gotoscr('nothing in the table there', 0x09, 0x19, 2, 5, 0x0000)
+gotoscr('a pattern the machine will not go to', 0x09, 0x19, 2, 5, 0x0999)
+gotoscr('a pattern in another list', 0x09, 0x19, 2, 5, 0x0109)
+gotoscr('the second digit four', 0x09, 0x19, 2, 4, 0x0101)
+gotoscr('the second digit four, another pattern', 0x09, 0x19, 2, 4, 0x0109)
+gotoscr('the pedal down', 0x09, 0x19, 2, 5, 0x0101,
+        extra=dict(list(b8(0x00FFFEC4, 0x01).items()) +
+                   list(b8(0x00114D78, 0x00).items())))
+gotoscr('the pedal down but already noticed', 0x09, 0x19, 2, 5, 0x0101,
+        extra=b8(0x00FFFEC4, 0x01))
+gotoscr('the digits at nought', 0x09, 0x19, 0, 0, 0x0101)
+gotoscr('the way back', 0x0A, 0x1A, 2, 5, 0x0101)
+gotoscr('the way back, refused', 0x0A, 0x1A, 2, 5, 0x0101,
+        extra=b8(0x00114DC6, 0x80))
+
+# H'225046. The picture this body loads is not a constant: it is the fifth
+# long of whatever H'11B2B6 points at. Left as the boot leaves it that is a
+# wild pointer and image_load never comes back, so both are pinned to what
+# the machine's own dump has -- H'11510E, whose fifth long is H'3B4352.
+_B11 = collections.OrderedDict()
+_B11.update(w32(0x0011B2B6, 0x0011510E))
+_B11.update(w32(0x0011511E, 0x003B4352))
+
+for _nm, _arrived, _relayout, _ex in (
+        ('just arrived', 1, 0, None),
+        ('laid out again', 0, 1, None),
+        ('a plain pass', 0, 0, None)):
+    e = pat_extra(dict(list(_B11.items()) + list((_ex or {}).items())))
+    dispatch_case(_nm, 0x11, _arrived, _relayout, 0, extra=e)
+    move_wipe(new[-1])
+    new[-1]['steps'] = 60000000
+    new[-1]['name'] = 'screen_body_11 (%s)' % _nm
+
+# ------------------------------------- screen H'09, the stitch length typed
+# The box beside the number is drawn with the font FONT4 already builds at
+# H'1196EA, and the string after it is "mm" from H'250AE0 -- so that font
+# needs a glyph at H'6D, which the test font does not define. H'23C570's
+# cases hit the same thing and settle it the same way, by pointing the slot
+# at the glyph data the fill already holds.
+MM_GLYPH = collections.OrderedDict(FONT4)
+MM_GLYPH.update(w32(0x001196EA + 4*0x6D - 0x84, 0x000E1640))
+
+def stitchnum(nm, arrived, box, val, typed, ceiling=0x40, extra=None):
+    e = collections.OrderedDict(MM_GLYPH)
+    e['11A1A5:10'] = '00'
+    for _i, _c in enumerate(typed):
+        e['%06X:1' % (0x0011A1A5 + _i)] = '%02X' % ord(_c)
+    e.update(w16(0x0011B31E, ceiling))
+    e.update(b8(0x00FFFEF7, 0x00))
+    e.update(b8(0x0011B0A9, 0x00))
+    # H'218C1A only draws on its tenth tick, so the counter is left one short
+    # of it: otherwise the cursor's own coordinates are never used.
+    e.update(w16(0x0011B31A, 0x0009))
+    e.update(b8(0x0011B31C, 0x00))
+    bx = 0x0C + 0x10*((box - 1) % 12)
+    by = 0x24 + 0x10*((box - 1) // 12)
+    e.update(b8(0x00FFFED9, bx))
+    e.update(b8(0x00FFFEDA, by))
+    e.update(boxval(box, val))
+    if extra: e.update(extra)
+    f = keypad_fill()
+    f.update(e)
+    add('stitch_number_screen (%s)' % nm, f,
+        {'addr': '218CBE', 'regs': {'er6': '%02X' % arrived}},
+        {'symbol': '_stitch_number_screen', 'regs': {'er0': '%02X' % arrived}},
+        steps=400000000)
+
+# Laying out, with and without the bit that shows what is set now.
+stitchnum('just laid out', 0x01, 0x01, 0x00, '')
+stitchnum('just laid out, showing what is set', 0x01, 0x01, 0x00, '',
+          extra=b8(0x00FFFEF7, 0x08))
+stitchnum('just laid out, a small ceiling', 0x01, 0x01, 0x00, '', ceiling=0x09)
+
+# Nothing pressed, and a box with no arm of its own.
+stitchnum('nothing pressed', 0x00, 0x01, 0x00, '2')
+
+# The digits.
+stitchnum('the first digit', 0x00, 0x01, 0x02, '')
+stitchnum('a leading nought, refused', 0x00, 0x01, 0x1B, '')
+stitchnum('a second digit', 0x00, 0x01, 0x02, '2')
+stitchnum('a nought after a digit', 0x00, 0x01, 0x1B, '2')
+stitchnum('a third digit, refused', 0x00, 0x01, 0x02, '25')
+stitchnum('a fourth digit, refused', 0x00, 0x01, 0x02, '253')
+
+# Rubbing one out.
+stitchnum('rubbing out with two typed', 0x00, 0x01, 0x0E, '25')
+stitchnum('rubbing out with one typed', 0x00, 0x01, 0x0E, '2')
+stitchnum('rubbing out with nothing typed', 0x00, 0x01, 0x0E, '')
+
+# Leaving, and taking what was typed.
+stitchnum('leaving it alone', 0x00, 0x01, 0x1A, '25')
+stitchnum('taking a number in range', 0x00, 0x01, 0x19, '25')
+stitchnum('taking a number below four', 0x00, 0x01, 0x19, '3')
+stitchnum('taking exactly four', 0x00, 0x01, 0x19, '4')
+stitchnum('taking exactly the ceiling', 0x00, 0x01, 0x19, '64', ceiling=0x40)
+stitchnum('taking one over the ceiling', 0x00, 0x01, 0x19, '65', ceiling=0x40)
+stitchnum('taking nothing at all', 0x00, 0x01, 0x19, '')
+
+# H'22474C
+for _nm, _arrived, _relayout, _ex in (
+        ('just arrived', 1, 0, None),
+        ('laid out again', 0, 1, None),
+        ('a plain pass', 0, 0, None)):
+    e = pat_extra(dict(list(MM_GLYPH.items()) +
+                       list(w16(0x0011B31E, 0x40).items()) +
+                       list((_ex or {}).items())))
+    dispatch_case(_nm, 0x09, _arrived, _relayout, 0, extra=e)
+    move_wipe(new[-1])
+    new[-1]['steps'] = 60000000
+    new[-1]['name'] = 'screen_body_09 (%s)' % _nm
+
 # A last look over every case for the fill-ordering trap.
 _seen = set()
+for c in new:
+    hoist_wipes(c)
 for c in new:
     for k, w in audit(c):
         if (k, w) in _seen: continue

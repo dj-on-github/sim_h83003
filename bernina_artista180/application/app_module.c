@@ -6434,3 +6434,626 @@ void module_hoop_screen(void)
         return;
     }
 }
+
+/* H'23A012. Whether the box `n' of the picking grid would reach past the
+ * last pattern there is. H'114D8B is the first pattern the page shows and
+ * H'0FFE80 how many there are altogether, so a box beyond the count is one
+ * with nothing in it. */
+u8 module_pick_past_end(u8 n)
+{
+    const u16 want = (u16)((u16)REG8(0x00114D8BUL) + (u16)n);
+    const u16 have = (u16)REG8(0x000FFE80UL);
+
+    if ((short)want > (short)have) return 0x01;
+    return 0x00;
+}
+
+/* H'249AEE and H'249B3A. Two more arrows: box ten and box eleven, each with
+ * a lit picture and a dim one. They share their pictures with the page
+ * arrows below, which is why the addresses are written out here rather than
+ * given names of their own. */
+void module_arrow_10(u8 lit)
+{
+    if (lit != 0) hitbox_blit(0x000A, LCD_FRAME_A, 0x0034E46CUL);
+    else          hitbox_blit(0x000A, LCD_FRAME_A, 0x0034E4A8UL);
+}
+
+void module_arrow_11(u8 lit)
+{
+    if (lit != 0) hitbox_blit(0x000B, LCD_FRAME_A, 0x0034E4E4UL);
+    else          hitbox_blit(0x000B, LCD_FRAME_A, 0x0034E520UL);
+}
+
+/* H'23A716. The stitch stream and the marks that go with it put back to
+ * nothing: H'0A41 bytes of whatever H'11F2C6 points at, the two H'15-byte
+ * tables at H'10405B and H'104046, and the dozen odds and ends around
+ * H'104037 that say where the stream has got to. */
+void module_stitch_marks_clear(void)
+{
+    u16 i;
+    u8 k;
+
+    for (i = 0; i < 0x0A41; i++) REG8(REG32(0x0011F2C6UL) + (u32)i) = 0x00;
+
+    for (k = 0; k < 0x15; k++) {
+        REG8(0x0010405BUL + (u32)k) = 0x00;
+        REG8(0x00104046UL + (u32)k) = 0x00;
+    }
+
+    REG8(0x00104037UL) = 0x00;
+    REG8(0x00104044UL) = 0x00;
+    REG8(0x00104040UL) = 0x00;
+    REG16(0x0010403CUL) = 0x0000;
+    REG8(0x00104038UL) = 0x00;
+    REG8(0x00104039UL) = 0x00;
+    REG16(0x0010403AUL) = 0x0000;
+    REG16(0x0010403EUL) = 0x0000;
+    REG8(0x00104042UL) = 0x00;
+    REG8(0x00104043UL) = 0x00;
+}
+
+/* H'231F72. A number written right-aligned into a box, and -- when `mark' is
+ * anything but nought -- the character at H'6D in this font put in a second
+ * box sixty-two pixels to its left. H'11F2DB is cleared first so that a
+ * shorter number cannot leave a digit of the last one behind it. */
+void module_number_label(short n, u16 x0, u16 y0, u16 x1, u16 y1, u16 mark)
+{
+    REG8(0x0011F2DBUL) = 0x00;
+    int_to_decimal(n, (char *)0x0011F2D6UL);
+    text_draw((const char *)0x0011F2D6UL, x0, y0, x1, y1,
+              0x0001, 0x00, (const u8 *)0x00119DE6UL);
+
+    if (mark != 0) {
+        REG8(0x0011F2D6UL) = 0x6D;
+        REG8(0x0011F2D7UL) = 0x00;
+        text_draw((const char *)0x0011F2D6UL, (u16)(x0 + 0xFFC2), y0,
+                  (u16)(x1 + 0xFFC2), y1, 0x0001, 0x00,
+                  (const u8 *)0x00119DE6UL);
+    }
+}
+
+/* H'244ADA. The picked pattern handed over to the module: a code in
+ * H'11A61B worked out from the slot's second record byte, then two messages
+ * sent one after the other, each waited on until the link goes quiet again.
+ *
+ * The code is H'0C for a record byte of nought and one more for each step up
+ * to eight; anything above that gets H'15. The ROM writes this as a jump
+ * table of nine arms that each store one constant, which is a table of nine
+ * constants with the arithmetic spelled out.
+ *
+ * The wait after the first message tests only three of the six things
+ * H'244CE8 does -- the ROM has the shorter form here and the longer one
+ * either side of it. */
+void module_pattern_send(void)
+{
+    const u8 k = REG8(0x0011A41FUL + module_slot12());
+
+    REG8(0x0011A61BUL) = (u8)(0x0C + (k > 0x08 ? 0x09 : k));
+
+    while (module_link_quiet() == 0) module_panel_blink(0x01);
+
+    REG8(0x0011F2A1UL) = 0x03;
+    link_send_start();
+
+    while ((REG8(0x00114D50UL) & 0x21) != 0 || REG8(0x0011F29EUL) != 0 ||
+           REG8(0x0011F2B6UL) != 0) {
+        module_panel_blink(0x01);
+    }
+
+    REG8(0x0011F2A1UL) = 0x04;
+    REG8(0x0011F2A2UL) = 0x01;
+    link_send_start();
+
+    while (module_link_quiet() == 0) module_panel_blink(0x01);
+
+    module_panel_box(0x01);
+}
+
+/* H'239390. One row of the picking grid: three cells across, each holding a
+ * pattern's thumbnail and its number beside it.
+ *
+ * `row' picks the row and gives the cells their y; the loop runs the three
+ * cells across and gives them their x, and the pattern each cell shows is
+ * H'114D8B plus three for the row plus one for the cell. `count' is how many
+ * of the three have a pattern at all -- a cell past it is cleared and left
+ * empty.
+ *
+ * The thumbnails are H'022E bytes apart in a block that is either in RAM at
+ * H'0E0200 or in the data at H'10032E, which `from_ram' chooses, and each is
+ * H'3E rows of nine bytes with a bit to a pixel, drawn one pixel at a time.
+ *
+ * The number beside a cell is drawn with the mark after it only when the
+ * module has more patterns than the machine knows about and this cell is one
+ * of the extra ones -- bit 1 of H'114D51 says the module has been asked, and
+ * H'100255 against H'0FFE80 is how many more. The ROM writes the plain case
+ * out twice, once for each way of reaching it. */
+void module_pick_row(u8 row, u16 first, u16 count, u16 from_ram)
+{
+    const u32 src = ((from_ram & 0xFF) == 0x01 ? 0x000E0200UL : 0x0010032EUL)
+                  + (u32)(u16)((u16)first * (u16)0x022E);
+    const u16 y0 = (u16)((u16)((u16)row << 2)
+                         + (u16)((u16)0x003E * (u16)row) + 0x0029);
+    const u8 gap = 0x06;
+    u16 c;
+
+    for (c = 0; c < 0x0003; c++) {
+        const u16 x0 = (u16)((u16)(0x0008 + (u16)(0x004C * c))
+                             + (c < 0x0002 ? 0x0000 : 0x0002));
+        const u8 n = (u8)((u8)((u8)c + 0x01) + (u8)(0x03 * row)
+                          + REG8(0x00114D8BUL));
+        u8 shown = n;
+        u16 mark = 0x0000;
+
+        module_box_clear((u16)(x0 + 1), y0,
+                         (u16)(x0 + 0x47), (u16)(y0 + 0x3D));
+
+        if ((u16)(u8)count <= c) continue;
+
+        {
+            u16 i, j, b, at;
+
+            for (i = 0; i < 0x003E; i++) {
+                at = 0;
+                for (j = 0; j < 0x0009; j++) {
+                    const u8 byte = REG8(src + (u32)(u16)(
+                        (u16)((u16)0x0009 * i) + (u16)((u16)0x022E * c) + j));
+                    u8 m = 0x80;
+
+                    for (b = 0; b < 0x0008; b++) {
+                        if ((u8)(m & byte) == m) {
+                            plot_pixel((u16)(x0 + at), (u16)(y0 + i),
+                                       LCD_FRAME_A, 0x03);
+                        }
+                        m = (u8)(m >> 1);
+                        at++;
+                    }
+                }
+            }
+        }
+
+        if (REG8(0x00114D51UL) & 0x02) {
+            const u8 extra = (u8)(REG8(0x000FFE80UL) - REG8(0x00100255UL));
+
+            REG8(0x00114DBCUL) = extra;
+            REG8(0x00114DBDUL) = REG8(0x000FFE80UL);
+
+            if ((short)(u16)((u16)REG8(0x000FFE80UL)
+                             - (u16)REG8(0x00100255UL)) < (short)(u16)n &&
+                REG8(0x0011A41DUL + module_slot12()) == 0) {
+                shown = (u8)(n - extra);
+                mark = 0x0001;
+            }
+        }
+
+        module_number_label((short)(u16)shown, (u16)(x0 - gap + 0x0044), y0,
+                            (u16)(x0 + 0x0046), (u16)(y0 + gap), mark);
+    }
+}
+
+/* H'239678 and H'2397D2. The two keys that page the picking grid.
+ *
+ * Both start by looking for a colour boundary between where the page is now
+ * and where the step would take it: the colours are H'1B patterns apart, and
+ * if one falls inside the step the page does not move at all -- instead
+ * H'114D8C is put on the boundary, H'114D87 says which way it was reached
+ * and the slot's record byte takes the colour's number. Only when no
+ * boundary is in the way does the page itself move three along.
+ *
+ * When it does move, the three rows already on the screen are slid up or
+ * down by a region copy and the one row that has come into view is drawn.
+ * The two arrows are then lit or dimmed by where the page has ended up. */
+void module_page_back(void)
+{
+    u8 k;
+
+    if (REG8(0x00114D8BUL) == 0) return;
+
+    for (k = 0x01; k < 0x0A; k++) {
+        const u16 top   = (u16)((u16)0x001B * (u16)k);
+        const u16 first = (u16)REG8(0x00114D8BUL);
+
+        if ((short)top < (short)first) continue;
+        if ((short)(u16)(top + 0xFFFA) > (short)first) continue;
+        if ((u16)((u16)(k - 1) * (u16)0x001B) == (u16)REG8(0x00114D8CUL)) {
+            continue;
+        }
+
+        REG8(0x00114D8CUL) = (u8)((u8)(k - 1) * (u8)0x1B);
+        REG8(0x00114D87UL) = 0x02;
+        REG8(0x0011A41FUL + module_slot12()) = (u8)(k - 1);
+        REG8(0x00114DAFUL) = 0x00;
+        return;
+    }
+
+    REG8(0x00114D8BUL) = (u8)(REG8(0x00114D8BUL) - 0x03);
+
+    region_copy(0x0008, 0x0029, 0x00ED, 0x00A8, 0x006B,
+                LCD_FRAME_A, LCD_FRAME_A);
+
+    {
+        short rows = (short)(u16)((u16)REG8(0x000FFE80UL)
+                                  - (u16)REG8(0x00114D8BUL));
+        const u8 row = (u8)(REG8(0x00114D8BUL) - REG8(0x00114D8CUL));
+
+        if (rows > 0x0003) rows = 0x0003;
+        if (rows >= 0) module_pick_row(0x00, (u16)row, (u16)rows, 0x0000);
+    }
+
+    module_arrow_10(REG8(0x00114D8BUL) != 0 ? 0x01 : 0x00);
+    module_arrow_11((short)(u16)((u16)REG8(0x000FFE80UL)
+                                 - (u16)REG8(0x00114D8BUL)) > 0x0009
+                    ? 0x01 : 0x00);
+}
+
+void module_page_on(void)
+{
+    u8 k;
+
+    if (!((short)(u16)((u16)REG8(0x000FFE80UL)
+                       - (u16)REG8(0x00114D8BUL)) > 0x0009)) {
+        return;
+    }
+
+    for (k = 0x01; k < 0x0A; k++) {
+        const u16 top   = (u16)((u16)0x001B * (u16)k);
+        const u16 first = (u16)REG8(0x00114D8BUL);
+
+        if ((short)(u16)(top + 0xFFF7) > (short)first) continue;
+        if ((short)(u16)(top + 0xFFFD) < (short)first) continue;
+        if (top == (u16)REG8(0x00114D8CUL)) continue;
+
+        REG8(0x00114D8CUL) = (u8)((u8)0x1B * k);
+        REG8(0x00114D87UL) = 0x01;
+        REG8(0x0011A41FUL + module_slot12()) = k;
+        REG8(0x00114DAFUL) = 0x01;
+        return;
+    }
+
+    REG8(0x00114D8BUL) = (u8)(REG8(0x00114D8BUL) + 0x03);
+
+    region_copy(0x0008, 0x006B, 0x00ED, 0x00EA, 0x0029,
+                LCD_FRAME_A, LCD_FRAME_A);
+
+    {
+        short rows = (short)(u16)((u16)REG8(0x000FFE80UL)
+                                  - (u16)((u16)REG8(0x00114D8BUL) + 0x0006));
+        const u8 row = (u8)((u8)(REG8(0x00114D8BUL)
+                                 - REG8(0x00114D8CUL)) + 0x06);
+
+        if (rows > 0x0003) rows = 0x0003;
+        if (rows >= 0) module_pick_row(0x02, (u16)row, (u16)rows, 0x0000);
+    }
+
+    module_arrow_10(REG8(0x00114D8BUL) != 0 ? 0x01 : 0x00);
+    module_arrow_11((short)(u16)((u16)REG8(0x000FFE80UL)
+                                 - (u16)REG8(0x00114D8BUL)) > 0x0009
+                    ? 0x01 : 0x00);
+}
+
+/* H'22BF8C. Screen H'14's press: the grid of patterns to pick from.
+ *
+ * The hit test covers boxes one to H'0D, but it is the box's *value* that is
+ * dispatched on and those run well past the box numbers -- H'17 and H'18
+ * page the grid, H'55 and H'1A are the two ways out, and one to nine are the
+ * nine cells. Unlike the other module screens this one is a run of
+ * comparisons rather than a jump table.
+ *
+ * Picking a cell works out which colour the pattern belongs to -- H'1B
+ * patterns to a colour -- and puts the colour in the slot's record and the
+ * pattern's place within it beside it. Where it goes next depends on bit 3
+ * of the pattern's attribute byte. */
+void module_pick_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+    REG8(0x00114D8EUL) = 0x03;
+    if (module_busy() != 0) return;
+
+    if (value == 0x0017) { module_page_back(); return; }
+    if (value == 0x0018) { module_page_on();   return; }
+
+    if (value == 0x0055) {
+        module_buffers_clear();
+        REG8(0x00114D7EUL) = 0x01;
+        REG8(0x00114DA1UL) = 0x00;
+        REG8(0x0011A41DUL + module_slot12()) = 0x00;
+        REG8(0x00114D8BUL) = 0x00;
+        REG8(0x00114D9BUL) = 0x01;
+        REG8(0x00114D8EUL) = 0x02;
+        screen_switch(0x13, 0x01, 0x00);
+        return;
+    }
+
+    if (value == 0x001A) {
+        module_buffers_clear();
+        REG8(0x00114D9BUL) = 0x01;
+        REG8(0x00114D8EUL) = 0x01;
+        screen_switch(0x12, 0x01, 0x00);
+        return;
+    }
+
+    if ((short)value < 0x0001) return;
+    if ((short)value > 0x0009) return;
+
+    {
+        const u8 v = (u8)value;
+
+        if (module_pick_past_end(v) != 0) return;
+        if (REG16(0x00114D4CUL) & 0x4000) return;
+        if (module_link_quiet() == 0) return;
+        if (!(REG8(0x00114D51UL) & 0x01)) return;
+        if (REG8(0x00114D72UL) != 0) return;
+
+        REG8(0x00114D98UL) = 0x00;
+        stitch_reset_current();
+
+        REG8(0x0011A41FUL + module_slot12()) =
+            (u8)((u16)(u8)((u8)(REG8(0x00114D8BUL) + v) - 0x01) / 0x1B);
+        REG8(0x0011A41AUL + module_slot12()) = (u8)(REG8(0x00114D8BUL) + v);
+        REG8(0x0011A41AUL + module_slot12()) =
+            (u8)(REG8(0x0011A41AUL + module_slot12())
+                 - (u8)((u16)REG8(0x0011A41FUL + module_slot12()) * 0x1B));
+
+        REG16(0x0011B106UL) = value;
+        REG8(0x0011F4E6UL) = 0x00;
+        REG16(0x0011F292UL) = 0x0000;
+        REG8(0x00114D89UL) = 0x00;
+        REG16(0x0011F4DCUL) = 0x0000;
+        REG16(0x0011F4DEUL) = 0x0000;
+
+        module_pattern_send();
+
+        if (pattern_attr_bit3() != 0) {
+            screen_switch(0x38, 0x01, 0x00);
+            module_stitch_marks_clear();
+            REG8(0x00114D8EUL) = 0x06;
+            REG8(0x00114D7FUL) = 0x01;
+            REG8(0x00114D96UL) = 0x01;
+        } else {
+            REG8(0x00114D69UL) = 0x01;
+            screen_switch(0x23, 0x01, 0x00);
+            REG8(0x00114D73UL) = 0x01;
+            REG8(0x00114D72UL) = 0x03;
+            REG8(0x00114D96UL) = 0x00;
+        }
+    }
+}
+
+/* H'22BCCC. Screen H'13's press, which is screen H'14's over again with four
+ * things changed:
+ *
+ *   - the state byte it leaves behind is H'02 rather than H'03;
+ *   - the H'55 key is the one that wants the module answering, not the cell,
+ *     so bit 0 of H'114D51 is tested there instead;
+ *   - that key hands on the *other* kind, so H'114DA1 and the slot's H'11A41D
+ *     both take one rather than nought, and it goes to screen H'14;
+ *   - the H'1A key writes its two bytes the other way round.
+ *
+ * Everything else -- the paging keys, the nine cells and the colour
+ * arithmetic under them -- is the same, and the cell arm ends in the same
+ * H'244ADA that cannot be reached in a comparison run. */
+void module_pick_screen_b(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+    REG8(0x00114D8EUL) = 0x02;
+    if (module_busy() != 0) return;
+
+    if (value == 0x0017) { module_page_back(); return; }
+    if (value == 0x0018) { module_page_on();   return; }
+
+    if (value == 0x0055) {
+        if (!(REG8(0x00114D51UL) & 0x01)) return;
+
+        module_buffers_clear();
+        REG8(0x00114D7EUL) = 0x01;
+        REG8(0x00114DA1UL) = 0x01;
+        REG8(0x0011A41DUL + module_slot12()) = 0x01;
+        REG8(0x00114D8BUL) = 0x00;
+        REG8(0x00114D9BUL) = 0x01;
+        REG8(0x00114D8EUL) = 0x03;
+        screen_switch(0x14, 0x01, 0x00);
+        return;
+    }
+
+    if (value == 0x001A) {
+        module_buffers_clear();
+        REG8(0x00114D8EUL) = 0x01;
+        REG8(0x00114D9BUL) = 0x01;
+        screen_switch(0x12, 0x01, 0x00);
+        return;
+    }
+
+    if ((short)value < 0x0001) return;
+    if ((short)value > 0x0009) return;
+
+    {
+        const u8 v = (u8)value;
+
+        if (module_pick_past_end(v) != 0) return;
+        if (REG16(0x00114D4CUL) & 0x4000) return;
+        if (module_link_quiet() == 0) return;
+        if (REG8(0x00114D72UL) != 0) return;
+
+        REG8(0x00114D98UL) = 0x00;
+        stitch_reset_current();
+
+        REG8(0x0011A41FUL + module_slot12()) =
+            (u8)((u16)(u8)((u8)(REG8(0x00114D8BUL) + v) - 0x01) / 0x1B);
+        REG8(0x0011A41AUL + module_slot12()) = (u8)(REG8(0x00114D8BUL) + v);
+        REG8(0x0011A41AUL + module_slot12()) =
+            (u8)(REG8(0x0011A41AUL + module_slot12())
+                 - (u8)((u16)REG8(0x0011A41FUL + module_slot12()) * 0x1B));
+
+        REG16(0x0011B106UL) = value;
+        REG8(0x0011F4E6UL) = 0x00;
+        REG16(0x0011F292UL) = 0x0000;
+        REG8(0x00114D89UL) = 0x00;
+        REG16(0x0011F4DCUL) = 0x0000;
+        REG16(0x0011F4DEUL) = 0x0000;
+
+        module_pattern_send();
+
+        if (pattern_attr_bit3() != 0) {
+            screen_switch(0x38, 0x01, 0x00);
+            module_stitch_marks_clear();
+            REG8(0x00114D8EUL) = 0x06;
+            REG8(0x00114D7FUL) = 0x01;
+            REG8(0x00114D96UL) = 0x01;
+        } else {
+            REG8(0x00114D69UL) = 0x01;
+            screen_switch(0x23, 0x01, 0x00);
+            REG8(0x00114D73UL) = 0x01;
+            REG8(0x00114D72UL) = 0x03;
+            REG8(0x00114D96UL) = 0x00;
+        }
+    }
+}
+
+/* H'22BB2A. Screen H'12's press: which of the two kinds of pattern to pick.
+ *
+ * Three boxes, and the third does nothing at all. The first two do the same
+ * eight things in the same order and differ only in what they hand on: key
+ * one leaves H'114DA1 and the slot's H'11A41D at nought and goes to screen
+ * H'13, key two puts one in both and goes to H'14 -- which is the pair of
+ * picking screens the other way round from where they send each other.
+ *
+ * Both first ask the module to say what it is, and give up with a claim of
+ * H'0B when it will not. Only the second also wants bit 0 of H'114D51,
+ * which is the module having answered how many patterns it holds. */
+void module_kind_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0001, 0x0003, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+    REG8(0x00114D8EUL) = 0x01;
+    if (module_busy() != 0) return;
+
+    if (value == 0x0001) {
+        if (module_identify() == 0) { (void)link_claim(0x0B); return; }
+
+        REG8(0x00114D7EUL) = 0x01;
+        REG8(0x00114D9BUL) = 0x01;
+        REG8(0x0011A63CUL) = 0x00;
+        REG8(0x0011F4E6UL) = 0x00;
+        (void)link_claim(0x05);
+        pattern_slot_begin();
+        screen_switch(0x13, 0x01, 0x00);
+        REG8(0x00114DA1UL) = 0x00;
+        REG8(0x0011A41DUL + module_slot12()) = 0x00;
+        REG8(0x0011A41FUL + module_slot12()) = 0x00;
+        REG8(0x00114D8EUL) = 0x02;
+        return;
+    }
+
+    if (value == 0x0002) {
+        if (module_identify() == 0) { (void)link_claim(0x0B); return; }
+        if (!(REG8(0x00114D51UL) & 0x01)) return;
+
+        REG8(0x00114D7EUL) = 0x01;
+        REG8(0x00114D9BUL) = 0x01;
+        REG8(0x0011A63CUL) = 0x00;
+        REG8(0x0011F4E6UL) = 0x00;
+        (void)link_claim(0x05);
+        pattern_slot_begin();
+        screen_switch(0x14, 0x01, 0x00);
+        REG8(0x00114DA1UL) = 0x01;
+        REG8(0x0011A41DUL + module_slot12()) = 0x01;
+        REG8(0x0011A41FUL + module_slot12()) = 0x00;
+        REG8(0x00114D8EUL) = 0x03;
+        return;
+    }
+}
+
+/* H'2382EE. The pedal seen for the first time: H'114D78 is H'EE while there
+ * is nothing to notice and H'FF once it has been, so the pass only happens
+ * on the edge. Bit 0 of H'FFFEC4 is the pedal itself. */
+void module_pedal_pass(void)
+{
+    if (REG8(0x00114D78UL) == 0xEE) return;
+    if (!(REG8(0x00FFFEC4UL) & 0x01)) return;
+
+    REG8(0x00114D78UL) = 0xFF;
+    module_wait_pass();
+}
+
+/* H'21A070. Screen H'11's press: the two digits typed on the number pad
+ * taken as a pattern number.
+ *
+ * Only boxes nine and ten are live. Box ten's value H'1A goes back one
+ * screen; box nine's H'19 looks the number up: the two digits at H'11B0FE
+ * and H'11B0FF make a number, that indexes the word table H'11B2BA points
+ * at, and the word there is the pattern. A nought there, or a pattern the
+ * machine will not go to, and it gives up to screen H'0F.
+ *
+ * The two calls to H'206724 write the same field of the pattern's queue
+ * record and differ only in the value -- nought when the second digit is
+ * four, five when the pattern is number one -- and nothing else in the
+ * record is touched, all fourteen other flags being nought.
+ *
+ * The test on H'57FF80 before the digits are read chooses between two arms
+ * that are the same instructions, which is the compiler having duplicated
+ * one; it is written once here.
+ *
+ * Both keys are refused outright while bit 7 of H'114DC6 is up. */
+void goto_number_screen(void)
+{
+    u16 value = 0, index = 0;
+
+    if (touch_hit(0x0009, 0x000A, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+
+    if (value == 0x0019) {
+        short typed;
+        u16 pattern;
+
+        if (REG8(0x00114DC6UL) & 0x80) return;
+
+        screen_stack_clear();
+
+        typed = (short)(u16)((u16)((u16)0x000A * (u16)REG8(0x0011B0FEUL))
+                             + (u16)REG8(0x0011B0FFUL));
+        pattern = REG16(REG32(0x0011B2BAUL)
+                        + (u32)(long)(short)(u16)((u16)typed << 1));
+
+        if (pattern == 0x0000) {
+            screen_switch(0x0F, 0x01, 0x00);
+            return;
+        }
+
+        if (goto_pattern_number(pattern) == 0) {
+            screen_switch(0x0F, 0x01, 0x00);
+            return;
+        }
+
+        if (REG8(0x0011B0FFUL) == 0x04) {
+            queue_record_set(0x01, REG16(0x00FFFEE0UL),
+                             0x00, 0xFF, 0x00, 0xFF, 0x01, 0x00, 0x00, 0xFF,
+                             0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF);
+        } else if (pattern == 0x0001) {
+            queue_record_set(0x01, REG16(0x00FFFEE0UL),
+                             0x00, 0xFF, 0x00, 0xFF, 0x01, 0x05, 0x00, 0xFF,
+                             0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF);
+        }
+
+        if (REG8(0x00FFFEC4UL) & 0x01) module_pedal_pass();
+        return;
+    }
+
+    if (value == 0x001A) {
+        if (REG8(0x00114DC6UL) & 0x80) return;
+
+        screen_stack_pop();
+        screen_switch(0x10, 0x01, 0x00);
+        return;
+    }
+}

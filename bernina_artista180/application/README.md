@@ -5145,6 +5145,436 @@ overrides -- silently, and with a fill that reaches nothing. `subspec.py`
 prunes the `fills` table to what its chosen cases name, so a three-case
 mutation spec stays small instead of carrying all thirty megabytes.
 
+## 36. Screen H'14, the grid of patterns to pick from
+
+Not a jump table this time: the press is a run of comparisons, and it
+dispatches on the box's *value* rather than its number, so the values run
+well past the thirteen boxes the hit test covers.
+
+| | |
+|---|---|
+| `H'23A012` `module_pick_past_end` | whether a cell reaches past the last pattern |
+| `H'249AEE` `module_arrow_10`, `H'249B3A` `module_arrow_11` | two more arrows |
+| `H'23A716` `module_stitch_marks_clear` | the stream buffer and its marks |
+| `H'231F72` `module_number_label` | a number, and a mark beside it |
+| `H'239390` `module_pick_row` | one row of three cells, thumbnails and numbers |
+| `H'239678` `module_page_back`, `H'2397D2` `module_page_on` | the two paging keys |
+| `H'244ADA` `module_pattern_send` | the pattern handed to the module |
+| `H'22BF8C` `module_pick_screen` | the press |
+| `H'2256AC` `screen_body_14` | the lay-out, with two extra pictures |
+
+The paging keys are the interesting pair. Neither simply moves the page:
+each first looks for a colour boundary between where the page is and where
+the step would put it -- colours are `H'1B` patterns apart -- and if one
+falls inside the step the page does not move at all. Instead `H'114D8C` goes
+onto the boundary and the slot's record byte takes the colour's number, so
+the next press starts the page from there. Only when nothing is in the way
+do the three rows slide by a region copy and the one row that has come into
+view get drawn.
+
+`H'239390` draws that row: three cells across, each a thumbnail of `H'3E`
+rows of nine bytes with a bit to a pixel, drawn a pixel at a time, and the
+pattern's number beside it. The number gains a mark after it only when the
+module holds more patterns than the machine knows about and this cell is one
+of the extra ones. The routine came out right first time, all seventeen
+cases -- which is what reading the geometry carefully rather than guessing
+buys.
+
+### Two traps in the cases, neither in the code
+
+Both cost more than the routines did.
+
+**Stack offsets in a case are hexadecimal.** Writing `'10'` and `'12'` for
+the fifth and sixth arguments put them at `H'10` and `H'12` instead of ten
+and twelve, so two arguments landed in the wrong place. `'4'`, `'6'` and
+`'8'` read the same either way, which is why five screens went by before
+this could bite.
+
+**The test font defines only `!` and the ten digits.** A table slot left
+undefined is a pointer of nought, and `text_draw` follows it -- into the code
+region, which the two images differ in *by construction*. So a routine that
+draws any other character has its two sides part company for reasons that
+have nothing to do with the routine, and the failure looks like a drawing
+bug: a tall stripe of pixels down the frame at a column neither box is at.
+The mark at `H'6D` now gets `'0'`'s glyph. The same trap took a negative
+number with it, since `int_to_decimal` has no minus sign and turns one into
+characters outside the digits -- that is the number formatter's business, and
+has cases of its own, so the case went rather than the font growing a
+work-round.
+
+**And one blind case caught by its own step count.** The first pair of arrow
+cases passed while running 280 steps against their four siblings' 20,000,
+because the fill those siblings use has a box table that stops short of box
+ten. Regenerated on the module screens' furniture they write 21 and 27 bytes
+and tell the two pictures apart. The lesson is the one from part 31 read
+backwards: **a case that passes suspiciously cheaply is a case that is not
+running the routine.**
+
+### The arm that cannot be reached, measured rather than assumed
+
+`H'244ADA` sends two messages one after the other and waits on each. The
+wait ends only when the SCI interrupt clears `H'11F29E`, and nothing in a
+comparison run does that; unlike the other send-and-wait routines there is no
+path through it that turns back before the first message. Both sides were
+run to **four hundred million steps** and neither returned. It is therefore
+written from the listing and has no cases, and the press's own cell arm --
+which ends in it -- is covered only as far as its five guards. Those five are
+each turned back by a case of their own.
+
+## 37. Screen H'13, the same grid reached the other way
+
+The shortest screen in the cluster, because it is screen H'14 over again.
+
+| | |
+|---|---|
+| `H'22BCCC` `module_pick_screen_b` | the press, a near-twin of `H'22BF8C` |
+| `H'2255B2` `screen_body_13` | the same lay-out with its own two pictures |
+
+**No new routines at all.** The press calls exactly the same twelve routines
+as screen H'14's and is exactly as long, so it was read by diffing the two
+listings with the local branch targets blanked out: 206 instructions each and
+thirty-two differing lines between them. That is a fifth of the reading the
+screen would otherwise have taken, and it is worth doing whenever two presses
+turn out to have the same callee set -- which the reach tool will say in a
+line.
+
+The four differences:
+
+* the state byte it leaves behind is `H'02` rather than `H'03`;
+* the `H'55` key is the one that wants the module answering, so bit 0 of
+  `H'114D51` is tested there instead of on the cell arm;
+* that key hands on the *other* kind of pattern -- `H'114DA1` and the slot's
+  `H'11A41D` both take one rather than nought -- and goes to screen `H'14`,
+  where screen `H'14`'s own equivalent goes to `H'13`;
+* the `H'1A` key writes its two bytes the other way round.
+
+The guard that moved is worth a case each way round, and the one that says
+so is `a cell with the module not answering, which it does not look at`: it
+matches the `something already asked for` case step for step, which is the
+proof that the test really has gone from that arm.
+
+The cell arm ends in the same `H'244ADA` that cannot be reached in a
+comparison run, so it too is covered only as far as its guards.
+
+## 38. Screen H'12, which kind of pattern to pick
+
+Three boxes, and the third does nothing at all.
+
+| | |
+|---|---|
+| `H'22BB2A` `module_kind_screen` | the press |
+| `H'2254D2` `screen_body_12` | the lay-out, and the preview it owes |
+
+No new routines. The two live keys do the same eight things in the same
+order and differ only in what they hand on: key one leaves `H'114DA1` and the
+slot's `H'11A41D` at nought and goes to screen `H'13`, key two puts one in
+both and goes to `H'14`. That is the pair of picking screens from parts 36
+and 37, and it closes the circle -- each of them sends the *other* kind on,
+and this is where the choice is first made.
+
+Only the second key also wants bit 0 of `H'114D51`, which is the module
+having said how many patterns it holds.
+
+The body is the plain lay-out with two additions: box three is put into
+state `H'02` as the screen is laid out, and `H'11B0A9` is raised so the same
+pass goes on to draw the preview of whatever item `H'FFFEE0` names.
+
+### Twelve cases that were all the same case, twice over
+
+This screen's cases had to be fixed twice, and both times the tell was the
+step count rather than a failure.
+
+**First:** all twelve arm cases passed at 805 steps and 11 bytes -- every one
+of them identical. `H'24610A` reports state `H'01` busy unless **bit 7** of
+`H'114D51` is up, and the fill had only bit 0, so the three-key dispatch was
+never reached at all.
+
+**Then:** with that fixed they all ran 4.65 *million* steps and still wrote
+the same 12 bytes. `H'249DE8` polls the module's reply buffer at `H'104C90`
+for the five bytes of the identity block at `H'200103` -- `"V03.0"` -- two and
+a half thousand times, with a delay between tries, before giving up. Left
+empty it always gives up, so every key ended in the same `link_claim(H'0B)`.
+Pre-loading those five bytes makes it match on the first try.
+
+Only then did the cases separate: seventeen bytes for the first key against
+eighteen for the second, and the guard that only the second has proven both
+ways -- turned back at 922 steps, through at 1001.
+
+**A case that passes cheaply and a case that passes expensively can both be
+the same case.** The first fix cost nothing and the second cost four and a
+half million steps, and neither was doing anything a mutation could have
+been caught by.
+
+## 39. Screen H'11, a pattern by its number
+
+The number pad's own screen: two digits typed, and the pattern they name.
+
+| | |
+|---|---|
+| `H'2382EE` `module_pedal_pass` | the pedal noticed, once |
+| `H'206724` `queue_record_set` | a pattern's cached parameters, sixteen arguments |
+| `H'21A070` `goto_number_screen` | the press |
+| `H'225046` `screen_body_11` | the lay-out, pushed on the stack |
+
+Only boxes nine and ten are live. Box ten goes back one screen. Box nine
+makes a number from the two digits at `H'11B0FE` and `H'11B0FF`, indexes the
+word table `H'11B2BA` points at, and hands the word there to
+`goto_pattern_number`. A nought in the table, or a pattern the machine will
+not go to, and it gives up to screen `H'0F`.
+
+### Sixteen arguments, and how they were checked
+
+`H'206724` takes `mark`, `slot` and then **seven flag-and-value pairs**, each
+flag saying whether to write its field. Two of the seven fields *move* when
+bit 6 of `H'11A7BD` is down -- to offsets `H'02` and `H'07` instead of `H'03`
+and `H'08`, which is the same pair of fields for the other kind of stitch --
+and byte nought's low six bits are rewritten last, keeping only bit 7 of
+whatever was there.
+
+Getting the order of sixteen arguments right from a listing is the sort of
+thing that is easy to be quietly wrong about, so the cases are built to say
+so: one case per pair, with that pair's flag up and the other six down.
+Each writes four bytes, and each writes them **at a different address**. A
+pair read into the wrong position would land in another field and the
+comparison would fail on the address, not merely on a value. Both settings of
+bit 6 are run for all of them, which is twenty-eight cases for one routine
+and worth it.
+
+The press's own two call sites turn on exactly one of the seven flags and
+pass `H'FF` for every other value, which is a second, independent check of
+the same thing: a mis-ordered argument would have put `H'FF` into a field.
+
+### A pointer that had to come out of the machine's dump
+
+`screen_body_11` does not load a constant picture the way the rest of the
+cluster does; it loads the fifth long of whatever `H'11B2B6` points at. Left
+as the boot leaves it that is a wild pointer, `image_load` runs off into
+nothing and never comes back, and both sides hang identically -- which is a
+pass the harness rightly refuses to give.
+
+`allnewdump.bin` settles it: `H'11B2B6` holds `H'11510E`, and that block's
+fifth long is the picture at `H'3B4352`. Both are pinned, and the case now
+draws fifty-three thousand bytes. **The first case this cluster has needed
+that could not be derived from the listing alone** -- everything else has come
+from reading the code, and this one had to be looked up in a picture of the
+real machine's memory.
+
+### The arm that the machine cannot be in
+
+The press's second call to `H'206724` is gated on the looked-up pattern being
+number one, and pattern one is in none of the item lists, so
+`goto_pattern_number` turns back before that line is ever reached. The other
+call site is covered, so the call and its argument order are checked; only
+that one constant is not. Contriving a fill in which pattern one resolves
+would be testing a state the machine cannot be in, which is worth less than
+saying so here.
+
+## 40. Screen H'09, a stitch length typed in
+
+The last of the cluster, and a single routine: `H'218CBE` is the whole
+screen, called with one as it lays out and with nought on every pass after.
+All sixteen of its callees were already written.
+
+| | |
+|---|---|
+| `H'218CBE` `stitch_number_screen` | the whole screen |
+| `H'22474C` `screen_body_09` | the lay-out |
+
+The typed digits live as a string at `H'11A1A5`. Box value `H'0E` rubs the
+last one out, `H'1A` leaves without changing anything, `H'19` takes what has
+been typed -- four up to the ceiling `H'11B31E` holds -- and every other value
+is a digit, the box value plus `H'15`. A leading nought is refused and so is
+a third digit.
+
+Two things in the listing read as noise on the way down and only made sense
+on the way back up:
+
+* the two buffers copied out of `H'250758` and `H'25075E` at the top are
+  both written over before they are read, and both sources are all noughts
+  anyway. They are the compiler's, not the screen's;
+* a single byte is set to nought at the very top, seven bytes into the
+  frame, for no visible reason. It is the terminator of the one-character
+  string a digit is appended through, planted a hundred instructions before
+  the character is.
+
+### A name that was already taken
+
+The font this screen's first box draws with lives at `H'1196EA`, and the
+string after the number is `"mm"` from `H'250AE0` -- the same character
+`H'6D` that screen H'15's mark needed, and the same trap, since the test font
+defines only `!` and the digits.
+
+The first attempt at a fix defined a `FONT4` for it. There already **was** a
+`FONT4` at that address, built four thousand lines earlier, and redefining it
+would have quietly handed every existing case that uses it a narrower,
+half-built font. Nothing would have complained.
+
+What caught it was the fill-ordering audit naming `1196EA:400` when the line
+just written said `1196EA:140` -- a span that had not been typed, which meant
+something else owned the name.
+
+The machinery that was already there turns out to have met this exact
+problem and written down what it looks like:
+
+> a character with no glyph reads its bitmap header from address zero and
+> paints a column down the screen
+
+which is precisely the tall stripe that took so long to diagnose from first
+principles in part 36. It also already had the convention for fixing it.
+**The codebase had solved this before and said so; the cost of not reading
+around the machinery before duplicating it was one near-miss and an
+afternoon of part 36.**
+
+### The module screens are done
+
+`H'37`, `H'24`, `H'23`, `H'4E`, `H'16`, `H'15`, `H'14`, `H'13`, `H'12`,
+`H'11` and `H'09` are all reconstructed and compared.
+
+## 41. Mutating the five screens, and the blind spot it found
+
+Screens `H'14` down to `H'09` were reconstructed and compared before any of
+them was mutated. **A hundred and twenty mutations, a hundred and eighteen
+killed.**
+
+They were run a routine at a time, each mutation against only the cases that
+can see it, rather than one spec of every case for every mutation; that is
+several times quicker and no weaker. Every anchor was checked against the
+sources first -- two of the hundred and twenty did not match, one a typo and
+one an anchor that appeared *twice* in its routine, which `mutate_apply`
+refuses. Ten minutes of checking saved two hours of running.
+
+### The uniform fill
+
+Fourteen kills' worth of blind spot came from one line of the case
+generator: the thumbnails the picking grid draws were filled with `A5`
+repeated seventeen hundred and sixty times.
+
+A block that reads the same at every offset hides **every** mutation of the
+arithmetic that works out where to read. Three separate routines were
+affected -- the `H'022E` between one thumbnail and the next, the nine bytes
+between one row of a thumbnail and the next, and the row index one of the
+paging keys hands on. All seventeen `module_pick_row` cases passed either
+way; the comparison suite could not have found this, and did not.
+
+The fill now goes down in `H'20`-byte bands of differing values. The same
+change took the `module_page_on` survivor with it, once the block was also
+made big enough that moving the index reads *pinned* data rather than two
+equally unpinned bytes -- a shorter block had both versions reading past the
+end, where the two images agree by accident.
+
+**A fill is part of the test, not scenery.** A case can exercise a line, pass,
+and still be unable to see it go wrong.
+
+### Three that were testing the wrong guard
+
+Three more survived because the case aimed at them was stopped by a
+*different* test first:
+
+* the `H'06` window a colour boundary is looked for in could not be probed
+  while `H'114D8C` sat at nought, because the equality test after it skipped
+  the arm for both versions;
+* `module_pick_screen` and `module_kind_screen`'s hit-test bounds needed a
+  press on the last box each covers, and every case pressed box one;
+* `queue_record_set`'s two masks on byte nought disagree about **bit 6
+  alone**, and no record in any case had it set.
+
+The region copy that slides the grid up needed the rows of the front buffer
+to differ from one another before moving its source row could show; with a
+value per row it fails ten cases.
+
+### The two that are left
+
+* **`rows > 3` widened to `rows > 4`** is equivalent, and provably so:
+  `module_pick_row` loops `c < 3` whatever it is told, and uses `count` only
+  in `count <= c`. No clamp above three can be told from three when a row
+  has three cells.
+* **`H'114D51 & 0x01` widened to `& 0x02`** in `module_pick_screen` is fenced
+  in by the send-and-wait limit of part 36. Every case that reaches that
+  guard is turned back by the `H'114D72` test on the very next line, so both
+  versions return having written the same bytes; and a case that passes both
+  runs into `H'244ADA`, which does not come back at any step budget. It is
+  the same gap seen from a second direction.
+
+## 42. The fill-ordering backlog
+
+The audit in part 31 had been printing warnings all along and nobody had
+read past the last line of them. There were **three hundred and thirty-nine**
+-- and that is the count *after* it drops repeats of the same pin and the
+same wide key. Counted properly, **1,952 of the 1,970 generated cases carried
+at least one wiped pin, 176,157 in all**, from about nineteen root causes in
+the shared fill builders.
+
+They are all gone, and fixing them changed what ninety-seven cases do.
+
+### Three tables pinned past their ends
+
+The biggest cause was three picture tables given spans that ran over the
+structures after them. The machine's own memory dump settles where each one
+really ends, and it is exact:
+
+| table | span used | what the dump shows |
+|---|---|---|
+| `H'11581E` | `H'100`, 64 entries | **44**, ending at `H'1158CE` |
+| `H'1158CE` | `H'200` and `H'400` | **78**, ending at `H'115A06` |
+
+Entry 43 of the first table is the last picture pointer and entry 44 *is*
+`H'1158CE`. Entry 77 of the icon table is the last pointer and entry 78 holds
+`0004000D` -- a count and its values, a list, not a pointer. And the highest
+key any real strip carries is `H'4D`, which is 77. The table fits the data it
+serves exactly.
+
+So the oversized spans were wiping the two lists at `H'115A06` and `H'115A20`
+that the same builders went on to set, and the keys the generator had
+invented above `H'4D` -- up to `H'66` -- had no picture at all and would have
+blitted from address nought.
+
+### The base case had it frozen in
+
+`base_fill` starts every generated fill from one hand-written case, and that
+case's own fill has `11581E:100` at position 172, *after* the sixteen icon
+pins it sets at positions 122 to 152. It was wiping its own work, and
+because it is hand-written and not generated, no amount of regenerating
+could ever have fixed it. It had to be corrected in `routines.json` itself,
+which touched two thousand and seventy-four cases.
+
+### A remedy that already existed, applied by hand
+
+`move_wipe` has been in this file for a long time and forty-five cases call
+it. It does one thing: moves the wide catalogue zero back to before the pins
+it would otherwise cover. Some builders never called it, and the proof is
+pleasing -- fixing the first one made the warnings reappear against the
+*next* builder with the same omission.
+
+So `hoist_wipes` now does what `move_wipe` does, for every wide key and
+every case, as a pass over the generated cases before the audit runs. Only
+the ordering moves; no value changes. It costs `gen_cases.py` about a minute
+and a half.
+
+**It is a net, not a cure.** All three causes above would have been hidden by
+it rather than found. It belongs next to the audit, not instead of it -- and
+the audit is worth having again now that it prints nothing, because the next
+warning will be a new mistake rather than one of three hundred.
+
+### What it was worth
+
+Ninety-seven cases changed behaviour and seventy-three of them write a
+different number of bytes. Not one of them started or stopped passing: they
+were all quite happy before, because both images were doing the same thing
+with the same wiped data.
+
+The best evidence is a comment that was already in the file, above the cases
+for `H'212B5E`:
+
+> Boxes 5 to 9 rather than 1 to 5: the shared fill wipes the box table again
+> part-way through, so only the boxes defined after that survive it.
+
+**The defect was known, and worked around instead of fixed.** Whoever wrote
+that avoided boxes 1 to 5 because the fill destroyed them, and left a case
+called `boxes 1 to 5, none of them drawn` to record the symptom. With the
+ordering right those boxes survive, that case draws them, and it writes four
+and a half times as many bytes as it did. The workaround is gone and so is
+the name.
+
 ## The tools
 
 Everything the comparison suite needs now lives in `tool/`, run from the

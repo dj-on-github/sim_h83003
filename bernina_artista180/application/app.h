@@ -1367,6 +1367,25 @@ u8 module_slot_changed(void);
 void module_sizes_screen(void);
 u8 module_turn_fits(u8 turn, u8 up, u8 by);
 void module_hoop_screen(void);
+u8 module_pick_past_end(u8 n);
+void module_pattern_send(void);
+void module_pick_row(u8 row, u16 first, u16 count, u16 from_ram);
+void module_page_back(void);
+void module_page_on(void);
+void module_pick_screen(void);
+void module_pick_screen_b(void);
+void module_kind_screen(void);
+void module_pedal_pass(void);
+void goto_number_screen(void);
+void stitch_number_screen(u8 arrived);
+void queue_record_set(u8 mark, u16 slot,
+                      u8 set_a, u8 a, u8 set_b, u8 b, u8 set_c, u8 c,
+                      u8 set_d, u8 d, u8 set_e, u8 e, u8 set_f, u8 f,
+                      u8 set_g, u8 g);
+void module_arrow_10(u8 lit);
+void module_arrow_11(u8 lit);
+void module_stitch_marks_clear(void);
+void module_number_label(short n, u16 x0, u16 y0, u16 x1, u16 y1, u16 mark);
 void embroidery_panel_save_b(void);
 u8 module_box10_live(void);
 void module_colours_dither(void);
@@ -1420,6 +1439,11 @@ void screen_body_37(void);
 void screen_body_24(void);
 void screen_body_23(void);
 void screen_body_4E(void);
+void screen_body_09(void);
+void screen_body_11(void);
+void screen_body_12(void);
+void screen_body_13(void);
+void screen_body_14(void);
 void screen_body_15(void);
 void screen_body_16(void);
 u8 hoop_nudge_screen(void);

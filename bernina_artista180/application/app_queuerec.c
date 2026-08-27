@@ -2049,3 +2049,51 @@ void picker_strip_screen(u16 mode)
         REG8(0x0011B0A9UL) = 0x01;
     }
 }
+
+/* H'206724. A pattern's cached parameters written into its queue record,
+ * each one only if its own flag says so.
+ *
+ * Sixteen arguments: whether to mark the queue dirty, which record, and
+ * then seven flag-and-value pairs. The record is the sixteen bytes at
+ * H'0E4010 plus the slot times sixteen, and the seven land at offsets H'01,
+ * H'03, H'04, H'05, H'08, H'06 and H'09 -- except that two of them move when
+ * bit 6 of H'11A7BD is down, to H'02 and H'07 instead, which is the same
+ * pair of fields for the other kind of stitch.
+ *
+ * Byte nought's low six bits are rewritten last: one normally, two when bit
+ * 6 was up, and bit 7 is the only thing kept from what was there. A record
+ * whose low bits were already nought counts as one. */
+void queue_record_set(u8 mark, u16 slot,
+                      u8 set_a, u8 a, u8 set_b, u8 b, u8 set_c, u8 c,
+                      u8 set_d, u8 d, u8 set_e, u8 e, u8 set_f, u8 f,
+                      u8 set_g, u8 g)
+{
+    const u32 rec = 0x000E4010UL + (u32)(u16)((u16)slot << 4);
+    u8 kind = (u8)(REG8(rec) & 0x3F);
+
+    if (kind == 0x00) kind = 0x01;
+
+    if (mark != 0) {
+        REG8(0x0011A6AEUL) |= 0x01;
+        REG8(0x00114DCDUL) &= (u8)~0x08;
+    }
+
+    if (set_a != 0) REG8(rec + 0x01) = a;
+
+    if (REG8(0x0011A7BDUL) & 0x40) {
+        if (set_b != 0) REG8(rec + 0x03) = b;
+        if (set_e != 0) REG8(rec + 0x08) = e;
+        kind = 0x02;
+    } else {
+        if (set_b != 0) REG8(rec + 0x02) = b;
+        if (set_e != 0) REG8(rec + 0x07) = e;
+    }
+
+    if (set_c != 0) REG8(rec + 0x04) = c;
+    if (set_d != 0) REG8(rec + 0x05) = d;
+    if (set_f != 0) REG8(rec + 0x06) = f;
+    if (set_g != 0) REG8(rec + 0x09) = g;
+
+    REG8(rec) = (u8)(REG8(rec) & 0x80);
+    REG8(rec) = (u8)(REG8(rec) | kind);
+}

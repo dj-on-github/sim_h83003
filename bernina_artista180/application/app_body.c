@@ -3990,6 +3990,21 @@ void screen_dispatch(void)
         case 0x4E:
             screen_body_4E();
             break;
+        case 0x09:
+            screen_body_09();
+            break;
+        case 0x11:
+            screen_body_11();
+            break;
+        case 0x12:
+            screen_body_12();
+            break;
+        case 0x13:
+            screen_body_13();
+            break;
+        case 0x14:
+            screen_body_14();
+            break;
         case 0x15:
             screen_body_15();
             break;
@@ -4876,4 +4891,283 @@ void screen_body_15(void)
     }
 
     module_hoop_screen();
+}
+
+/* H'2256AC, screen H'14: the grid of patterns to pick from.
+ *
+ * Not the plain lay-out the rest of the cluster has: after the picture is
+ * loaded a bitmap goes into the corner of the scratch buffer, and once the
+ * whole thing has been copied forward box H'0D takes a picture of its own.
+ * The block is at H'117602 and the press is H'22BF8C.
+ */
+void screen_body_14(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117602UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        bitmap_draw(0x0007, 0x0002, 0x0027, 0x0025,
+                    (const u8 *)0x0034BE0BUL, LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        hitbox_blit(0x000D, LCD_FRAME_A, 0x0034BFC7UL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_pick_screen();
+}
+
+/* H'2255B2, screen H'13: the other grid of patterns to pick from.
+ *
+ * The same shape as screen H'14's body and the same block at H'117602, with
+ * its own corner bitmap and its own picture for box H'0D. The press is
+ * H'22BCCC.
+ */
+void screen_body_13(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00117602UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        bitmap_draw(0x0009, 0x0004, 0x004C, 0x0023,
+                    (const u8 *)0x0034BD38UL, LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        hitbox_blit(0x000D, LCD_FRAME_A, 0x0034BF08UL);
+        REG8(0x0011B0A8UL) = 0x00;
+    }
+
+    module_pick_screen_b();
+}
+
+/* H'2254D2, screen H'12: which kind of pattern to pick.
+ *
+ * The plain lay-out with the block at H'1174F6, and then two things the rest
+ * of the cluster does not do: box three is put into state H'02 as the screen
+ * is laid out, and H'11B0A9 is raised so that the *next* pass through --
+ * this one included -- draws the preview of whatever item H'FFFEE0 holds.
+ * The press is H'22BB2A.
+ */
+void screen_body_12(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x001174F6UL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        hitbox_set_state(0x0003, 0x0003, 0x02, 0);
+        REG8(0x0011B0A8UL) = 0x00;
+        REG8(0x0011B0A9UL) = 0x01;
+    }
+
+    if (REG8(0x0011B0A9UL) != 0) {
+        item_preview(REG16(0x00FFFEE0UL));
+        REG8(0x0011B0A9UL) = 0x00;
+    }
+
+    module_kind_screen();
+}
+
+/* H'225046, screen H'11: the number pad's own screen.
+ *
+ * Its lay-out block is at H'11675E, and the picture it loads is not a
+ * constant -- it comes from the tenth word of whatever H'11B2B6 points at.
+ * The screen is pushed on the stack as it arrives and the help page drawn
+ * over it. The press is H'21A070.
+ */
+void screen_body_11(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x0011675EUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        screen_stack_push();
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        lcd_buffer_fill(LCD_FRAME_B, 0x00);
+        image_load(REG32(REG32(0x0011B2B6UL) + 0x10), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        REG8(0x0011B0A8UL) = 0x00;
+        help_page_draw();
+    }
+
+    goto_number_screen();
+}
+
+/* H'218CBE. Screen H'09's whole screen: a stitch length typed in as a
+ * number. Called with one as the screen is laid out and with nought on
+ * every pass after.
+ *
+ * The typed digits live as a string at H'11A1A5. Box value H'0E rubs the
+ * last one out, H'1A leaves without changing anything, H'19 takes what has
+ * been typed -- anything from four up to the ceiling H'11B31E holds -- and
+ * everything else is a digit, which is the box value plus H'15. A leading
+ * nought is refused and so is a third digit.
+ *
+ * The two buffers copied out of H'250758 and H'25075E at the top are both
+ * written over before they are read; they are the compiler's, not the
+ * screen's. The two bytes after the first of them are the one-character
+ * string a digit is appended through, which is why the second is set to
+ * nought before anything else happens.
+ */
+void stitch_number_screen(u8 arrived)
+{
+    char shown[8];
+    char scratch[8];
+    char one[2];
+    u16 value = 0, index = 0;
+    u16 len;
+    u8 i;
+
+    for (i = 0; i < 6; i++) scratch[i] = (char)REG8(0x00250758UL + (u32)i);
+    for (i = 0; i < 6; i++) shown[i]   = (char)REG8(0x0025075EUL + (u32)i);
+    one[1] = 0;
+
+    if (arrived != 0) {
+        const u16 ceiling = (u16)bus_byte_11();
+
+        screen_stack_push();
+        str_copy((char *)0x0011A1A5UL, (const char *)0x00250ADFUL);
+
+        REG16(0x0011B31EUL) = ceiling;
+        int_to_decimal((short)ceiling, shown);
+        str_append(shown, (const char *)0x00250AE0UL);
+        text_draw(shown, 0x0022, 0x0036, 0x0049, 0x003F,
+                  0x0001, 0x01, (const u8 *)0x001196EAUL);
+
+        if (REG8(0x00FFFEF7UL) & 0x08) {
+            const u16 now = (u16)stitch_length_shown();
+
+            int_to_decimal((short)now, (char *)0x0011A1A5UL);
+            text_draw((const char *)0x0011A1A5UL, 0x0063, 0x0033, 0x0099,
+                      0x0043, 0x0002, 0x00, (const u8 *)0x0011936EUL);
+        }
+    }
+
+    cursor_blink(0x009F, 0x002E);
+
+    if (touch_hit(0x0001, 0x000D, &value, &index) != 0x03) return;
+
+    message_show_held(index);
+    len = (u16)str_length((const char *)0x0011A1A5UL);
+
+    if (value == 0x000E) {
+        if (len != 0) {
+            str_copy_n(scratch, (const char *)0x0011A1A5UL,
+                       (u32)(long)(short)(len - 1));
+            str_copy((char *)0x0011A1A5UL, scratch);
+            text_draw((const char *)0x0011A1A5UL, 0x0063, 0x0033, 0x0099,
+                      0x0043, 0x0002, 0x00, (const u8 *)0x0011936EUL);
+        }
+        return;
+    }
+
+    if (value == 0x001A) {
+        screen_from_slot(0x01);
+        REG8(0x0011B0A9UL) = 0x01;
+        screen_stack_pop();
+        return;
+    }
+
+    if (value == 0x0019) {
+        const char *end = 0;
+        const short typed = (short)str_to_long((const char *)0x0011A1A5UL,
+                                               &end, 0x000A);
+
+        if (typed >= 0x0004 && typed <= (short)REG16(0x0011B31EUL)) {
+            stitch_length_choose((u8)typed);
+            screen_from_slot(0x01);
+            REG8(0x0011B0A9UL) = 0x01;
+            screen_stack_pop();
+        }
+        return;
+    }
+
+    one[0] = (char)(u8)((u8)value + 0x15);
+
+    if (len == 0 && (u8)one[0] == 0x30) return;   /* no leading nought */
+    if ((short)len > 0x0001) return;              /* and no third digit */
+
+    str_append((char *)0x0011A1A5UL, one);
+    text_draw((const char *)0x0011A1A5UL, 0x0063, 0x0033, 0x0099, 0x0043,
+              0x0002, 0x00, (const u8 *)0x0011936EUL);
+}
+
+/* H'22474C, screen H'09: the stitch length typed as a number.
+ *
+ * Its block is at H'115E3A, and unlike the rest of the cluster it clears the
+ * back buffer with a filled rectangle rather than a whole-buffer fill before
+ * the picture goes in. The box list at H'115E1E fills boxes one to H'0D.
+ * H'218CBE is called with one as it lays out and with nought every pass.
+ */
+void screen_body_09(void)
+{
+    if (REG8(0x0011B0A8UL) != 0) {
+        u32 src = 0x00115E3AUL;
+        u32 dst = 0x0011B0AEUL;
+        u8 n;
+
+        for (n = 4; n != 0; n--) {
+            REG32(dst) = REG32(src);
+            src += 4;
+            dst += 4;
+        }
+
+        hitbox_reset_all();
+        draw_rect(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                  REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                  LCD_FRAME_B, 0x00, 0x01);
+        image_load(REG32(0x0011B0AEUL), LCD_SCRATCH);
+        region_copy(REG16(0x0011B0B2UL), REG16(0x0011B0B4UL),
+                    REG16(0x0011B0B6UL), REG16(0x0011B0B8UL),
+                    REG16(0x0011B0B4UL), LCD_SCRATCH, LCD_FRAME_A);
+        hitbox_fill_from_list(0x0001, 0x000D, 0x0001, 0x00115E1EUL);
+        REG8(0x0011B0A8UL) = 0x00;
+        stitch_number_screen(0x01);
+    }
+
+    stitch_number_screen(0x00);
 }
