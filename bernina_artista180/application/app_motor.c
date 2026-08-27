@@ -927,9 +927,16 @@ void analog_input_init(void)
     for (i = 7; i != 0; i--) analog_scan();
 }
 
-/* H'208E2A. The two knobs. Below H'05 is not a real reading, so it becomes
- * H'02 -- which is also what the debounce writes when they move. */
-void knobs_read(void)
+/* H'208E2A. The touch panel's two axes, off analog channels 0 and 1. Below
+ * H'05 is not a real reading, so it becomes H'02 -- which is also what the
+ * debounce writes when the reading moves, and what H'210EE2 later treats as
+ * the screen not being touched at all.
+ *
+ * Not the knobs, despite the name the first reading of this gave it: those
+ * are the quadrature pairs on port C that H'20A10C and H'20A19A follow.
+ * Everything this leaves ends up in H'FFFED9 and H'FFFEDA, the raw touch
+ * coordinates H'210EE2 scales by the calibration at H'11A87E. */
+void touch_read(void)
 {
     u8 v;
 
@@ -972,12 +979,12 @@ void key_banks_read(void)
     v = (u8)(PCDDR_SHADOW & (u8)~0x40); PCDDR = v;
     PCDDR_SHADOW = v;
 
-    if (KEY_PASS & 0x01) knobs_read();
+    if (KEY_PASS & 0x01) touch_read();
 }
 
 /* H'208F18. What survives the pass: a bank that has changed is thrown away
- * rather than kept, and a knob that has moved by more than two is put back
- * to H'02, which cannot pass the test at the end. */
+ * rather than kept, and a touch reading that has moved by more than two is
+ * put back to H'02, which cannot pass the test at the end. */
 void key_scan_compare(void)
 {
     short a, b;
@@ -1021,10 +1028,10 @@ void key_scan_again(void)
  *
  * The three banks go to H'FFFEDB..H'FFFEDD. If any key came through, a
  * hold-off of H'96 goes into H'11A802 and no further scan starts until an
- * interrupt has counted it down -- that is the auto-repeat rate. The knobs
- * are published only when both are above H'05, and only once, latched by
- * bit 1 of H'11A80E so that holding a knob still does not keep re-sending
- * it. Bit 7 of H'FFFEF7 is something else owning the panel: then everything
+ * interrupt has counted it down -- that is the auto-repeat rate. The touch
+ * coordinates go to H'FFFED9 and H'FFFEDA, only when both axes are above
+ * H'05, and only once, latched by bit 1 of H'11A80E so that a finger held
+ * still does not keep re-sending it. Bit 7 of H'FFFEF7 is something else owning the panel: then everything
  * published this pass is taken back, unless a key in the second bank asked
  * for it.
  */

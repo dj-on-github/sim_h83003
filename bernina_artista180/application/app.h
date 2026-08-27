@@ -801,7 +801,7 @@ void presser_switch_read(void);
 void trim_to_eeprom(void);
 void analog_scan(void);
 void analog_input_init(void);
-void knobs_read(void);
+void touch_read(void);
 void key_banks_read(void);
 void key_scan_compare(void);
 void key_scan_first(void);

@@ -437,7 +437,7 @@
 0020268a t .L245
 0020269a t .L246
 002026a2 T _analog_input_init
-0020271a T _knobs_read
+0020271a T _touch_read
 00202730 t .L253
 00202746 t .L255
 00202748 T _key_banks_read

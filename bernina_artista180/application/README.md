@@ -691,12 +691,16 @@ the evidence that the two libraries agree over the range that matters.
 
 **Part 3r, the front panel (`H'20ACC8`) -- done.** The keys are a matrix:
 three strobes on port C, eight returns from a latch at H'060000, active low.
-The two knobs come in on the same pass as analog channels 0 and 1.
+The **touch panel's two axes** come in on the same pass, as analog channels
+0 and 1 -- not the knobs, which are the quadrature pairs on port C read by
+the interrupt. `H'208E2A` was called `knobs_read` on the first reading of it
+and is `touch_read` now: everything it produces ends in H'FFFED9 and
+H'FFFEDA, which `touch_hit` scales by the calibration at H'11A87E.
 
 The whole panel is read ten times over. A bank that reads differently from
-the pass before is thrown away rather than believed, and a knob that has
-moved by more than two counts is put back to H'02, which cannot pass the
-test at the end. Only what has been still for ten passes survives. That is
+the pass before is thrown away rather than believed, and a touch reading
+that has moved by more than two counts is put back to H'02, which cannot
+pass the test at the end. Only what has been still for ten passes survives. That is
 why the bring-up spends a scan here before it trusts anything.
 
 Three of the ten dispatch targets cannot be called on their own: H'209072,
