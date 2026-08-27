@@ -6,6 +6,7 @@
  * that another file calls.
  */
 #include "app.h"
+#include "app_keys.h"
 
 /* ---- bringing the machine up -------------------------------------------
  * H'208D88, the spine of the whole start-up. Twenty calls in order, ending

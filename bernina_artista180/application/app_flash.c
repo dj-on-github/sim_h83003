@@ -509,35 +509,6 @@ void port_b_init(void)
     if (INPUT_TRIM <= 0x0A || INPUT_TRIM >= 0xF5) INPUT_TRIM = 0x32;
 }
 
-/* H'208E6C. Three port C outputs driven high. Called only from the routine
- * below, straight after those same three pins are turned round to inputs --
- * on this part writing the data register of an input pin sets what the pin
- * will read as the moment it becomes an output again. */
-void port_c_bits_high(void)
-{
-    PCDR |= 0x01;
-    PCDR |= 0x02;
-    PCDR |= 0x40;
-}
-
-/* H'208FE8. Port C bits 0, 1 and 6 to inputs, P4 bit 5 to an input, then
- * the three data bits above. */
-void port_c_init(void)
-{
-    u8 v;
-
-    v = (u8)(PCDDR_SHADOW & (u8)~0x01); PCDDR = v;
-    v = (u8)(v            & (u8)~0x02); PCDDR = v;
-    v = (u8)(v            & (u8)~0x40); PCDDR = v;
-    PCDDR_SHADOW = v;
-
-    v = (u8)(P4DDR_SHADOW & (u8)~0x20);
-    P4DDR = v;
-    P4DDR_SHADOW = v;
-
-    port_c_bits_high();
-}
-
 /* H'200D44. One pattern's three side records copied onto another's slot.
  *
  * A pattern carries three things besides its descriptor: a four-byte record

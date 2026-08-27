@@ -754,8 +754,6 @@ void settings_save(u8 clear_queue);
 void config_block_check(void);
 void pins_to_input_2061A0(void);
 void port_b_init(void);
-void port_c_bits_high(void);
-void port_c_init(void);
 
 /* app_motor.c -- the ports, the timers, the motors, the foot control and the panel keys */
 void foot_demand_hold(void);
@@ -801,14 +799,6 @@ void presser_switch_read(void);
 void trim_to_eeprom(void);
 void analog_scan(void);
 void analog_input_init(void);
-void touch_read(void);
-void key_banks_read(void);
-void key_scan_compare(void);
-void key_scan_first(void);
-void key_scan_again(void);
-void key_scan_finish(void);
-void key_scan_step(void);
-void keys_scan_settled(void);
 
 /* app_stitch.c -- the stitch database, and making a pattern current */
 u32 stitch_record(u16 n);
