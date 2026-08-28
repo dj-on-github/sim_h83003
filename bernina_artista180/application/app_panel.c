@@ -6,6 +6,7 @@
  * that another file calls.
  */
 #include "app.h"
+#include "app_keys.h"
 
 /* ---- all ten interrupt slots are now real ------------------------------ */
 void isr_sci0_eri(void) __attribute__((interrupt_handler));
@@ -984,7 +985,7 @@ u8 main_menu_screen(void)
         REG8(0x0011A17DUL) = 0x01;
     }
 
-    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == KEY_CLR) {
         REG8(0x00FFFEC5UL) = 0x00;
     }
 

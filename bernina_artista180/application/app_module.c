@@ -6,6 +6,7 @@
  * that another file calls.
  */
 #include "app.h"
+#include "app_keys.h"
 
 /* ---- what the dispatcher does before it dispatches --------------------
  * Seven routines from the top of H'22382A: the pending screen change, the
@@ -153,36 +154,40 @@ void foot_switch_screen(void)
  * of H'FFFEC4 says the module is there it is only accepted when the module
  * will take the order. When it will not, the key is not reported at all and
  * the scan carries on into the last two tests below it.
- */
+ *
+ * The names are from pressing each button and watching H'11B10E. The codes,
+ * the panel as it is printed on the machine, and the two names that do not
+ * yet agree with it, are all in app_keys.h.
+ */  
 void key_scan(void)
 {
-    if (REG8(0x00FFFEDCUL) & 0x04) { REG16(0x0011B10EUL) = 0x006D; return; }
-    if (REG8(0x00FFFEDDUL) & 0x08) { REG16(0x0011B10EUL) = 0x006E; return; }
-    if (REG8(0x00FFFEDDUL) & 0x20) { REG16(0x0011B10EUL) = 0x006F; return; }
-    if (REG8(0x00FFFEDCUL) & 0x01) { REG16(0x0011B10EUL) = 0x0070; return; }
-    if (REG8(0x00FFFEDBUL) & 0x01) { REG16(0x0011B10EUL) = 0x0071; return; }
-    if (REG8(0x00FFFEDDUL) & 0x01) { REG16(0x0011B10EUL) = 0x0072; return; }
-    if (REG8(0x00FFFEDCUL) & 0x08) { REG16(0x0011B10EUL) = 0x0073; return; }
-    if (REG8(0x00FFFEDDUL) & 0x02) { REG16(0x0011B10EUL) = 0x0074; return; }
-    if (REG8(0x00FFFEDDUL) & 0x04) { REG16(0x0011B10EUL) = 0x0076; return; }
-    if (REG8(0x00FFFEDBUL) & 0x04) { REG16(0x0011B10EUL) = 0x0077; return; }
-    if (REG8(0x00FFFEDCUL) & 0x02) { REG16(0x0011B10EUL) = 0x0078; return; }
-    if (REG8(0x00FFFEDDUL) & 0x10) { REG16(0x0011B10EUL) = 0x0079; return; }
-    if (REG8(0x00FFFEDBUL) & 0x40) { REG16(0x0011B10EUL) = 0x007A; return; }
-    if (REG8(0x00FFFEC1UL) & 0x02) { REG16(0x0011B10EUL) = 0x007B; return; }
-    if (REG8(0x00FFFEDBUL) & 0x80) { REG16(0x0011B10EUL) = 0x007C; return; }
-    if (REG8(0x00FFFEDBUL) & 0x02) { REG16(0x0011B10EUL) = 0x007D; return; }
-    if (REG8(0x00FFFEDCUL) & 0x10) { REG16(0x0011B10EUL) = 0x0081; return; }
+    if (REG8(0x00FFFEDCUL) & 0x04) { REG16(0x0011B10EUL) = KEY_MEM; return; }
+    if (REG8(0x00FFFEDDUL) & 0x08) { REG16(0x0011B10EUL) = KEY_LEFT; return; }
+    if (REG8(0x00FFFEDDUL) & 0x20) { REG16(0x0011B10EUL) = KEY_RIGHT; return; }
+    if (REG8(0x00FFFEDCUL) & 0x01) { REG16(0x0011B10EUL) = KEY_BUTTONHOLE; return; }
+    if (REG8(0x00FFFEDBUL) & 0x01) { REG16(0x0011B10EUL) = KEY_STITCH_SEL; return; }
+    if (REG8(0x00FFFEDDUL) & 0x01) { REG16(0x0011B10EUL) = KEY_FANCY; return; }
+    if (REG8(0x00FFFEDCUL) & 0x08) { REG16(0x0011B10EUL) = KEY_HELP; return; }
+    if (REG8(0x00FFFEDDUL) & 0x02) { REG16(0x0011B10EUL) = KEY_MODULE; return; }
+    if (REG8(0x00FFFEDDUL) & 0x04) { REG16(0x0011B10EUL) = KEY_PEN_UPDOWN; return; }
+    if (REG8(0x00FFFEDBUL) & 0x04) { REG16(0x0011B10EUL) = KEY_CLR; return; }
+    if (REG8(0x00FFFEDCUL) & 0x02) { REG16(0x0011B10EUL) = KEY_A; return; }
+    if (REG8(0x00FFFEDDUL) & 0x10) { REG16(0x0011B10EUL) = KEY_OUTPUT; return; }
+    if (REG8(0x00FFFEDBUL) & 0x40) { REG16(0x0011B10EUL) = KEY_F; return; }
+    if (REG8(0x00FFFEC1UL) & 0x02) { REG16(0x0011B10EUL) = KEY_REVERSE; return; }
+    if (REG8(0x00FFFEDBUL) & 0x80) { REG16(0x0011B10EUL) = KEY_C_EQUALS; return; }
+    if (REG8(0x00FFFEDBUL) & 0x02) { REG16(0x0011B10EUL) = KEY_FRAME; return; }
+    if (REG8(0x00FFFEDCUL) & 0x10) { REG16(0x0011B10EUL) = KEY_SMART; return; }
 
     if (REG8(0x00FFFEDBUL) & 0x08 &&
         (!(REG8(0x00FFFEC4UL) & 0x01) || module_ready() != 0)) {
-        REG16(0x0011B10EUL) = 0x0075;
+        REG16(0x0011B10EUL) = KEY_75;
         REG8(0x0011A16FUL) = 0x01;
         return;
     }
 
-    if (REG8(0x00FFFEDCUL) & 0x20) REG16(0x0011B10EUL) = 0x007E;
-    else                           REG16(0x0011B10EUL) = 0xFFFF;
+    if (REG8(0x00FFFEDCUL) & 0x20) REG16(0x0011B10EUL) = KEY_ECO;
+    else                           REG16(0x0011B10EUL) = KEY_NONE;
 }
 
 /* H'21F4C6. The screen picture and its state put away and fetched back.
@@ -1277,9 +1282,9 @@ void screen_request(void)
     /* The two menu keys: on the sewing screens they only mark what the
      * screen should show next time it is laid out; anywhere else they go
      * to the sewing screen with the first item of that category picked. */
-    case 0x0070:
-    case 0x0071: {
-        const u8 category = (u8)((want == 0x0070) ? 0x04 : 0x03);
+    case KEY_BUTTONHOLE:
+    case KEY_STITCH_SEL: {
+        const u8 category = (u8)((want == KEY_BUTTONHOLE) ? 0x04 : 0x03);
 
         if (touch_allowed(want) == 0) return;
         if (REG8(0x0011A169UL) == 0x02 || REG8(0x0011A169UL) == 0x07) {
@@ -1292,7 +1297,7 @@ void screen_request(void)
         return;
     }
 
-    case 0x0072:
+    case KEY_FANCY:
         if (CONFIG_BLOCK == CONFIG_ALT_POINTER) {
             if (REG8(0x0011A169UL) != 0x05) screen_switch(0x05, 0x01, 0x00);
             return;
@@ -1303,7 +1308,7 @@ void screen_request(void)
         }
         /* falls through -- a machine that is neither gets H'74's body */
 
-    case 0x0074:
+    case KEY_MODULE:
         if (REG8(0x0011A174UL) != 0) {
             screen_back_out(REG8(0x0011A169UL));
             screen_hand_over(0x12);
@@ -1312,13 +1317,13 @@ void screen_request(void)
         }
         return;
 
-    case 0x0073:
+    case KEY_HELP:
         REG16(0x0011B114UL) = REG16(0x0011B108UL);
         REG8(0x0011B0A6UL) = REG8(0x0011A169UL);
         screen_switch(0x0E, 0x01, 0x00);
         return;
 
-    case 0x0078:
+    case KEY_A:
         if (CONFIG_BLOCK == CONFIG_ALT_POINTER) {
             if (REG8(0x0011A169UL) != 0x25) screen_switch(0x25, 0x01, 0x00);
             return;
@@ -1329,7 +1334,7 @@ void screen_request(void)
         }
         /* falls through -- and so does this one, into H'79 */
 
-    case 0x0079: {
+    case KEY_OUTPUT: {
         const u8 s = REG8(0x0011A169UL);
 
         if (REG8(0x00114DC6UL) & 0x80) return;
@@ -1346,22 +1351,22 @@ void screen_request(void)
         return;
     }
 
-    case 0x007D:
+    case KEY_FRAME:
         screen_switch(0x32, 0x01, 0x00);
         return;
 
-    case 0x0077:
+    case KEY_CLR:
         if (REG8(0x0011A169UL) != 0x44) pattern_reset_current();
         return;
 
-    case 0x007E:
+    case KEY_ECO:
         if (REG8(0x00FFFEF7UL) & 0x80) foot_demand_restore();
         else                           foot_demand_hold();
         return;
 
     /* The pattern parked by H'2236F8, asked for back -- but only when the
      * dialog is still the one that parked it, and never while sewing. */
-    case 0x0081:
+    case KEY_SMART:
         if (REG8(0x00FFFEC4UL) & 0x01) return;
         if (REG8(0x0011B29BUL) != 0 ||
             REG8(0x0011A174UL) != REG8(0x0011B29DUL)) {
@@ -1398,7 +1403,7 @@ u8 module_version_press(u8 fresh)
     if (fresh != 0) module_version_text_draw();
 
     if (screen_leave_check(&out, 0x00) != 0x03) return 0x00;
-    if (out == 0x0077) screen_switch(0x1F, 0x01, 0x00);
+    if (out == KEY_CLR) screen_switch(0x1F, 0x01, 0x00);
 
     return 0x00;
 }
@@ -1866,7 +1871,7 @@ u8 module_settings_screen(void)
     u16 value = 0, index = 0;
     u16 to = 0;
 
-    if (screen_leave_check(&to, 0x00) == 0x03 && to == 0x0077) {
+    if (screen_leave_check(&to, 0x00) == 0x03 && to == KEY_CLR) {
         if (module_screen_free() != 0) {
             module_switches_stop();
             screen_switch(0x17, 0x01, 0x00);

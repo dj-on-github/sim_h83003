@@ -6,6 +6,7 @@
  * that another file calls.
  */
 #include "app.h"
+#include "app_keys.h"
 
 static u32 item_descriptor(u16 item)
 {
@@ -471,9 +472,9 @@ u8 touch_allowed(u16 code)
 /* ---- three more that the screens share --------------------------------- */
 
 /* H'21F87A. Whether leaving for screen H'11B10E means the one being left
- * should go on the stack. Screens H'75 and H'7E never do; on the sewing
+ * should go on the stack. KEY_75 and KEY_ECO never do; on the sewing
  * screen and the two like it, a jump to one of the settings screens does
- * not; and H'78 turns the display over on the way out.
+ * not; and KEY_A turns the display over on the way out.
  *
  * H'11A17C being zero -- nothing on the stack yet -- also means no. */
 u8 screen_leave_stacks(void)
@@ -481,14 +482,16 @@ u8 screen_leave_stacks(void)
     const u16 to = REG16(0x11B10EUL);
     const u8  from = REG8(0x11A169UL);
 
-    if (to == 0x0075 || to == 0x007E) return 0x00;
+    if (to == KEY_75 || to == KEY_ECO) return 0x00;
     if (REG8(0x11A17CUL) == 0) return 0x00;
 
     if (REG8(0x11A178UL) != 0 && from != 0x46) {
-        if ((short)to >= 0x0070) {
-            if ((short)to < 0x0073 || to == 0x0077 || to == 0x007D) return 0x00;
+        if ((short)to >= KEY_BUTTONHOLE) {
+            if ((short)to < KEY_HELP || to == KEY_CLR || to == KEY_FRAME) {
+                return 0x00;
+            }
         }
-        if (to == 0x0078) {
+        if (to == KEY_A) {
             message_show(0x000A);
             return 0x01;
         }
@@ -496,13 +499,13 @@ u8 screen_leave_stacks(void)
     }
 
     if (from == 0x2B) {
-        if ((short)to >= 0x006E && (short)to <= 0x006F) return 0x00;
+        if ((short)to >= KEY_LEFT && (short)to <= KEY_RIGHT) return 0x00;
         return 0x01;
     }
 
     if (from >= 0x0C && (from < 0x0E || from == 0x42)) {
-        if ((short)to >= 0x006E) {
-            if ((short)to < 0x0070 || to == 0x0077) return 0x00;
+        if ((short)to >= KEY_LEFT) {
+            if ((short)to < KEY_BUTTONHOLE || to == KEY_CLR) return 0x00;
         }
         return 0x01;
     }
@@ -514,17 +517,17 @@ u8 screen_leave_stacks(void)
  * for it.
  *
  * Being asked for the screen that is already up is refused -- except for
- * H'7B, which is allowed round again, and except when the caller forces it.
+ * KEY_REVERSE, which is allowed round again, and except when the caller forces it.
  * Both of those jump straight to the write, which is why they skip the
  * "already there" test rather than answering 2. */
 u8 screen_leave_check(u16 *out, u8 forced)
 {
     const u16 to = REG16(0x11B10EUL);
 
-    if (to == 0xFFFF) return 0x02;
+    if (to == KEY_NONE) return 0x02;
     if (screen_leave_stacks() != 0) return 0x02;
 
-    if (forced == 0 && to != 0x007B) {
+    if (forced == 0 && to != KEY_REVERSE) {
         if (REG16(0x11A17EUL) == to) return 0x02;
     }
 

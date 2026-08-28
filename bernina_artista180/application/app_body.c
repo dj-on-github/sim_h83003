@@ -6,6 +6,7 @@
  * that another file calls.
  */
 #include "app.h"
+#include "app_keys.h"
 
 /* ---- the screen bodies' helpers ---------------------------------------
  * H'22382A's thirty-odd screen bodies are inline blocks behind a table of
@@ -181,7 +182,7 @@ void demo_screen_step(u8 fresh)
     if (fresh != 0) { REG16(0x0011B362UL) = 0x0000; return; }
 
     if (screen_leave_check(&code, 0x00) == 0x03) {
-        if (code == 0x0077) {
+        if (code == KEY_CLR) {
             REG8(0x00FFFEC5UL) = 0x00;
             screen_switch(0x17, 0x01, 0x00);
         }
@@ -342,7 +343,7 @@ u8 screen_only_77(void)
     u16 code = 0;
 
     if (screen_leave_check(&code, 0x00) == 0x03) {
-        if (code == 0x0077) {
+        if (code == KEY_CLR) {
             REG8(0x00FFFEC5UL) = 0x00;
             screen_switch(0x17, 0x01, 0x00);
         }
@@ -758,7 +759,7 @@ u8 pedal_test_screen(void)
     }
 
     if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
-    if (to != 0x0077) return 0x00;
+    if (to != KEY_CLR) return 0x00;
 
     REG16(0x0011A1ACUL) = 0xFFFF;
     REG16(0x0011A1AEUL) = 0xFFFF;
@@ -801,7 +802,7 @@ u8 variant_screen(void)
         return 0x00;
     }
 
-    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == KEY_CLR) {
         if (REG8(0x0011B360UL) != CONFIG_BLOCK) {
             sew_picture_box();
             settings_save(0x00);
@@ -1208,7 +1209,7 @@ u8 needle_pos_screen(void)
 {
     u16 value = 0, index = 0;
 
-    if (screen_leave_check(&value, 0x00) == 0x03 && value == 0x0077) {
+    if (screen_leave_check(&value, 0x00) == 0x03 && value == KEY_CLR) {
         REG8(0xFFFEC5UL) = 0x00;
         screen_switch(0x17, 0x01, 0x00);
         return 0x00;
@@ -1279,7 +1280,7 @@ u8 version_screen(void)
     }
 
     if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
-    if (to != 0x0077) return 0x00;
+    if (to != KEY_CLR) return 0x00;
 
     REG8(0x0011A1B3UL) = 0x01;
     REG8(0xFFFEC5UL) = 0x00;
@@ -3510,7 +3511,7 @@ void queue_edit_press(void)
 {
     u16 hit[2];
 
-    if (screen_leave_check(&hit[0], 0x00) == 0x03 && hit[0] == 0x0077) {
+    if (screen_leave_check(&hit[0], 0x00) == 0x03 && hit[0] == KEY_CLR) {
         const u16 box  = hitbox_find(0x0001, 0x000F, REG16(0x00FFFEE0UL), 0x01);
         const u16 from = queue_entry_delete();
 
@@ -4417,7 +4418,7 @@ u8 module_busy_screen(void)
     (void)screen_touch();
 
     if (screen_leave_check(&to, 0x00) != 0x03) return 0x00;
-    if (to != 0x0077) return 0x00;
+    if (to != KEY_CLR) return 0x00;
 
     REG8(0x00FFFEC5UL) = 0x00;
     screen_switch(0x17, 0x01, 0x00);
