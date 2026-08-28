@@ -15,7 +15,7 @@ import 'package:flutter/material.dart';
 import 'keypad.dart';
 
 /// How far the pointer must be dragged for one detent of a knob.
-const double _pixelsPerDetent = 9.0;
+const double _pixelsPerDetent = 2.25;
 
 /// Two clicks closer together than this latch a key down.
 const Duration _doubleClickWindow = Duration(milliseconds: 350);
