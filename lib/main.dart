@@ -440,6 +440,23 @@ class _SimulatorPageState extends State<SimulatorPage>
     _scrollDisasmTo(addr);
   }
 
+  /// Scroll to the PC because the CPU moved it there itself -- a reset, an
+  /// interrupt, or the register being set by hand -- rather than because the
+  /// user asked to go somewhere.
+  ///
+  /// Only the memory pane honours Follow PC: with it off the view stays where
+  /// it was parked, which is the point of pinning it. The disassembly always
+  /// follows, since the toggle is about the memory view and a disassembly of
+  /// somewhere the CPU is not is no use to anyone.
+  void _scrollToPc() {
+    final addr = cpu.pc & SparseMemory.addrMask;
+    if (_followPcInMemory) {
+      _scrollToAddress(addr);
+    } else {
+      _scrollDisasmTo(addr);
+    }
+  }
+
   /// Scrolls the disassembly list so the instruction at/just before [addr]
   /// is at the top.
   void _scrollDisasmTo(int addr) {
@@ -815,7 +832,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   void _reset() {
     _pause();
     setState(cpu.reset);
-    _scrollToAddress(cpu.pc);
+    _scrollToPc();
   }
 
   /// Fires the non-maskable interrupt (vector 7).
@@ -824,7 +841,7 @@ class _SimulatorPageState extends State<SimulatorPage>
       cpu.nmi();
       _memRev++;
     });
-    _scrollToAddress(cpu.pc);
+    _scrollToPc();
   }
 
   /// Fires IRQ0 (vector 12). If the I bit has it masked, the CPU state is
@@ -835,7 +852,7 @@ class _SimulatorPageState extends State<SimulatorPage>
       if (taken) _memRev++;
     });
     if (taken) {
-      _scrollToAddress(cpu.pc);
+      _scrollToPc();
     } else {
       _showSnack('IRQ0 ignored — the I (interrupt mask) bit is set.');
     }
@@ -1930,7 +1947,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     );
     if (result != null) {
       setState(() => apply(result));
-      if (name == 'PC') _scrollToAddress(cpu.pc);
+      if (name == 'PC') _scrollToPc();
     }
   }
 

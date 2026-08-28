@@ -78,5 +78,44 @@ void main() {
       expect(tester.widget<Scrollable>(list).controller!.offset, parked,
           reason: 'the view should not chase the PC while pinned');
     });
+
+    testWidgets('with it off, resetting leaves the view where it was',
+        (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const SimH8App());
+
+      // Park the view a long way from the reset vector's target.
+      final list = find.byType(Scrollable).first;
+      await tester.drag(list, const Offset(0, -4000));
+      await tester.pumpAndSettle();
+      final parked = tester.widget<Scrollable>(list).controller!.offset;
+
+      await tester.tap(switchFinder());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip("Reset (load reset vector at H'000000)"));
+      await tester.pumpAndSettle();
+      expect(tester.widget<Scrollable>(list).controller!.offset, parked,
+          reason: 'a reset should not move the view while it is pinned');
+    });
+
+    testWidgets('with it on, resetting brings the PC back into view',
+        (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(const SimH8App());
+
+      final list = find.byType(Scrollable).first;
+      await tester.drag(list, const Offset(0, -4000));
+      await tester.pumpAndSettle();
+      final parked = tester.widget<Scrollable>(list).controller!.offset;
+
+      await tester.tap(find.byTooltip("Reset (load reset vector at H'000000)"));
+      await tester.pumpAndSettle();
+      expect(tester.widget<Scrollable>(list).controller!.offset,
+          isNot(parked),
+          reason: 'following the PC, the view should come back to it');
+    });
   });
 }
