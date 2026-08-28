@@ -28,6 +28,8 @@ import 'sci_bridge.dart';
 import 'serial_link.dart';
 import 'sparse_memory.dart';
 import 'symbols.dart';
+import 'keypad.dart';
+import 'panel_view.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
@@ -146,6 +148,11 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// watch one address change.
   bool _followPcInMemory = true;
 
+  /// The front panel shown in the Buttons tab, wired to the CPU as the real
+  /// one is: a scanned matrix on port C and the latch at H'060000, reverse on
+  /// a port 8 pin, and the two knobs on their quadrature pairs.
+  final Keypad _keypad = Keypad();
+
   /// Top address shown in the memory window (drives the header label).
   int _memBase = 0x000100;
 
@@ -241,6 +248,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   bool _viewProfile = false;
   bool _viewFlash = false;
   bool _viewEeprom = false;
+  bool _viewPanel = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
   /// switches between the tabbed and side-by-side arrangements.
@@ -255,6 +263,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _profKey = GlobalKey();
   final GlobalKey _flashKey = GlobalKey();
   final GlobalKey _eepromKey = GlobalKey();
+  final GlobalKey _panelKey = GlobalKey();
 
   /// SCI tab, host serial bridge. One simulated channel can be joined to a
   /// real port on this machine, so the software that talks to a Bernina can
@@ -358,7 +367,11 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 11, vsync: this);
+    _tab = TabController(length: 12, vsync: this);
+    // The front panel stays on the bus for the life of the app: it answers
+    // for the key latch and holds the knob pins, and an unattached one would
+    // leave the firmware scanning a dead matrix.
+    cpu.attachKeypad(_keypad);
     _serialPorts = SerialLink.availablePorts();
     _serialPortLabels = SerialLink.describePorts(_serialPorts);
     _loadDemo();
@@ -1585,6 +1598,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             Tab(text: 'Profile'),
             Tab(text: 'Flash'),
             Tab(text: 'EEPROM'),
+            Tab(text: 'Buttons'),
           ],
         ),
         Expanded(
@@ -1610,6 +1624,8 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _flashKey, child: _KeepAlive(child: _flashView())),
               KeyedSubtree(
                   key: _eepromKey, child: _KeepAlive(child: _eepromView())),
+              KeyedSubtree(
+                  key: _panelKey, child: _KeepAlive(child: _panelView())),
             ],
           ),
         ),
@@ -1701,6 +1717,13 @@ class _SimulatorPageState extends State<SimulatorPage>
           flex: 1,
           width: null
         ),
+      if (_viewPanel)
+        (
+          pane: KeyedSubtree(
+              key: _panelKey, child: _KeepAlive(child: _panelView())),
+          flex: 1,
+          width: null
+        ),
     ];
     if (entries.isEmpty) {
       return const Center(child: Text('Select a view above'));
@@ -1786,6 +1809,7 @@ class _SimulatorPageState extends State<SimulatorPage>
         _viewToggle('PROF', _viewProfile, (v) => _viewProfile = v),
         _viewToggle('FLASH', _viewFlash, (v) => _viewFlash = v),
         _viewToggle('EEPROM', _viewEeprom, (v) => _viewEeprom = v),
+        _viewToggle('BTN', _viewPanel, (v) => _viewPanel = v),
       ],
     );
   }
@@ -1802,7 +1826,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         (_viewTrace ? 1 : 0) +
         (_viewProfile ? 1 : 0) +
         (_viewFlash ? 1 : 0) +
-        (_viewEeprom ? 1 : 0);
+        (_viewEeprom ? 1 : 0) +
+        (_viewPanel ? 1 : 0);
     return Tooltip(
       message: enabled
           ? 'Show the $label view'
@@ -2580,6 +2605,17 @@ class _SimulatorPageState extends State<SimulatorPage>
         local.dx / paneSize.width * _LcdPane.width,
         local.dy / paneSize.height * _LcdPane.height,
       );
+
+  /// The Buttons tab. The panel drives the keypad model, which the firmware
+  /// reads through the matrix and the port pins for itself.
+  Widget _panelView() {
+    return PanelView(
+      keypad: _keypad,
+      repaint: _screenRev,
+      askedFor: () =>
+          (cpu.peekBus(0x11B10E) << 8) | cpu.peekBus(0x11B10F),
+    );
+  }
 
   Widget _screenView() {
     return Column(

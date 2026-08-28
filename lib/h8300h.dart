@@ -24,6 +24,7 @@ import 'i2c_eeprom.dart';
 import 'itu.dart';
 import 'sci.dart';
 import 'sparse_memory.dart';
+import 'keypad.dart';
 
 /// CCR flag bit masks (I UI H U N Z V C).
 class H8Flag {
@@ -287,6 +288,28 @@ class H8Cpu {
     eeprom = null;
   }
 
+  /// The front panel, when one is attached. Null by default, which leaves
+  /// the key latch reading as plain memory and the knob pins floating -- how
+  /// every tool behaved before this existed.
+  Keypad? keypad;
+
+  /// Puts the panel on the bus and on its port pins. It works out the strobe
+  /// state from the port registers itself, so it needs to read memory, and
+  /// it drives the knob pairs and the reverse key through the same external
+  /// pin layer a switch would use.
+  void attachKeypad(Keypad k) {
+    k.peek = mem.peek;
+    k.hold = setPin;
+    k.release = releasePin;
+    keypad = k;
+    k.driveKnobs();
+  }
+
+  void detachKeypad() {
+    keypad?.releaseAll();
+    keypad = null;
+  }
+
   final List<ExternalInputs> externalInputs = [
     ExternalInputs(name: 'digital inputs', base: 0x080000, size: 0x020000),
   ];
@@ -323,6 +346,9 @@ class H8Cpu {
 
   /// Value the CPU sees when it reads [p]'s data register.
   int portRead(H8Port p) {
+    // The knobs hang off port C, and only turn when the CPU looks at them:
+    // see Keypad.pollKnobs for why they are paced rather than free-running.
+    if (p.drAddr == Keypad.pcDr) keypad?.pollKnobs(cycles);
     final dr = mem.peek(p.drAddr);
     final driven = (pinDriven[p.drAddr] ?? 0) & p.pinMask;
     if (driven == 0) return dr;
@@ -484,6 +510,8 @@ class H8Cpu {
     if (adc.owns(addr)) return adc.read(addr);
     final port = portByDr[addr];
     if (port != null) return portRead(port);
+    final kp = keypad;
+    if (kp != null && kp.owns(addr)) return kp.read(addr);
     for (final e in externalInputs) {
       if (e.owns(addr)) {
         final v = e.value;

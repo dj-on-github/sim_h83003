@@ -63,7 +63,7 @@ void keys_scan_settled(void);
  *   clr         mem
  *
  *   penupdown                     Left     Right
- *   ?           Help              smart    Output
+ *   ?           Help              smart    setup
  *
  *                                          eco
  *
@@ -122,7 +122,7 @@ void keys_scan_settled(void);
 #define KEY_PEN_UPDOWN      0x0076
 #define KEY_CLR             0x0077
 #define KEY_A               0x0078
-#define KEY_OUTPUT          0x0079
+#define KEY_SETUP          0x0079
 #define KEY_F               0x007A
 #define KEY_REVERSE         0x007B
 #define KEY_C_EQUALS        0x007C

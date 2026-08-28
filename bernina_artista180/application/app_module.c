@@ -172,7 +172,7 @@ void key_scan(void)
     if (REG8(0x00FFFEDDUL) & 0x04) { REG16(0x0011B10EUL) = KEY_PEN_UPDOWN; return; }
     if (REG8(0x00FFFEDBUL) & 0x04) { REG16(0x0011B10EUL) = KEY_CLR; return; }
     if (REG8(0x00FFFEDCUL) & 0x02) { REG16(0x0011B10EUL) = KEY_A; return; }
-    if (REG8(0x00FFFEDDUL) & 0x10) { REG16(0x0011B10EUL) = KEY_OUTPUT; return; }
+    if (REG8(0x00FFFEDDUL) & 0x10) { REG16(0x0011B10EUL) = KEY_SETUP; return; }
     if (REG8(0x00FFFEDBUL) & 0x40) { REG16(0x0011B10EUL) = KEY_F; return; }
     if (REG8(0x00FFFEC1UL) & 0x02) { REG16(0x0011B10EUL) = KEY_REVERSE; return; }
     if (REG8(0x00FFFEDBUL) & 0x80) { REG16(0x0011B10EUL) = KEY_C_EQUALS; return; }
@@ -1334,7 +1334,7 @@ void screen_request(void)
         }
         /* falls through -- and so does this one, into H'79 */
 
-    case KEY_OUTPUT: {
+    case KEY_SETUP: {
         const u8 s = REG8(0x0011A169UL);
 
         if (REG8(0x00114DC6UL) & 0x80) return;
