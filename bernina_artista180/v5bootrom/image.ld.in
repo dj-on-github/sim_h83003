@@ -1,0 +1,21 @@
+/* One image slot. IMAGE_BASE and IMAGE_LEN come from the Makefile. */
+MEMORY
+{
+    rom (rx)  : ORIGIN = IMAGE_BASE, LENGTH = IMAGE_LEN
+    ram (rwx) : ORIGIN = 0xFFF718, LENGTH = 0x5F0   /* above the three
+                                                       longwords stage-0 and
+                                                       the thunks reserve */
+}
+ENTRY(_image_start)
+SECTIONS
+{
+    .header : { KEEP(*(.header)) } > rom
+    .text : {
+        *(.text.start)
+        *(.text*)
+        *(.rodata*)
+    } > rom
+    .data : { *(.data*) } > rom
+    .bss  : { *(.bss*) *(COMMON) } > ram
+    /DISCARD/ : { *(.comment) *(.debug*) }
+}
