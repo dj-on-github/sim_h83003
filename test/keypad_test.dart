@@ -176,6 +176,36 @@ void main() {
       }
     });
 
+    test('keep turning after the CPU is reset', () {
+      // reset() puts cycles back to zero. The knob's pacing is measured in
+      // cycles, so unless it notices the clock has restarted it will hold
+      // every step back until the count catches up -- which is what made the
+      // knobs look dead in whichever image was loaded second.
+      final pad = Keypad();
+      final cpu = withKeypad(pad);
+      cpu.writeB(Keypad.pcDdr, 0x00);
+      final knob = pad.knobs[0];
+
+      // Run a while, turn it, then reset as loading an image does.
+      cpu.cycles = 500000000;
+      pad.turn(knob, 2);
+      cpu.readB(Keypad.pcDr);
+      cpu.reset();
+      cpu.writeB(Keypad.pcDdr, 0x00);
+
+      final was = (cpu.readB(Keypad.pcDr) >> knob.shift) & 0x03;
+      pad.turn(knob, 4);
+      var moved = false;
+      for (var i = 0; i < 8; i++) {
+        cpu.cycles += pad.knobStepCycles;
+        if (((cpu.readB(Keypad.pcDr) >> knob.shift) & 0x03) != was) {
+          moved = true;
+        }
+      }
+      expect(moved, isTrue, reason: 'the knob should still turn after a reset');
+      expect(knob.pending, 0, reason: 'and its detents should all be paid out');
+    });
+
     test('the two knobs are on separate pairs', () {
       final pad = Keypad();
       expect(pad.knobs[0].shift, 2, reason: 'knob A is port C bits 2-3');

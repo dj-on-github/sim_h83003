@@ -229,6 +229,12 @@ class Keypad {
   /// outrunning the millisecond interrupt, and hanging it off the read stops
   /// the knob turning while the CPU is stopped at a breakpoint.
   void pollKnobs(int cycles) {
+    // A reset puts the cycle count back to zero, and a knob turned before it
+    // would have left a mark somewhere far ahead. Without this the gate below
+    // would refuse every step until the count climbed back to where it was --
+    // after a long run, for ever -- and the knobs would look broken while the
+    // keys carried on working.
+    if (cycles < _lastKnobCycles) _lastKnobCycles = cycles;
     if (cycles - _lastKnobCycles < knobStepCycles) return;
     var moved = false;
     for (final k in knobs) {
