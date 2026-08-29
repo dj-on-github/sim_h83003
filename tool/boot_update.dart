@@ -10,6 +10,8 @@
 // here it is placed directly, since the burner already proves that path.
 //
 //   dart run tool/boot_update.dart <v5image.bin> <dir-with-updater.bin>
+//     [--identify] read the boot flash's maker and device bytes and write
+//                 nothing, which is the check worth making before an update
 //     [--cut N]   stop the machine N pages into the write, as a power failure
 //     [--busy N]  reads of the boot device that report busy after a write
 //     [--out F]   write the machine as it stands afterwards
@@ -27,10 +29,13 @@ import 'package:sim_h83003/h8300h.dart';
 import 'package:sim_h83003/hex_files.dart';
 
 const int updaterBase = 0x3E8000;
+const int identifyBase = 0x3E9000;
 const int payloadBase = 0x3EA000;
 const int appEntryAlt = 0x200004;
 const int statusByte = 0xFFF7F0;
 const int pagesDone = 0xFFF7F4;
+const int identMfr = 0xFFF7F8;
+const int identDev = 0xFFF7F9;
 const int activeBase = 0xFFF710;
 const int imageA = 0x000800;
 const int imageB = 0x004000;
@@ -70,6 +75,7 @@ void main(List<String> args) {
   String? opt(String n) =>
       args.contains(n) ? args[args.indexOf(n) + 1] : null;
   final cut = int.tryParse(opt('--cut') ?? '');
+  final identify = args.contains('--identify');
   final busy = int.parse(opt('--busy') ?? '400');
 
   final files = args.where((a) => !a.startsWith('--')).toList();
@@ -82,10 +88,11 @@ void main(List<String> args) {
   final image = List<int>.from(base);
   image.setRange(updaterBase, updaterBase + updater.length, updater);
   image.setRange(payloadBase, payloadBase + payload.length, payload);
-  image[appEntryAlt] = (updaterBase >> 24) & 0xFF;
-  image[appEntryAlt + 1] = (updaterBase >> 16) & 0xFF;
-  image[appEntryAlt + 2] = (updaterBase >> 8) & 0xFF;
-  image[appEntryAlt + 3] = updaterBase & 0xFF;
+  final entry = identify ? identifyBase : updaterBase;
+  image[appEntryAlt] = (entry >> 24) & 0xFF;
+  image[appEntryAlt + 1] = (entry >> 16) & 0xFF;
+  image[appEntryAlt + 2] = (entry >> 8) & 0xFF;
+  image[appEntryAlt + 3] = entry & 0xFF;
 
   final m = Machine(image, busy: busy);
   print('boot device busy for $busy reads after each page write');
@@ -98,6 +105,44 @@ void main(List<String> args) {
       '(generation ${m.u32(started + 4)})');
 
   m.cpu.sci1.receive('G'.codeUnits);
+
+  if (identify) {
+    // Identify only. Nothing is programmed, so this waits for the two bytes
+    // to appear and reports them.
+    for (var i = 0; i < 40000000; i++) {
+      m.cpu.step();
+      if (m.cpu.peekBus(statusByte) == 0x1D) break;
+    }
+    final mfr = m.cpu.peekBus(identMfr);
+    final dev = m.cpu.peekBus(identDev);
+    String b(int v) => "H'${v.toRadixString(16).toUpperCase().padLeft(2, '0')}";
+    final known = mfr == 0x1F && dev == 0xA4
+        ? 'Atmel, the A4 part the ROM programs a page at a time'
+        : 'NOT the part the ROM has a page-write driver for';
+    print('boot flash: manufacturer ${b(mfr)}, device ${b(dev)}  -- $known');
+
+    final after = m.snapshot(0, 0x8000);
+    var changed = 0;
+    for (var i = 0; i < 0x8000; i++) {
+      if (after[i] != image[i]) changed++;
+    }
+    print('boot flash bytes changed: $changed');
+
+    // Booting again is the check that the device was put back into read
+    // mode. Left in autoselect, the low two addresses read as the maker and
+    // device bytes -- and those two addresses are the reset vector.
+    final restart = List<int>.from(image);
+    restart.setRange(0, 0x8000, after);
+    for (var copy = 0x8000; copy < 0x20000; copy += 0x8000) {
+      restart.setRange(copy, copy + 0x8000, after);
+    }
+    final m2 = Machine(restart, busy: 0);
+    m2.run(14000000);
+    final now = m2.u32(activeBase);
+    print('and it still boots: ${now == 0 ? 'NO -- left in autoselect?' : 'yes,'
+        ' image ${now == imageA ? 'A' : 'B'} at ${h(now)}'}');
+    return;
+  }
 
   var stoppedAt = -1;
   for (var i = 0; i < 60000000; i++) {

@@ -26,6 +26,7 @@
  * placed by the test harness (on a real machine, by the boot ROM's own 'P'
  * command, which is safe here because it targets area 1). */
 #define UPDATER_BASE    0x003E8000UL
+#define IDENTIFY_BASE   0x003E9000UL   /* the identify entry, see below */
 #define PAYLOAD         0x003EA000UL
 
 #define IMAGE_A         0x00000800UL
@@ -39,11 +40,14 @@
 /* Somewhere the harness can read the outcome without a serial port. */
 #define STATUS          REG8(0x00FFF7F0UL)
 #define PAGES_DONE      REG32(0x00FFF7F4UL)
+#define IDENT_MFR       REG8(0x00FFF7F8UL)
+#define IDENT_DEV       REG8(0x00FFF7F9UL)
 
 #define ST_RUNNING      0x01
 #define ST_PROGRAM_FAIL 0x02
 #define ST_VERIFY_FAIL  0x03
 #define ST_DONE         0x5A
+#define ST_IDENTIFIED   0x1D
 
 /* The unlock cells of the boot device. Only the low fifteen address lines
  * reach it, which is exactly what these offsets need. */
@@ -84,6 +88,85 @@ static int program_page(u32 dst, const u8 *src)
         ((volatile u8 *)dst)[i] = src[i];
     }
     return wait_ready(dst);
+}
+
+/* A short spin, for the microseconds the part needs to answer the autoselect
+ * command. The boot ROM's delay() would do, but it lives in bank 0 and this
+ * is the one routine that has bank 0 in a mode where the low two addresses
+ * do not read as code. Keeping the wait local avoids the question. */
+/* One byte from the bottom of bank 0.
+ *
+ * Written the long way round because the two addresses wanted are 0 and 1,
+ * and a literal load from address 0 is undefined behaviour the compiler is
+ * entitled to turn into a trap -- which it did, leaving a call to abort in
+ * the middle of the identify. Taking the base through a volatile stops it
+ * being folded back to a constant. */
+static u8 read_bank0(u16 offset)
+{
+    volatile u32 base = 0;
+
+    return *(volatile u8 *)(base + offset);
+}
+
+static void spin(u16 n)
+{
+    volatile u16 i;
+
+    while (n-- != 0) {
+        for (i = 0; i < 600; i++) { }
+    }
+}
+
+/* Identify the boot flash, and program nothing.
+ *
+ * This is the check worth making before an update: the boot ROM's own
+ * flash_identify is static, and every command that reaches it goes on to
+ * program the device. 'P B 00' can be refused before it writes, but all
+ * three of the ROM's download streams open with the same "OE", so the reply
+ * only says "the ROM will drive this part", not which part it is.
+ *
+ * Running from bank 1 makes the question easy. Autoselect leaves the array
+ * readable everywhere except the two low addresses, so the risk here is not
+ * the mode itself -- it is that the vector table is at those low addresses.
+ * An interrupt taken while bank 0 is in autoselect would fetch its vector
+ * and get the manufacturer and device bytes instead. Hence interrupts off
+ * for the whole of it, and the device put back into read mode before they
+ * come on again.
+ *
+ * Entered by pointing H'200004 at IDENTIFY_BASE and sending 'G'. Afterwards
+ * the two bytes are at H'FFF7F8 and H'FFF7F9, which the boot ROM's 'N'
+ * command will dump.
+ */
+__attribute__((section(".text.identify")))
+void updater_identify(void)
+{
+    u8 mfr, id;
+
+    mask_interrupts();
+    STATUS = ST_RUNNING;
+
+    UNLOCK_A = 0xAA;
+    UNLOCK_B = 0x55;
+    UNLOCK_A = 0x90;              /* autoselect */
+    spin(11);
+
+    mfr = read_bank0(0);
+    id = read_bank0(1);
+
+    UNLOCK_A = 0xAA;
+    UNLOCK_B = 0x55;
+    UNLOCK_A = 0xF0;              /* and back to reading the array */
+    spin(11);
+
+    IDENT_MFR = mfr;
+    IDENT_DEV = id;
+    STATUS = ST_IDENTIFIED;
+
+    /* Nothing has been written, so the machine can simply carry on. */
+    {
+        void (*reset)(void) = (void (*)(void))STAGE0_ENTRY;
+        reset();
+    }
 }
 
 /* Pinned to the start of the section so that the entry really is at
