@@ -53,10 +53,10 @@
  * strings out of here, so they are placed rather than merely linked. */
     .section .appinfo, "a"
 appinfo_start:
-    .asciz  "NMMV03.01"
+    .asciz  "NMMV05.01"
     .asciz  "English     "
-    .asciz  "Bernina Electronic AG  "
-    .asciz  "July 98 "
+    .asciz  "Deadhat Hackings  "
+    .asciz  "Aug 26 "
     /* The fields are fixed width, trailing spaces and all, and the rest of
        the block is erased flash rather than zeros. Both matter: this is
        compared against the original byte for byte. */
