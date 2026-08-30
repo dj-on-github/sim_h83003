@@ -1,4 +1,7 @@
-
+./host/artista180_burn_bootrom --install-v5 /tmp/artista \
+    bernina_artista180/v5bootrom/updater.bin \
+    bernina_artista180/v5bootrom/imageB.bin
+    
 
 Burning the boot rom
 --------------------
@@ -9,12 +12,15 @@ The v5 updater runs from the application flash (bus area 1) and writes the boot 
 
 > cd ../..
 
-> Run the simulator. Load an image, enable flash and TCP mode in SCI.
+> Run the simulator. Load an image, enable flash and TCP mode in SCI and enable bridge mode.
 > Reset the simulator, don't start it.
 
+> ./host/artista180_burn_bootrom --probe
 > ./host/artista180_burn_bootrom --identify /tmp/artista bernina_artista180/v5bootrom/updater.bin
 
-> ./nhost/artista180_burn_bootrom /tmp/artista bernina_artista180/v5bootrom/updater.bin bernina_artista180/v5bootrom/imageN.bin
+./host/artista180_burn_bootrom --install-v5 /tmp/artista \
+    bernina_artista180/v5bootrom/updater.bin \
+    bernina_artista180/v5bootrom/imageB.bin
 
 > Run the simulator when the CLI tools ask you to reset the machine.
 
