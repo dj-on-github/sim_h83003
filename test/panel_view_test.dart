@@ -47,6 +47,7 @@ Offset atKey(WidgetTester tester, int code) {
 }
 
 void main() {
+  sewingLightTests();
   group('pressing a key', () {
     testWidgets('goes down while held and comes up on release',
         (tester) async {
@@ -196,6 +197,60 @@ void main() {
       await g.up();
 
       expect(pad.down, isEmpty);
+    });
+  });
+}
+
+/// The lamp over the needle, shown on the panel as a bulb. It is an
+/// indicator and not a control: the firmware drives port 4 bit 2, and the
+/// setting that turns it on lives in the machine's own setup screen.
+void sewingLightTests() {
+  Future<void> pumpWithLight(WidgetTester tester, bool? on) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: PanelView(
+          keypad: detachedPad(),
+          repaint: ValueNotifier<int>(0),
+          lightOn: on == null ? null : () => on,
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+  }
+
+  group('the sewing light', () {
+    testWidgets('is drawn dark when the pin is low', (tester) async {
+      await pumpWithLight(tester, false);
+      // The label is painted on the canvas, so the check is that the panel
+      // draws without complaint and reports the state it was given.
+      final painted = tester.widget<CustomPaint>(
+          find.byKey(const Key('panelCanvas')));
+      expect(painted.painter.runtimeType.toString(), '_PanelPainter');
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('and lit when it is high', (tester) async {
+      await pumpWithLight(tester, true);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('repaints when the lamp changes', (tester) async {
+      await pumpWithLight(tester, false);
+      final before = tester.widget<CustomPaint>(
+          find.byKey(const Key('panelCanvas'))).painter;
+      await pumpWithLight(tester, true);
+      final after = tester.widget<CustomPaint>(
+          find.byKey(const Key('panelCanvas'))).painter;
+      expect(before!.shouldRepaint(after!), isTrue,
+          reason: 'the bulb has to be redrawn when the pin moves');
+    });
+
+    testWidgets('is left off the drawing with no machine behind it',
+        (tester) async {
+      await pumpWithLight(tester, null);
+      expect(tester.takeException(), isNull);
     });
   });
 }

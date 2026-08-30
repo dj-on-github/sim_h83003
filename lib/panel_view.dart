@@ -20,12 +20,18 @@ const double _pixelsPerDetent = 2.25;
 /// Two clicks closer together than this latch a key down.
 const Duration _doubleClickWindow = Duration(milliseconds: 350);
 
+/// Where the lamp indicator sits in the panel drawing: below the two knobs,
+/// where there is nothing else.
+const double _bulbX = 1330;
+const double _bulbY = 1120;
+
 class PanelView extends StatefulWidget {
   const PanelView({
     super.key,
     required this.keypad,
     required this.repaint,
     this.askedFor,
+    this.lightOn,
   });
 
   final Keypad keypad;
@@ -37,6 +43,11 @@ class PanelView extends StatefulWidget {
   /// What the firmware is currently asking for, H'11B10E, or null when the
   /// panel is not attached to a running machine.
   final int Function()? askedFor;
+
+  /// Whether the lamp over the needle is lit -- port 4 bit 2. Null leaves
+  /// the bulb off the drawing altogether, which is what a panel with no
+  /// machine behind it wants.
+  final bool Function()? lightOn;
 
   @override
   State<PanelView> createState() => _PanelViewState();
@@ -163,6 +174,7 @@ class _PanelViewState extends State<PanelView> {
                     // The panel's lettering follows the app's typography
                     // rather than hard-coding a face.
                     base: theme.textTheme.bodyMedium ?? const TextStyle(),
+                    lightOn: widget.lightOn?.call(),
                     repaint: widget.repaint,
                   ),
                 ),
@@ -232,6 +244,7 @@ class _PanelPainter extends CustomPainter {
     required this.held,
     required this.onSurface,
     required this.base,
+    required this.lightOn,
     required Listenable repaint,
   }) : super(repaint: repaint);
 
@@ -239,6 +252,9 @@ class _PanelPainter extends CustomPainter {
   final PanelKey? held;
   final Color onSurface;
   final TextStyle base;
+
+  /// Null when there is no machine to ask.
+  final bool? lightOn;
 
   static const Color keyFace = Color(0xFFEDEDED);
   static const Color keyHeld = Color(0xFF7FB2FF);
@@ -262,6 +278,7 @@ class _PanelPainter extends CustomPainter {
     for (final k in keypad.knobs) {
       _knob(canvas, k);
     }
+    if (lightOn != null) _bulb(canvas, lightOn!);
     canvas.restore();
   }
 
@@ -432,6 +449,56 @@ class _PanelPainter extends CustomPainter {
     }
   }
 
+  /// The lamp over the needle, on port 4 bit 2.
+  ///
+  /// Not a control: the firmware drives that pin, and the setting that turns
+  /// it on lives in the machine's own setup screen. This only says which way
+  /// it currently is.
+  void _bulb(Canvas canvas, bool on) {
+    const centre = Offset(_bulbX, _bulbY);
+    const r = 46.0;
+    final ink = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 6
+      ..strokeCap = StrokeCap.round
+      ..color = onSurface;
+
+    if (on) {
+      // Lit: the glass filled, and light coming off it.
+      canvas.drawCircle(centre, r, Paint()..color = const Color(0xFFFFFFFF));
+      for (var i = 0; i < 8; i++) {
+        // Not the one pointing straight down: that is where the cap is, and
+        // a ray through it makes the thing read as a sun rather than a bulb.
+        if (i == 4) continue;
+        final a = i * math.pi / 4 - math.pi / 2;
+        final d = Offset(math.cos(a), math.sin(a));
+        canvas.drawLine(centre + d * (r + 16), centre + d * (r + 40),
+            ink..strokeWidth = 7);
+      }
+    } else {
+      // Dark: an outline with nothing behind it.
+      canvas.drawCircle(centre, r, Paint()..color = const Color(0xFF202020));
+    }
+    canvas.drawCircle(centre, r, ink..strokeWidth = 6);
+
+    // The cap, drawn the same either way: two bands on a short stem.
+    final capTop = centre.dy + r - 6;
+    canvas.drawLine(Offset(centre.dx - 20, capTop),
+        Offset(centre.dx + 20, capTop), ink..strokeWidth = 6);
+    canvas.drawLine(Offset(centre.dx - 20, capTop + 14),
+        Offset(centre.dx + 20, capTop + 14), ink);
+    canvas.drawLine(Offset(centre.dx - 20, capTop),
+        Offset(centre.dx - 20, capTop + 26), ink..strokeWidth = 5);
+    canvas.drawLine(Offset(centre.dx + 20, capTop),
+        Offset(centre.dx + 20, capTop + 26), ink);
+    canvas.drawLine(Offset(centre.dx - 12, capTop + 26),
+        Offset(centre.dx + 12, capTop + 26), ink);
+
+    _text(canvas, on ? 'light on' : 'light off',
+        Offset(centre.dx, centre.dy + r + 66),
+        size: 40, color: onSurface, align: _Align.centre, italic: true);
+  }
+
   void _text(Canvas canvas, String s, Offset at,
       {required double size,
       required Color color,
@@ -457,7 +524,10 @@ class _PanelPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_PanelPainter old) =>
-      old.held != held || old.onSurface != onSurface || old.base != base;
+      old.held != held ||
+      old.onSurface != onSurface ||
+      old.base != base ||
+      old.lightOn != lightOn;
 }
 
 enum _Align { centre, left }

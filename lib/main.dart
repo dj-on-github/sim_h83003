@@ -33,6 +33,7 @@ import 'panel_view.dart';
 import 'tcp_link.dart';
 import 'sim_config.dart';
 import 'sim_config_file.dart';
+import 'pin_roles.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
@@ -2914,7 +2915,27 @@ class _SimulatorPageState extends State<SimulatorPage>
       repaint: _screenRev,
       askedFor: () =>
           (cpu.peekBus(0x11B10E) << 8) | cpu.peekBus(0x11B10F),
+      lightOn: _sewingLightOn,
     );
+  }
+
+  /// Whether the lamp over the needle is lit.
+  ///
+  /// Port 4 bit 2, which pin_roles.dart names, so the two cannot drift
+  /// apart. The data register only means anything while the pin is an
+  /// output: before the firmware has set the direction it is an input and
+  /// the level says nothing, which is the same as the lamp being dark.
+  bool _sewingLightOn() {
+    final role = artista180PinRoles
+        .where((r) => r.name == 'sewing light')
+        .firstOrNull;
+    if (role == null) return false;
+    final port = _portNamed(role.port);
+    final ddrAddr = port?.ddrAddr;
+    if (port == null || ddrAddr == null) return false;
+    if ((cpu.peekBus(ddrAddr) >> role.bit) & 1 == 0) return false;
+    final level = (cpu.peekBus(port.drAddr) >> role.bit) & 1 == 1;
+    return level == role.activeHigh;
   }
 
   Widget _screenView() {
@@ -4553,6 +4574,7 @@ class _SimulatorPageState extends State<SimulatorPage>
                     value: (dr >> bit) & 1,
                     isFirst: bit == 7,
                     driven: driven && !isOutput,
+                    role: hasPin ? pinRole(p.name, bit) : null,
                     onTap: hasPin && !isOutput ? () => _cyclePin(p, bit) : null,
                   );
                 }(),
@@ -4570,6 +4592,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     required int value,
     required bool isFirst,
     bool driven = false,
+    PinRole? role,
     VoidCallback? onTap,
   }) {
     final Color? fill = !hasPin
@@ -4587,7 +4610,9 @@ class _SimulatorPageState extends State<SimulatorPage>
     final box = Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Bit number label above the box.
+        // The bit number, and under the box what the pin is for when that
+        // is known. A pin with no entry keeps its number and nothing else,
+        // which is honest: a wrong name would be believed.
         Text('$bit', style: TextStyle(fontSize: 10, color: _inkA(0.6))),
         Container(
           width: 34,
@@ -4609,12 +4634,30 @@ class _SimulatorPageState extends State<SimulatorPage>
                 )
               : null,
         ),
+        SizedBox(
+          width: 34,
+          child: Text(
+            role?.name ?? '',
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 8, height: 1.1, color: _inkA(0.6)),
+          ),
+        ),
       ],
     );
-    if (onTap == null) return box;
+
+    final wrapped = role == null
+        ? box
+        : Tooltip(
+            message: '${role.name} — ${role.where}\n${role.detail}\n'
+                'Active ${role.activeHigh ? "high" : "low"}.',
+            child: box,
+          );
+    if (onTap == null) return wrapped;
     return MouseRegion(
       cursor: SystemMouseCursors.click,
-      child: GestureDetector(onTap: onTap, child: box),
+      child: GestureDetector(onTap: onTap, child: wrapped),
     );
   }
 
