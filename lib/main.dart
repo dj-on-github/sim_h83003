@@ -31,6 +31,8 @@ import 'symbols.dart';
 import 'keypad.dart';
 import 'panel_view.dart';
 import 'tcp_link.dart';
+import 'sim_config.dart';
+import 'sim_config_file.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
@@ -40,10 +42,34 @@ import 'file_save_stub.dart' if (dart.library.io) 'file_save_io.dart';
 import 'hex_startup_stub.dart' if (dart.library.io) 'hex_startup_io.dart';
 
 void main(List<String> args) {
+  // ~/.h8simrc, if there is one. A file that is there but wrong is reported
+  // rather than ignored: settings that quietly did nothing would be worse
+  // than settings that say why.
+  var config = const SimConfig();
+  String? configError;
+  try {
+    config = loadSimConfig() ?? const SimConfig();
+  } catch (e) {
+    configError = '$e';
+  }
+
   // On the desktop builds the runner forwards command line arguments here,
-  // so `sim_h83003 program.mot` loads that file at startup.
-  final startup = readStartupHexFile(args);
-  runApp(SimH8App(startup: startup));
+  // so `sim_h83003 program.mot` loads that file at startup. A file named on
+  // the command line beats the one in the config, which is the way round
+  // that lets the config hold the usual case and the argument be the
+  // exception.
+  var startup = readStartupHexFile(args);
+  if (startup.path == null &&
+      config.image.load &&
+      (config.image.file?.isNotEmpty ?? false)) {
+    startup = readStartupHexFile([config.image.file!]);
+  }
+
+  runApp(SimH8App(
+    startup: startup,
+    config: config,
+    configError: configError,
+  ));
 }
 
 /// Shown in the in-app About dialog. Keep [kAppVersion] in step with the
@@ -79,17 +105,32 @@ class AppSettings {
 }
 
 class SimH8App extends StatefulWidget {
-  const SimH8App({super.key, this.startup});
+  const SimH8App({
+    super.key,
+    this.startup,
+    this.config = const SimConfig(),
+    this.configError,
+  });
 
   /// A hex file named on the command line (path/contents/error), if any.
   final StartupHex? startup;
+
+  /// What ~/.h8simrc said, or the defaults if there was no file.
+  final SimConfig config;
+
+  /// Why the file could not be read, if it was there and unreadable.
+  final String? configError;
 
   @override
   State<SimH8App> createState() => _SimH8AppState();
 }
 
 class _SimH8AppState extends State<SimH8App> {
-  AppSettings _settings = const AppSettings();
+  late AppSettings _settings = AppSettings(
+    darkMode: widget.config.appearance.darkMode,
+    fontFamily: widget.config.appearance.fontFamily,
+    cpuHz: widget.config.appearance.cpuHz,
+  );
 
   ThemeData _theme(Brightness b) => ThemeData(
         useMaterial3: true,
@@ -110,6 +151,8 @@ class _SimH8AppState extends State<SimH8App> {
       themeMode: _settings.darkMode ? ThemeMode.dark : ThemeMode.light,
       home: SimulatorPage(
         startup: widget.startup,
+        config: widget.config,
+        configError: widget.configError,
         settings: _settings,
         onSettingsChanged: (s) => setState(() => _settings = s),
       ),
@@ -121,12 +164,20 @@ class SimulatorPage extends StatefulWidget {
   const SimulatorPage({
     super.key,
     this.startup,
+    this.config = const SimConfig(),
+    this.configError,
     required this.settings,
     required this.onSettingsChanged,
   });
 
   /// A hex file named on the command line, to load once at startup.
   final StartupHex? startup;
+
+  /// What ~/.h8simrc said.
+  final SimConfig config;
+
+  /// Why it could not be read, if it was there and unreadable.
+  final String? configError;
 
   /// Current user settings and a callback to change them.
   final AppSettings settings;
@@ -387,9 +438,202 @@ class _SimulatorPageState extends State<SimulatorPage>
     _serialPortLabels = SerialLink.describePorts(_serialPorts);
     _loadDemo();
     _applyStartupHex(); // override the demo if a hex file was given on CLI
+    _applyConfig(); // and then whatever ~/.h8simrc asked for
     _memScroll.addListener(_onMemScroll);
     WidgetsBinding.instance
         .addPostFrameCallback((_) => _scrollToAddress(_memBase));
+  }
+
+  // ---- ~/.h8simrc -------------------------------------------------------
+  //
+  // Setting a session up is a dozen small decisions, and every one of them
+  // has to be made again next time. The config file is those decisions
+  // written down; this is the pair of routines that put them into effect and
+  // read them back out. The file itself is lib/sim_config.dart.
+
+  /// Puts the config into effect.
+  ///
+  /// Everything that is only state is done now. Everything that touches a
+  /// file or a port waits for the first frame, so a failure can be shown in
+  /// the status line it belongs to rather than thrown during a build.
+  void _applyConfig() {
+    final c = widget.config;
+
+    final v = c.views;
+    _viewMem = v.memory;
+    _viewDis = v.disassembly;
+    _viewScr = v.screen;
+    _viewSci = v.sci;
+    _viewItu = v.itu;
+    _viewDma = v.dma;
+    _viewIo = v.io;
+    _viewTrace = v.trace;
+    _viewProfile = v.profile;
+    _viewFlash = v.flash;
+    _viewEeprom = v.eeprom;
+    _viewPanel = v.buttons;
+
+    // In the narrow layout there is one tab rather than a set of panes, so
+    // the first view asked for is the one to open on.
+    final wanted = v.asList.indexOf(true);
+    if (wanted >= 0) _tab.index = wanted;
+
+    _followPcInMemory = c.memory.followPc;
+    _memBase = c.memory.address & 0xFFFFF8;
+
+    _serialChannelIndex = c.sci.channel == 0 ? 0 : 1;
+    _serialUseTcp = c.sci.useTcp;
+    if (c.sci.port != null) _serialPortName = c.sci.port;
+    _tcpPortCtl.text = '${c.sci.tcpPort}';
+    _serialPhiHz = c.sci.phiHz;
+    _serialPhiCtl.text = '${c.sci.phiHz}';
+
+    cpu.profiling = c.profiling;
+    for (final a in c.dataBreakpoints) {
+      cpu.dataBreaks.add(a & SparseMemory.addrMask);
+    }
+    for (final a in c.instructionBreakpoints) {
+      cpu.instrBreaks.add(a & SparseMemory.addrMask);
+    }
+
+    for (final t in c.traces) {
+      _traces.add(TraceEntry(
+          target: t.target, bits: t.bits, bigEndian: t.bigEndian));
+    }
+
+    for (final pin in c.pins) {
+      final port = _portNamed(pin.port);
+      if (port == null) continue;
+      if (pin.isFloat) {
+        cpu.releasePin(port.drAddr, pin.bit);
+      } else {
+        cpu.setPin(port.drAddr, pin.bit, pin.isHigh);
+      }
+    }
+
+    // Keys held from the start: clr held down is how the machine is put into
+    // service mode, which is the whole reason this is worth configuring.
+    for (final code in c.heldKeys) {
+      final key = Keypad.panelKeys.where((k) => k.code == code);
+      if (key.isEmpty) continue;
+      _keypad.setDown(key.first, true);
+      _keypad.latched.add(code);
+    }
+
+    if (c.flash.file != null) _flashPathCtl.text = c.flash.file!;
+    _eepromPathCtl.text = c.eeprom.file;
+    _eeprom.verifyFriendly = c.eeprom.verifyFriendly;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final err = widget.configError;
+      if (err != null) {
+        _showSnack('~/$kConfigFileName could not be read: $err');
+      }
+      if (c.flash.enable) {
+        await _setFlashOn(true);
+      } else if (c.flash.load && _flashPathCtl.text.isNotEmpty) {
+        await _loadFlashImage();
+      }
+      if (c.eeprom.enable) await _setEepromOn(true);
+      if (c.sci.bridge) await _setSerialOn(true);
+    });
+  }
+
+  /// The port the manual calls [name], or null if there is no such thing.
+  H8Port? _portNamed(String name) {
+    for (final p in H8Cpu.ports) {
+      if (p.name.toUpperCase() == name.toUpperCase()) return p;
+    }
+    return null;
+  }
+
+  /// The session as it stands, ready to be written to the file.
+  SimConfig _captureConfig() {
+    final pins = <PinConfig>[];
+    for (final p in H8Cpu.ports) {
+      for (var bit = 0; bit < 8; bit++) {
+        if ((p.pinMask >> bit) & 1 == 0) continue;
+        if (!cpu.pinIsDriven(p.drAddr, bit)) continue;
+        // The panel holds the knob pairs and reverse itself. Writing those
+        // down would give a session that comes back with its knobs pinned.
+        if (_keypad.ownsPin(p.drAddr, bit)) continue;
+        pins.add(PinConfig(
+          port: p.name,
+          bit: bit,
+          level: cpu.pinIsHigh(p.drAddr, bit) ? 'high' : 'low',
+        ));
+      }
+    }
+
+    return SimConfig(
+      views: ViewConfig(
+        memory: _viewMem,
+        disassembly: _viewDis,
+        screen: _viewScr,
+        sci: _viewSci,
+        itu: _viewItu,
+        dma: _viewDma,
+        io: _viewIo,
+        trace: _viewTrace,
+        profile: _viewProfile,
+        flash: _viewFlash,
+        eeprom: _viewEeprom,
+        buttons: _viewPanel,
+      ),
+      memory: MemoryConfig(
+          followPc: _followPcInMemory, address: _memBase),
+      sci: SciConfig(
+        channel: _serialChannelIndex,
+        transport: _serialUseTcp ? 'tcp' : 'serial',
+        port: _serialPortName,
+        tcpPort: int.tryParse(_tcpPortCtl.text.trim()) ?? 5555,
+        phiHz: _serialPhiHz,
+        bridge: _serialOn,
+      ),
+      pins: pins,
+      traces: [
+        for (final t in _traces)
+          TraceConfig(
+              target: t.target, bits: t.bits, bigEndian: t.bigEndian),
+      ],
+      profiling: cpu.profiling,
+      flash: FlashConfig(
+        file: _flashPathCtl.text.trim().isEmpty
+            ? null
+            : _flashPathCtl.text.trim(),
+        load: _flashOn,
+        enable: _flashOn,
+      ),
+      eeprom: EepromConfig(
+        file: _eepromPathCtl.text.trim(),
+        enable: _eepromOn,
+        verifyFriendly: _eeprom.verifyFriendly,
+      ),
+      // Only the latched ones: a key held by the mouse at the moment of
+      // saving is not a setting.
+      heldKeys: _keypad.latched.toList()..sort(),
+      image: ImageConfig(
+        file: _lastProgramPath,
+        load: _lastProgramPath != null,
+      ),
+      dataBreakpoints: cpu.dataBreaks.toList()..sort(),
+      instructionBreakpoints: cpu.instrBreaks.toList()..sort(),
+      appearance: AppearanceConfig(
+        darkMode: widget.settings.darkMode,
+        fontFamily: widget.settings.fontFamily,
+        cpuHz: widget.settings.cpuHz,
+      ),
+    );
+  }
+
+  /// Writes the session to ~/.h8simrc.
+  Future<void> _saveConfig() async {
+    try {
+      final path = saveSimConfig(_captureConfig());
+      _showSnack('Settings saved to $path.');
+    } catch (e) {
+      _showSnack('Could not save the settings: $e');
+    }
   }
 
   /// If a program file was named on the command line, load it over the demo.
@@ -1504,6 +1748,28 @@ class _SimulatorPageState extends State<SimulatorPage>
                     onChanged: (v) =>
                         setLocal(() => clearBreakpoints = v ?? false),
                   ),
+                  const Divider(height: 20),
+                  // The whole session, not just what is in this dialog: the
+                  // views, the memory window, the SCI link, the pin
+                  // overrides, the traces, the flash and EEPROM, the keys
+                  // held down and every breakpoint.
+                  Row(children: [
+                    Expanded(
+                      child: Text(
+                        'Save the whole session — views, memory window, SCI '
+                        'link, pin overrides, traces, flash, EEPROM, held '
+                        'keys and breakpoints — to ~/$kConfigFileName, to be '
+                        'picked up next time.',
+                        style: TextStyle(color: _inkA(0.7), fontSize: 12),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    OutlinedButton(
+                      key: const Key('saveConfigButton'),
+                      onPressed: () => unawaited(_saveConfig()),
+                      child: const Text('Save settings'),
+                    ),
+                  ]),
                 ],
               ),
               actions: [

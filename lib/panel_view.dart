@@ -188,7 +188,13 @@ class _PanelViewState extends State<PanelView> {
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           color: theme.colorScheme.surfaceContainerHighest,
-          child: Row(
+          // A Wrap rather than a Row: this pane gets narrow when several
+          // views share the window, and a Row here overflows instead of
+          // wrapping.
+          child: Wrap(
+            spacing: 20,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               Text(
                 down.isEmpty
@@ -196,21 +202,18 @@ class _PanelViewState extends State<PanelView> {
                     : 'down: ${down.map((c) => "H'${hex(c)}").join(' ')}',
                 style: mono,
               ),
-              const SizedBox(width: 20),
               if (asked != null)
                 Text(
                   "asking for: ${asked == 0xFFFF ? 'nothing' : "H'${hex(asked)}"}"
                   "   (H'11B10E)",
                   style: mono,
                 ),
-              const Spacer(),
               Text(
                 'knobs '
                 '${pad.knobs.map((k) => '${k.levels.toRadixString(2).padLeft(2, '0')}'
                     '${k.pending == 0 ? '' : ' ${k.pending > 0 ? '+' : ''}${k.pending}'}').join('  ')}',
                 style: mono,
               ),
-              const SizedBox(width: 16),
               TextButton(
                 onPressed: () => setState(pad.releaseAll),
                 child: const Text('Release all'),

@@ -163,6 +163,25 @@ class Keypad {
 
   bool owns(int addr) => addr >= latchBase && addr < latchBase + latchSize;
 
+  /// True when this pin is one the panel drives itself: the two quadrature
+  /// pairs and reverse. Anything reading the CPU's held pins back out -- the
+  /// settings file, say -- has to leave these alone, or a saved session would
+  /// hold the knobs still and the reverse key down.
+  bool ownsPin(int drAddr, int bit) {
+    if (drAddr == pcDr) {
+      for (final k in knobs) {
+        if (bit == k.shift || bit == k.shift + 1) return true;
+      }
+      return false;
+    }
+    for (final k in panelKeys) {
+      if (k.wiring == KeyWiring.pin && k.pinDr == drAddr && k.pinBit == bit) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool isDown(int code) => down.contains(code);
 
   /// Presses or releases a key, and for the ones wired to a port pin drives
