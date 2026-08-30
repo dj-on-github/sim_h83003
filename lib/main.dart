@@ -30,6 +30,7 @@ import 'sparse_memory.dart';
 import 'symbols.dart';
 import 'keypad.dart';
 import 'panel_view.dart';
+import 'tcp_link.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
@@ -269,6 +270,16 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// real port on this machine, so the software that talks to a Bernina can
   /// talk to the simulation instead.
   final SerialLink _serial = SerialLink();
+
+  /// The other way out of the SCI tab. libserialport cannot open a pty, so a
+  /// socket is what lets socat put the machine on a virtual serial port.
+  final TcpLink _tcp = TcpLink();
+
+  /// Which of the two the bridge uses. The channel has one transmit hook, so
+  /// only one can be running at a time.
+  bool _serialUseTcp = false;
+  final TextEditingController _tcpPortCtl =
+      TextEditingController(text: '5555');
   List<String> _serialPorts = const [];
 
   /// Port names to the labels shown in the menu, worked out when the list is
@@ -428,6 +439,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     _memScroll.removeListener(_onMemScroll);
     _memScroll.dispose();
     _disasmScroll.dispose();
+    _tcpPortCtl.dispose();
     _screenRev.dispose();
     super.dispose();
   }
@@ -709,9 +721,9 @@ class _SimulatorPageState extends State<SimulatorPage>
       channel: _bridged,
       outgoing: _serialOut,
       phiHz: _serialPhiHz,
-      setBaud: _serial.setBaud,
-      drain: _serial.drain,
-      send: _serial.send,
+      setBaud: _serialUseTcp ? _tcp.setBaud : _serial.setBaud,
+      drain: _serialUseTcp ? _tcp.drain : _serial.drain,
+      send: _serialUseTcp ? _tcp.send : _serial.send,
     );
   }
 
@@ -727,16 +739,10 @@ class _SimulatorPageState extends State<SimulatorPage>
     });
   }
 
-  void _setSerialOn(bool on) {
+  Future<void> _setSerialOn(bool on) async {
     if (!on) {
       _detachSerial();
       setState(() => _serialStatus = 'Bridge off.');
-      return;
-    }
-
-    final port = _serialPortName;
-    if (port == null) {
-      setState(() => _serialStatus = 'Choose a serial port first.');
       return;
     }
 
@@ -748,11 +754,33 @@ class _SimulatorPageState extends State<SimulatorPage>
       return;
     }
 
-    final error = _serial.open(port, baud);
-    if (error != null) {
-      setState(() => _serialStatus = error);
-      return;
+    final String where;
+    if (_serialUseTcp) {
+      final tcpPort = int.tryParse(_tcpPortCtl.text.trim());
+      if (tcpPort == null || tcpPort < 1 || tcpPort > 65535) {
+        setState(() => _serialStatus = 'That is not a usable port number.');
+        return;
+      }
+      final error = await _tcp.open(tcpPort, baud);
+      if (error != null) {
+        setState(() => _serialStatus = error);
+        return;
+      }
+      where = 'TCP ${_tcp.port}';
+    } else {
+      final port = _serialPortName;
+      if (port == null) {
+        setState(() => _serialStatus = 'Choose a serial port first.');
+        return;
+      }
+      final error = _serial.open(port, baud);
+      if (error != null) {
+        setState(() => _serialStatus = error);
+        return;
+      }
+      where = port;
     }
+
     // Both want the channel's transmit hook; only one can have it.
     if (_netOn) unawaited(_detachNetwork());
 
@@ -760,7 +788,11 @@ class _SimulatorPageState extends State<SimulatorPage>
     _bridged.onTransmit = _serialOut.add;
     setState(() {
       _serialOn = true;
-      _serialStatus = 'Bridged ${_bridged.name} to $port at $baud baud.';
+      _serialStatus = _serialUseTcp
+          ? 'Bridged ${_bridged.name} to $where at $baud baud. Join a pty to '
+              'it with:  socat pty,raw,echo=0,link=/tmp/artista '
+              'TCP:localhost:${_tcp.port}'
+          : 'Bridged ${_bridged.name} to $where at $baud baud.';
     });
   }
 
@@ -833,6 +865,8 @@ class _SimulatorPageState extends State<SimulatorPage>
     }
     _serialOut.clear();
     _serial.close();
+    // Whichever transport was in use; closing the idle one costs nothing.
+    unawaited(_tcp.close());
     _serialOn = false;
   }
 
@@ -3084,34 +3118,73 @@ class _SimulatorPageState extends State<SimulatorPage>
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               SizedBox(
-                width: 300,
-                child: DropdownButtonFormField<String>(
-                  key: const Key('serialPortDropdown'),
-                  initialValue: _serialPortName,
+                width: 150,
+                child: DropdownButtonFormField<bool>(
+                  key: const Key('serialTransportDropdown'),
+                  initialValue: _serialUseTcp,
+                  // Ellipsize rather than overflow: this pane gets narrow
+                  // when three views share the window.
                   isExpanded: true,
                   decoration: const InputDecoration(
                     isDense: true,
                     border: OutlineInputBorder(),
-                    labelText: 'Port',
+                    labelText: 'Via',
                   ),
-                  items: [
-                    for (final p in _serialPorts)
-                      DropdownMenuItem(
-                        value: p,
-                        child: Text(_serialPortLabels[p] ?? p,
-                            overflow: TextOverflow.ellipsis, style: dim),
-                      ),
+                  items: const [
+                    DropdownMenuItem(value: false, child: Text('Serial')),
+                    DropdownMenuItem(value: true, child: Text('TCP')),
                   ],
                   onChanged: _serialOn
                       ? null
-                      : (v) => setState(() => _serialPortName = v),
+                      : (v) => setState(() => _serialUseTcp = v ?? false),
                 ),
               ),
-              OutlinedButton(
-                key: const Key('serialRefreshButton'),
-                onPressed: _serialOn ? null : _refreshSerialPorts,
-                child: const Text('Refresh'),
-              ),
+              if (!_serialUseTcp) ...[
+                SizedBox(
+                  width: 300,
+                  child: DropdownButtonFormField<String>(
+                    key: const Key('serialPortDropdown'),
+                    initialValue: _serialPortName,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'Port',
+                    ),
+                    items: [
+                      for (final p in _serialPorts)
+                        DropdownMenuItem(
+                          value: p,
+                          child: Text(_serialPortLabels[p] ?? p,
+                              overflow: TextOverflow.ellipsis, style: dim),
+                        ),
+                    ],
+                    onChanged: _serialOn
+                        ? null
+                        : (v) => setState(() => _serialPortName = v),
+                  ),
+                ),
+                OutlinedButton(
+                  key: const Key('serialRefreshButton'),
+                  onPressed: _serialOn ? null : _refreshSerialPorts,
+                  child: const Text('Refresh'),
+                ),
+              ] else
+                SizedBox(
+                  width: 150,
+                  child: TextField(
+                    key: const Key('serialTcpPortField'),
+                    controller: _tcpPortCtl,
+                    enabled: !_serialOn,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      labelText: 'TCP port',
+                      helperText: 'listens on localhost',
+                    ),
+                  ),
+                ),
               SizedBox(
                 width: 130,
                 child: DropdownButtonFormField<int>(
@@ -3154,7 +3227,7 @@ class _SimulatorPageState extends State<SimulatorPage>
                 Switch(
                   key: const Key('serialEnableSwitch'),
                   value: _serialOn,
-                  onChanged: _setSerialOn,
+                  onChanged: (v) => unawaited(_setSerialOn(v)),
                 ),
                 Text('Bridge', style: label),
               ]),
@@ -3177,8 +3250,12 @@ class _SimulatorPageState extends State<SimulatorPage>
           if (_serialOn) ...[
             const SizedBox(height: 6),
             Text(
-              'in ${_serial.bytesIn}  out ${_serial.bytesOut}'
-              '${_serial.lastError != null ? "   ${_serial.lastError}" : ""}',
+              _serialUseTcp
+                  ? 'in ${_tcp.bytesIn}  out ${_tcp.bytesOut}   '
+                      '${_tcp.describe()}'
+                      '${_tcp.lastError != null ? "   ${_tcp.lastError}" : ""}'
+                  : 'in ${_serial.bytesIn}  out ${_serial.bytesOut}'
+                      '${_serial.lastError != null ? "   ${_serial.lastError}" : ""}',
               style: dim,
             ),
           ],
@@ -4351,19 +4428,28 @@ class _SimulatorPageState extends State<SimulatorPage>
     cpu.flash.clear();
     final padded = applyFlashImage(bytes, cpu.mem.poke, addressed: addressed);
     for (final region in artista180Flash) {
-      cpu.attachFlash(JedecFlash(base: region.base, size: region.size));
+      cpu.attachFlash(JedecFlash.forRegion(region));
     }
     _reset();
 
     final shape = addressed
         ? 'read as a memory dump, each device taken from its own address'
-        : 'read as the two devices back to back';
+        : 'read as the devices back to back';
+    // An image written before the data device was in the list is exactly the
+    // size of the other two. Padding it leaves that device erased, and the
+    // application then comes up without its icons -- which is a confusing
+    // thing to have to work out from the screen.
+    final oldShape = !addressed && bytes.length == 0x208000;
     setState(() {
       _flashOn = true;
       _flashAddressed = addressed;
       _flashStatus = '${bytes.length} bytes $shape.'
           '${padded > 0 ? "  $padded bytes past the end of the file were "
               "filled with H'FF." : ""}'
+          '${oldShape ? "  That is the size of an image saved before the "
+              "data device at H'500000 was known about, so that device is "
+              "erased and the application will come up without its icons. "
+              "Load a full memory dump and save the image again." : ""}'
           '  CPU reset.';
     });
   }
@@ -4528,9 +4614,107 @@ class _SimulatorPageState extends State<SimulatorPage>
             },
             children: rows,
           ),
+          const SizedBox(height: 20),
+          _flashWrittenSection(),
         ],
       ),
     );
+  }
+
+  /// What the machine has had written to it, by 64K bank.
+  ///
+  /// The counts come from the flash devices themselves rather than from
+  /// anything the host said, so this is the burn seen from the machine's
+  /// side: pages climbing while a burner streams, and the span narrowing
+  /// down to exactly what landed if one stops part way.
+  Widget _flashWrittenSection() {
+    final devices = cpu.flash;
+    final any = devices.any((d) => d.written.isNotEmpty);
+
+    final rows = <TableRow>[
+      TableRow(children: [
+        _flashCell('Bank', bold: true),
+        _flashCell('Device', bold: true),
+        _flashCell('Pages', bold: true),
+        _flashCell('Bytes', bold: true),
+        _flashCell('Touched', bold: true),
+      ]),
+    ];
+    for (final d in devices) {
+      final banks = d.written.values.toList()
+        ..sort((a, b) => a.bank.compareTo(b.bank));
+      for (final b in banks) {
+        rows.add(TableRow(children: [
+          _flashCell("H'${_addr6(b.bank)}"),
+          _flashCell(_flashNameFor(d.base)),
+          _flashCell('${b.pages}'),
+          _flashCell('${b.bytes}'),
+          _flashCell(b.lowest < 0
+              ? '-'
+              : "H'${_addr6(b.lowest)}-H'${_addr6(b.highest)}"
+                  '${b.erases == 0 ? '' : '   ${b.erases} erased'}'),
+        ]));
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // A Wrap, not a Row: this pane gets narrow when several views share
+        // the window, and a Row here overflows rather than wrapping.
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Text('WRITTEN BANKS',
+                style: TextStyle(
+                    fontFamily: _font,
+                    color: _ink,
+                    fontWeight: FontWeight.bold)),
+            OutlinedButton(
+              key: const Key('flashClearWrittenButton'),
+              onPressed: any ? _clearFlashWriteLog : null,
+              child: const Text('Clear'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        if (!_flashOn)
+          Text('The flash model is off, so nothing is being recorded.',
+              style: TextStyle(fontFamily: _font, color: _inkA(0.75)))
+        else if (!any)
+          Text('Nothing written yet.',
+              style: TextStyle(fontFamily: _font, color: _inkA(0.75)))
+        else
+          Table(
+            columnWidths: const {
+              0: IntrinsicColumnWidth(),
+              1: IntrinsicColumnWidth(),
+              2: IntrinsicColumnWidth(),
+              3: IntrinsicColumnWidth(),
+              4: IntrinsicColumnWidth(),
+            },
+            children: rows,
+          ),
+      ],
+    );
+  }
+
+  /// Which of the machine's two devices starts at [base].
+  String _flashNameFor(int base) {
+    for (final r in artista180Flash) {
+      if (r.base == base) return r.name;
+    }
+    return "H'${_addr6(base)}";
+  }
+
+  void _clearFlashWriteLog() {
+    setState(() {
+      for (final d in cpu.flash) {
+        d.clearWriteLog();
+      }
+    });
   }
 
   static String _addr6(int v) =>

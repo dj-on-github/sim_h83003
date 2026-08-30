@@ -1,9 +1,11 @@
-/* The updater lives in the spare space at the top of the application flash.
- * The 2M device is used up to H'3E78C2, so H'3E8000 is clear and page
- * aligned. The payload it programs sits above it at H'3EA000. */
+/* The updater lives in the top 64K of the application device.
+ *
+ * The 3.01 image's application data runs to H'3EDAB2, so the H'3E8000 this
+ * used to use was not spare at all. H'3F0000 upwards is erased in both
+ * dumps, and is where the payload and the permanent block go too. */
 MEMORY
 {
-    rom (rx)  : ORIGIN = 0x3E8000, LENGTH = 0x2000
+    rom (rx)  : ORIGIN = 0x3F0000, LENGTH = 0x4000
     ram (rwx) : ORIGIN = 0xFFF7C0, LENGTH = 0x30
 }
 ENTRY(_updater_main)
@@ -24,7 +26,10 @@ SECTIONS
     /* The identify entry, at a fixed address of its own so the host can
        point H'200004 at either it or the updater without knowing how big
        the other one came out. H'1000 in is clear of both. */
-    .text.identify 0x3E9000 : { KEEP(*(.text.identify)) } > rom
+    .text.identify 0x3F2000 : { KEEP(*(.text.identify)) } > rom
+
+    /* The first-install entry, on its own fixed address like the others. */
+    .text.install  0x3F2800 : { KEEP(*(.text.install)) } > rom
     .data : { *(.data*) } > rom
     .bss  : { *(.bss*) *(COMMON) } > ram
     /DISCARD/ : { *(.comment) *(.debug*) }

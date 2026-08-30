@@ -25,9 +25,20 @@
 /* Where the pieces live. The payload is a complete image, header and all,
  * placed by the test harness (on a real machine, by the boot ROM's own 'P'
  * command, which is safe here because it targets area 1). */
-#define UPDATER_BASE    0x003E8000UL
-#define IDENTIFY_BASE   0x003E9000UL   /* the identify entry, see below */
-#define PAYLOAD         0x003EA000UL
+/* The top 64K of the application device.
+ *
+ * Not H'3E8000, which is where these used to sit: that is inside what the
+ * 3.01 image actually uses -- its application data runs to H'3EDAB2 -- so
+ * staging here overwrote real data and only looked harmless because a page
+ * write replaces whatever was there. Both dumps have H'3F0000 upwards
+ * erased. */
+#define UPDATER_BASE    0x003F0000UL
+#define IDENTIFY_BASE   0x003F2000UL   /* the identify entry, see below */
+#define INSTALL_BASE    0x003F2800UL   /* the first-install entry */
+#define PAYLOAD         0x003F4000UL
+#define PERMANENT_SRC   0x003F6000UL   /* the permanent block, for a first
+                                          install */
+#define PERMANENT_LEN   0x800UL        /* vectors, trampolines, stage-0 */
 
 #define IMAGE_A         0x00000800UL
 #define IMAGE_B         0x00004000UL
@@ -48,6 +59,8 @@
 #define ST_VERIFY_FAIL  0x03
 #define ST_DONE         0x5A
 #define ST_IDENTIFIED   0x1D
+#define ST_NOT_V5       0x1E
+#define ST_INSTALLED_V5 0x2D
 
 /* The unlock cells of the boot device. Only the low fifteen address lines
  * reach it, which is exactly what these offsets need. */
@@ -176,6 +189,98 @@ void updater_identify(void)
  * rubbish over the *other* slot and left the machine with no valid image at
  * all. The one thing this whole design exists to prevent, caused by a
  * section ordering. */
+/* Put v5 on a machine that is not running it yet.
+ *
+ * This is the one operation that cannot be made safe, and the ordering is
+ * the whole of what makes it as safe as it can be:
+ *
+ *   1. The image goes into slot B at H'004000 first. On a stock machine
+ *      that is free space -- the 3.01 ROM ends at H'0023FF and nothing
+ *      boots from H'004000 -- so this part is fully retryable. The old ROM
+ *      is untouched and still runs.
+ *
+ *   2. Then pages 1-7 of the permanent block. This is where the old ROM
+ *      starts to go: its interrupt trampolines are at H'000100 and its boot
+ *      code at H'000400. From here on the machine has no working ROM.
+ *
+ *   3. Then page 0, the vector table, which is what makes any of it run.
+ *
+ * The window is between the first write of step 2 and the end of step 3:
+ * eight page writes, on the order of eighty milliseconds. Lose power in it
+ * and the machine has neither ROM and will not start at all -- there is no
+ * fallback, because the fallback *is* what step 2 overwrites.
+ *
+ * Note the image installed here must be linked for slot B. Its header's
+ * entry field says where it expects to be, and the host checks that.
+ */
+__attribute__((section(".text.install")))
+void updater_install_v5(void)
+{
+    const u8 *img = (const u8 *)PAYLOAD;
+    const u8 *perm = (const u8 *)PERMANENT_SRC;
+    u32 total, done;
+
+    mask_interrupts();
+    STATUS = ST_RUNNING;
+    PAGES_DONE = 0;
+
+    total = (((u32)img[8] << 24) | ((u32)img[9] << 16) |
+             ((u32)img[10] << 8) | (u32)img[11]) + 0x40;
+    total = (total + (PAGE - 1)) & ~(u32)(PAGE - 1);
+
+    /* 1. The image, body first and header last, into the free slot. */
+    for (done = PAGE; done < total; done += PAGE) {
+        if (!program_page(IMAGE_B + done, img + done)) {
+            STATUS = ST_PROGRAM_FAIL;
+            for (;;) { }
+        }
+        PAGES_DONE = done / PAGE;
+    }
+    if (!program_page(IMAGE_B, img)) {
+        STATUS = ST_PROGRAM_FAIL;
+        for (;;) { }
+    }
+    for (done = 0; done < total; done++) {
+        if (((const volatile u8 *)IMAGE_B)[done] != img[done]) {
+            STATUS = ST_VERIFY_FAIL;
+            for (;;) { }
+        }
+    }
+
+    /* 2. Pages 1-7. The old ROM goes here; there is no way back after this
+     *    until step 3 lands. */
+    for (done = PAGE; done < PERMANENT_LEN; done += PAGE) {
+        if (!program_page(done, perm + done)) {
+            STATUS = ST_PROGRAM_FAIL;
+            for (;;) { }
+        }
+        PAGES_DONE = (total / PAGE) + (done / PAGE);
+    }
+
+    /* 3. Page 0, and the machine is v5. */
+    if (!program_page(0, perm)) {
+        STATUS = ST_PROGRAM_FAIL;
+        for (;;) { }
+    }
+    for (done = 0; done < PERMANENT_LEN; done++) {
+        if (read_bank0((u16)done) != perm[done]) {
+            STATUS = ST_VERIFY_FAIL;
+            for (;;) { }
+        }
+    }
+
+    STATUS = ST_INSTALLED_V5;
+
+    /* Start what was just written, by way of its own reset vector. */
+    {
+        const u32 entry = ((u32)read_bank0(0) << 24) |
+                          ((u32)read_bank0(1) << 16) |
+                          ((u32)read_bank0(2) << 8) | (u32)read_bank0(3);
+        void (*go)(void) = (void (*)(void))entry;
+        go();
+    }
+}
+
 __attribute__((section(".text.entry")))
 void updater_main(void)
 {
@@ -186,8 +291,23 @@ void updater_main(void)
     STATUS = ST_RUNNING;
     PAGES_DONE = 0;
 
-    /* Write whichever slot is not the one we are running under. */
+    /* Write whichever slot is not the one we are running under.
+     *
+     * ACTIVE_BASE is published by stage-0, so it names a slot only on a
+     * machine that is already running v5. Anywhere else it holds whatever
+     * happened to be in that RAM, and the choice below would fall through
+     * to slot A -- which on a stock machine is not a spare slot at all but
+     * the boot ROM's own code, from H'000800 upwards. Writing it overwrites
+     * the running ROM: the reset vector below H'000800 survives, so the
+     * machine still starts, and then dies at the first call into what was
+     * overwritten.
+     *
+     * There is no version of that worth risking, so refuse instead. */
     active = ACTIVE_BASE;
+    if (active != IMAGE_A && active != IMAGE_B) {
+        STATUS = ST_NOT_V5;
+        for (;;) { }
+    }
     target = (active == IMAGE_A) ? IMAGE_B : IMAGE_A;
 
     /* The payload's own header says how long it is. Round up to a page. */

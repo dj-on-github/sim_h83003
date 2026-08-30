@@ -37,7 +37,7 @@ void main(List<String> args) {
   cpu.mem.poke(0x200000, 0x01); // keep the boot ROM in charge
   final devices = <JedecFlash>[];
   for (final r in artista180Flash) {
-    final d = JedecFlash(base: r.base, size: r.size)..busyReads = busy;
+    final d = JedecFlash.forRegion(r)..busyReads = busy;
     cpu.attachFlash(d);
     devices.add(d);
   }

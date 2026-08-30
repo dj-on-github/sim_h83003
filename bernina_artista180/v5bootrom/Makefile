@@ -22,7 +22,7 @@ IMAGE_B_LEN  = 0x4000
 # answers 'I' with a different banner, so "did it take" is one command away.
 NEW_BANNER = -DBIOS_BANNER='"BiosVersion: 1.11\r"' -DBIOS_DATE='"Aug 26\r"'
 
-all: v5boot.bin updater.bin imageN.bin mergebootrom
+all: v5boot.bin permanent.bin updater.bin imageN.bin mergebootrom
 
 stage0.o: stage0.S ; $(CC) $(CFLAGS) -c $< -o $@
 stage0.elf: stage0.o stage0.ld
@@ -55,8 +55,8 @@ $(eval $(call IMAGE_RULES,N,$(IMAGE_A_BASE),$(IMAGE_A_LEN),3,$(NEW_BANNER)))
 
 # Lay the pieces out in a 32K device image: the permanent block at 0, image A
 # at H'000600, image B at H'004000. Gaps are left erased.
-v5boot.bin: stage0.bin imageA.bin imageB.bin assemble.py
-	python3 assemble.py $@
+v5boot.bin permanent.bin: stage0.bin imageA.bin imageB.bin assemble.py
+	python3 assemble.py v5boot.bin
 
 updater.o: updater.c h8_3003.h
 	$(CC) $(CFLAGS) -c $< -o $@

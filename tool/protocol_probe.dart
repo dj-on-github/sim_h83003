@@ -50,7 +50,7 @@ class Machine {
       // memory and every programming command is refused at the identify.
       if (flashSpec == 'machine') {
         for (final r in artista180Flash) {
-          cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+          cpu.attachFlash(JedecFlash.forRegion(r));
         }
       } else {
         final parts = flashSpec.split(':');

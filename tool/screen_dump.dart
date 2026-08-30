@@ -31,7 +31,7 @@ void main(List<String> args) {
   // that are really flash stop accepting bare stores.
   if (args.contains('--flash')) {
     for (final r in artista180Flash) {
-      cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+      cpu.attachFlash(JedecFlash.forRegion(r));
     }
     print('flash model on: ${artista180Flash.map((r) => r.name).join(", ")}');
     reportFlash = true;

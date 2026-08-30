@@ -1,0 +1,99 @@
+
+
+Burning the boot rom
+--------------------
+
+The v5 updater runs from the application flash (bus area 1) and writes the boot flash (area 0) — a different device, so the CPU keeps fetching while area 0 is busy. In the simulator that's three commands:
+
+> cd bernina_artista180/v5bootrom && make
+
+> cd ../..
+
+> Run the simulator. Load an image, enable flash and TCP mode in SCI.
+> Reset the simulator, don't start it.
+
+> ./host/artista180_burn_bootrom --identify /tmp/artista bernina_artista180/v5bootrom/updater.bin
+
+> ./nhost/artista180_burn_bootrom /tmp/artista bernina_artista180/v5bootrom/updater.bin bernina_artista180/v5bootrom/imageN.bin
+
+> Run the simulator when the CLI tools ask you to reset the machine.
+
+
+OLD:
+
+> cd bernina_artista180/v5bootrom && make
+
+> ./mergebootrom -b v5boot.bin -m ../Bernina180_20260816.bin -o /tmp/v5merged.bin
+
+> dart run tool/boot_update.dart /tmp/v5merged.bin bernina_artista180/v5bootrom
+
+
+Add --cut N to stop it N pages in, as a power failure. Cutting at 5 pages comes back up on image B, generation 2 — the old image, intact. That's real: the updater writes the body first and the header page last, so an interrupted slot never has a valid header for stage-0 to choose.
+
+The gap for a real machine
+--------------------------
+
+boot_update.dart is a simulator harness, not a serial tool — there's no burn_test.py equivalent for the boot ROM yet. Over the wire you'd need three steps, and only the first has a tool:
+
+step	tool
+put updater.bin at H'3E8000 and imageN.bin at H'3EA000 in app flash	artista180_burn_application -a 3E8000 -n — works, area 1 is safe and retryable
+
+point the entry longword at H'200004 to H'3E8000	nothing — needs the ROM's M command
+send G to jump into it	nothing
+
+Both missing steps are small — M plus six address digits plus eight data digits, then G — and would fit naturally as a --boot-updater mode on the burner, or a separate artista180_burn_bootrom. Say the word and I'll write it.
+
+Before any of that on real hardware, the two checks from earlier still stand: confirm flash_identify returns the Atmel A4 code for bank 0, and find out whether the flash is socketed. If it's socketed, none of this carries real risk.
+
+==============
+
+
+Burning the Application
+-----------------------
+
+The command
+
+python3 tool/burn_test.py bernina_artista180/Bernina180_20260816.bin bernina_artista180/application/app.bin
+
+Two arguments: the machine image to boot (any full dump — its boot ROM is what answers the protocol) and the application binary to burn.
+
+What it does
+
+There's no socat and no libserialport here, so burn_test.py builds the link itself rather than borrowing one:
+
+Opens a pty pair and hands the slave path to the burner — as far as open() and termios are concerned that's a real serial port, so the burner's actual device path is exercised, not stubbed.
+Starts tool/serial_stdio.dart, which runs the machine with one SCI on its stdin/stdout.
+Relays master ↔ simulator until the burn finishes.
+
+Nothing needs power-cycling: the burner waits for the boot ROM's "BOS", and the simulator sends it moments after starting, so the two meet on their own.
+
+Options
+	
+--out FILE	dump the machine's memory when it stops — this is how you check the burn landed
+--baud N	rate to raise the link to (default 115200; 19200 skips the J command)
+--channel N	which SCI the machine is bridged on (default 1)
+
+To burn and verify in one go:
+
+> python3 tool/burn_test.py bernina_artista180/Bernina180_20260816.bin bernina_artista180/application/app.bin --out /tmp/after.bin
+
+then compare /tmp/after.bin at H'200000 against app.bin.
+
+Using the TCP path in SCI
+----
+> run simulator, load a rom, reset it, don't start it.
+> Open TCP port 5555 in SCI tab in simulator
+
+> socat pty,raw,echo=0,link=/tmp/artista TCP:localhost:5555 &
+> ./host/artista180_burn_application -w 120 /tmp/artista bernina_artista180/application/app.bin
+
+> Run the simulator
+
+=====
+
+The script runs the burner for you — there's no mode that just sets up the port and leaves it for you to drive by hand. If you want that, the pty setup in burn_test.py is about ten lines and could easily take a --no-burner flag that prints the pty path and waits; say the word.
+
+For real hardware there's tool/serial_bridge.dart, which joins the simulator to an actual serial port through libserialport — but that's for putting the simulated machine on a real wire. To burn a real machine you'd point the burner straight at its port:
+
+./host/artista180_burn_application /dev/cu.usbserial-XXXX bernina_artista180/application/app.bin
+

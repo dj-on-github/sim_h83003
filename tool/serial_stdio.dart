@@ -78,7 +78,7 @@ void main(List<String> argv) async {
   // answering 'V' means.
   if (!argv.contains('--no-flash')) {
     for (final r in artista180Flash) {
-      cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+      cpu.attachFlash(JedecFlash.forRegion(r));
     }
     say('flash attached: '
         '${artista180Flash.map((r) => r.name).join(', ')}');

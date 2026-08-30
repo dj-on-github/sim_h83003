@@ -47,7 +47,7 @@ class Machine {
     loadRawBinary(image, 0, cpu.mem.poke);
     if (download) cpu.mem.poke(0x200000, 0x01);
     for (final r in artista180Flash) {
-      final d = JedecFlash(base: r.base, size: r.size);
+      final d = JedecFlash.forRegion(r);
       if (r.name == 'boot') d.busyReads = busy;
       cpu.attachFlash(d);
     }

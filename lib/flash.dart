@@ -31,13 +31,30 @@ import 'dart:typed_data';
 
 /// One flash device's place in the address map.
 class FlashRegion {
-  const FlashRegion(this.name, this.base, this.size);
+  const FlashRegion(this.name, this.base, this.size, {int? decodes})
+      : decodes = decodes ?? size;
 
   final String name;
   final int base;
+
+  /// How big the device is: how much storage it actually has.
   final int size;
 
+  /// How much address space it answers for.
+  ///
+  /// Larger than [size] when the board leaves address lines unconnected, and
+  /// the device then repeats through the window. The boot flash is 32K
+  /// decoded across 128K, so the same storage appears four times.
+  final int decodes;
+
+  /// The end of the storage. [decodedEnd] is the end of the window.
   int get end => base + size;
+  int get decodedEnd => base + decodes;
+
+  /// Where [addr] really lands in the device.
+  int fold(int addr) => base + (addr - base) % size;
+
+  bool get mirrored => decodes > size;
 }
 
 /// The artista 180 carries two flash devices, one per external bus area.
@@ -56,10 +73,23 @@ class FlashRegion {
 ///    does not repeat within the area at either 512K or 1M, and nothing
 ///    writes to it while the machine runs normally.
 ///
+///  * Area 2 holds a 1M device at H'500000: the stitch and icon data the
+///    application draws from, and the settings block in its last page at
+///    H'57FF80 upwards, which the machine rewrites as it runs. H'400000 to
+///    H'4FFFFF reads as zeroes rather than as erased flash, so nothing is
+///    decoded in the bottom half of the area and the device sits in the top.
+///
+///    Leaving this one out is not a quiet loss: the application comes up
+///    without its icons, because that is where they are. Thirty thousand of
+///    the screen's seventy-six thousand pixels change.
+///
 /// A flash image file holds the two back to back in this order.
 const List<FlashRegion> artista180Flash = [
-  FlashRegion('boot', 0x000000, 0x008000),
+  // 32K of storage, decoded across 128K: it answers at H'000000, H'008000,
+  // H'010000 and H'018000, and all four are the same bytes.
+  FlashRegion('boot', 0x000000, 0x008000, decodes: 0x020000),
   FlashRegion('application', 0x200000, 0x200000),
+  FlashRegion('data', 0x500000, 0x100000),
 ];
 
 /// Size of a flash image file holding [regions] back to back.
@@ -130,6 +160,37 @@ int applyFlashImage(List<int> image, void Function(int, int) poke,
 }
 
 /// The command sequence recognised at the unlock offsets.
+/// What has happened to one 64K bank of a device since the log was cleared.
+///
+/// A bank is the unit the boot ROM works in -- its unlock sequence is
+/// addressed within `addr & H'FF0000` -- so grouping by it is what makes a
+/// burn legible: a 206K application image walks four banks, and the v5 boot
+/// update touches one.
+class FlashBankWrites {
+  FlashBankWrites(this.bank);
+
+  /// Base address of the bank, `addr & H'FF0000`.
+  final int bank;
+
+  /// Page programs committed, and bytes programmed by the byte-at-a-time
+  /// parts. A page write counts one page and its pageSize bytes.
+  int pages = 0;
+  int bytes = 0;
+
+  /// Erases that landed in this bank.
+  int erases = 0;
+
+  /// The span actually touched, which is narrower than the bank whenever a
+  /// burn stops part way -- and that is what shows the progress.
+  int lowest = -1;
+  int highest = -1;
+
+  void touch(int from, int to) {
+    if (lowest < 0 || from < lowest) lowest = from;
+    if (to > highest) highest = to;
+  }
+}
+
 enum _Phase { read, unlock1, unlock2, erasePrefix, eraseUnlock1, eraseUnlock2 }
 
 class JedecFlash {
@@ -142,14 +203,25 @@ class JedecFlash {
     this.sectorSize = 0x10000,
     this.pageWrite = true,
     this.busyReads = 0,
-  });
+    int? decodes,
+  }) : decodes = decodes ?? size;
 
   /// The device the artista 180 carries: 512K, Atmel, page-write.
   factory JedecFlash.atmelA4({required int base, int size = 0x80000}) =>
       JedecFlash(base: base, size: size);
 
+  /// Builds the device a [FlashRegion] describes, mirroring and all.
+  factory JedecFlash.forRegion(FlashRegion r) =>
+      JedecFlash(base: r.base, size: r.size, decodes: r.decodes);
+
   final int base;
   final int size;
+
+  /// How much address space it answers for. Bigger than [size] when the
+  /// board leaves address lines unconnected: the boot flash is 32K wired
+  /// across 128K, so the same storage answers at four addresses and a write
+  /// through any of them is a write to all four.
+  final int decodes;
   final int manufacturerId;
   final int deviceId;
   final int pageSize;
@@ -164,6 +236,20 @@ class JedecFlash {
   /// How many reads report "busy" after an operation before it appears
   /// finished. Zero makes programming look instantaneous, which is what the
   /// firmware's own timeout-bounded polls treat as success on the first try.
+  ///
+  /// Keep it under about 36 for anything that programs through the boot
+  /// ROM. The ROM's post-program poll is bounded at FLASH_BUSY_TRIES = 17
+  /// iterations of two reads each, and it ignores the failure: past that it
+  /// gives up, re-enables interrupts, and the next interrupt fetches its
+  /// vector out of a device that is still answering with status instead of
+  /// data. The machine then runs off into unmapped space, which looks like a
+  /// protocol fault a long way from its cause.
+  ///
+  /// That is a property of this model, not of the machine: the application
+  /// writes flash at runtime through the same poll, so the real part
+  /// finishes well inside seventeen tries. Code that does its own waiting --
+  /// v5bootrom/updater.c bounds at two million -- is not affected, which is
+  /// why tool/boot_update.dart can use 400.
   int busyReads;
 
   /// Backing store, supplied by the CPU so the device and the debugger see
@@ -193,11 +279,29 @@ class JedecFlash {
   int ignoredWrites = 0;
   final Map<int, int> ignoredByBank = {};
   int erasedSectors = 0;
+
+  /// Which banks have been written since [clearWriteLog], in the order they
+  /// were first touched. Watching this fill in is how a burn's progress is
+  /// visible from the machine's side rather than the host's.
+  final Map<int, FlashBankWrites> written = {};
+
+  FlashBankWrites _bankFor(int addr) =>
+      written.putIfAbsent(addr & 0xFF0000, () => FlashBankWrites(addr & 0xFF0000));
+
+  /// Forgets what has been written. The contents are untouched: this is the
+  /// log, not the device.
+  void clearWriteLog() => written.clear();
   int identifyCount = 0;
 
-  bool owns(int addr) => addr >= base && addr < base + size;
+  bool owns(int addr) => addr >= base && addr < base + decodes;
+
+  /// Where [addr] really lands. Only the address lines the device has are
+  /// wired, so anything above them is dropped.
+  int fold(int addr) => base + (addr - base) % size;
 
   void reset() {
+    // The write log survives: it is a record of what the host has done, not
+    // part of the device's state.
     _phase = _Phase.read;
     _autoselect = false;
     _pageBase = null;
@@ -211,7 +315,13 @@ class JedecFlash {
   bool _isUnlockA(int addr) => (addr & 0x7FFF) == 0x5555;
   bool _isUnlockB(int addr) => (addr & 0x7FFF) == 0x2AAA;
 
+  /// Reads still to go before the device stops reporting busy. Exposed so a
+  /// harness can tell "the firmware's poll returned too early" from "the
+  /// model is leaking reads the poll never made".
+  int get busyLeft => _busyLeft;
+
   int read(int addr) {
+    addr = fold(addr);
     if (_busyLeft > 0) {
       _busyLeft--;
       _toggle = !_toggle;
@@ -228,6 +338,7 @@ class JedecFlash {
   }
 
   void write(int addr, int value) {
+    addr = fold(addr);
     value &= 0xFF;
 
     // A program command in flight swallows writes as data. On a byte-write
@@ -242,6 +353,9 @@ class JedecFlash {
         _busyLeft = busyReads;
         _toggle = false;
         programmedBytes++;
+        final b = _bankFor(addr);
+        b.bytes++;
+        b.touch(addr, addr);
         return;
       }
       final page = addr & ~(pageSize - 1);
@@ -338,6 +452,10 @@ class JedecFlash {
     _busyByte = _pageBuffer[pageSize - 1] ?? 0xFF;
     _pageBuffer.clear();
     programmedPages++;
+    final b = _bankFor(page);
+    b.pages++;
+    b.bytes += pageSize;
+    b.touch(page, page + pageSize - 1);
     _busyLeft = busyReads;
     _toggle = false;
   }
@@ -345,6 +463,13 @@ class JedecFlash {
   void _eraseRange(int from, int length) {
     for (var i = 0; i < length; i++) {
       poke(from + i, 0xFF);
+    }
+    // An erase can span banks; note it against each one it reaches.
+    for (var a = from & 0xFF0000; a < from + length; a += 0x10000) {
+      final b = _bankFor(a);
+      b.erases++;
+      b.touch(from < a ? a : from,
+          (from + length - 1) > (a + 0xFFFF) ? a + 0xFFFF : from + length - 1);
     }
     _busyByte = 0xFF;
     _busyLeft = busyReads;

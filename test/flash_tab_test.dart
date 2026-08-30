@@ -52,6 +52,8 @@ Future<void> openFlashTab(WidgetTester tester) async {
 }
 
 void main() {
+  oldImageWarningTest();
+  writtenBanksTabTests();
   testWidgets('the tab starts with the model off', (tester) async {
     await openFlashTab(tester);
 
@@ -112,7 +114,7 @@ void main() {
     expect(sw.value, isFalse);
   });
 
-  testWidgets('a two-device image is loaded and the model comes on',
+  testWidgets('a whole-image file is loaded and the model comes on',
       (tester) async {
     final dir = Directory.systemTemp.createTempSync('flashtab');
     addTearDown(() => dir.deleteSync(recursive: true));
@@ -124,7 +126,7 @@ void main() {
 
     final sw = tester.widget<Switch>(find.byKey(const Key('flashEnableSwitch')));
     expect(sw.value, isTrue);
-    expect(find.textContaining('two devices back to back'), findsOneWidget);
+    expect(find.textContaining('devices back to back'), findsOneWidget);
     expect(find.textContaining('erase or program sequence'), findsOneWidget);
 
     // And off again. The contents stay put; the devices simply stop
@@ -150,16 +152,107 @@ void main() {
   });
 
   group('image layout', () {
-    test('the two devices sit back to back in a plain image', () {
-      expect(flashImageSize(), 0x208000);
+    test('the three devices sit back to back in a plain image', () {
+      // boot 32K, application 2M, data 1M.
+      expect(flashImageSize(), 0x308000);
       expect(flashImageOffset(artista180Flash[0], false), 0x000000);
       expect(flashImageOffset(artista180Flash[1], false), 0x008000);
+      expect(flashImageOffset(artista180Flash[2], false), 0x208000);
+    });
+
+    test('the data device is there, and is where the icons live', () {
+      final data = artista180Flash[2];
+      expect(data.name, 'data');
+      expect(data.base, 0x500000);
+      expect(data.size, 0x100000);
     });
 
     test('a full memory dump is recognised and read by address', () {
-      expect(flashImageIsAddressed(0x208000), isFalse);
+      expect(flashImageIsAddressed(0x308000), isFalse);
       expect(flashImageIsAddressed(0x1000000), isTrue);
       expect(flashImageOffset(artista180Flash[1], true), 0x200000);
+      expect(flashImageOffset(artista180Flash[2], true), 0x500000);
     });
+
+    test('an image saved before the data device was known reads as short', () {
+      // 0x208000 is the old two-device size. It has to be recognised as a
+      // plain image rather than an addressed one, and the data device then
+      // comes up erased -- which is what left the machine without icons.
+      expect(flashImageIsAddressed(0x208000), isFalse);
+      final short = List<int>.filled(0x208000, 0x00);
+      final seen = <int, int>{};
+      final padded = applyFlashImage(short, (a, v) => seen[a] = v);
+      expect(padded, 0x100000,
+          reason: 'the whole data device is padded with erased bytes');
+      expect(seen[0x500000], 0xFF);
+    });
+  });
+}
+
+/// The written-banks list, which is how a burn's progress shows on the
+/// machine's side while a host tool streams into it.
+void writtenBanksTabTests() {
+  Future<void> show(WidgetTester tester) async {
+    await tester.scrollUntilVisible(find.text('WRITTEN BANKS'), 200,
+        scrollable: find.byType(Scrollable).last);
+    await tester.pumpAndSettle();
+  }
+
+  group('the written banks list', () {
+    testWidgets('is there, empty, with Clear disabled', (tester) async {
+      await openFlashTab(tester);
+      await show(tester);
+
+      expect(find.text('WRITTEN BANKS'), findsOneWidget);
+      final clear = tester.widget<OutlinedButton>(
+          find.byKey(const Key('flashClearWrittenButton')));
+      expect(clear.onPressed, isNull,
+          reason: 'nothing to clear before anything is written');
+    });
+
+    testWidgets('says the model is off when it is', (tester) async {
+      await openFlashTab(tester);
+      await show(tester);
+      expect(find.textContaining('flash model is off'), findsOneWidget);
+    });
+
+    testWidgets('switches from "model off" to "nothing written" once on',
+        (tester) async {
+      final dir = Directory.systemTemp.createTempSync('flashwritten');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final img = writeImage(dir, 0xFF);
+
+      await openFlashTab(tester);
+      await tester.enterText(
+          find.byKey(const Key('flashPathField')), img.path);
+      await tester.pumpAndSettle();
+      await toggleFlash(tester);
+      await show(tester);
+
+      expect(find.textContaining('flash model is off'), findsNothing);
+      expect(find.textContaining('Nothing written yet'), findsOneWidget,
+          reason: 'the devices are on and have had nothing written to them');
+    });
+
+  });
+}
+
+/// An image written before the data device was in the list is exactly the
+/// size of the other two, and padding it silently leaves that device erased
+/// -- which shows up much later as an application with no icons. The tab
+/// says so instead.
+void oldImageWarningTest() {
+  testWidgets('an image of the old size is called out', (tester) async {
+    final dir = Directory.systemTemp.createTempSync('flasholdsize');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final f = File('${dir.path}/old.bin');
+    f.writeAsBytesSync(Uint8List(0x208000)..fillRange(0, 0x208000, 0xA5));
+
+    await openFlashTab(tester);
+    await tester.enterText(find.byKey(const Key('flashPathField')), f.path);
+    await toggleFlash(tester);
+
+    expect(find.textContaining("data device at H'500000"), findsOneWidget);
+    expect(find.textContaining('without its icons'), findsOneWidget);
   });
 }

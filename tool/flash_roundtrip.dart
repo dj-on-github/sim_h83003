@@ -21,7 +21,7 @@ H8Cpu machine(List<int> memoryImage, {bool download = true}) {
   loadRawBinary(memoryImage, 0, cpu.mem.poke);
   if (download) cpu.mem.poke(0x200000, 0x01);
   for (final r in artista180Flash) {
-    cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+    cpu.attachFlash(JedecFlash.forRegion(r));
   }
   cpu.reset();
   return cpu;
@@ -43,7 +43,7 @@ List<int> screenOf(List<int> memoryImage) {
   final cpu = H8Cpu();
   loadRawBinary(memoryImage, 0, cpu.mem.poke);
   for (final r in artista180Flash) {
-    cpu.attachFlash(JedecFlash(base: r.base, size: r.size));
+    cpu.attachFlash(JedecFlash.forRegion(r));
   }
   cpu.reset();
   for (var i = 0; i < 40000000; i++) {
@@ -82,7 +82,7 @@ void main(List<String> args) {
   applyFlashImage(image, fresh.mem.poke);
   fresh.mem.poke(0x200000, 0x01);
   for (final r in artista180Flash) {
-    fresh.attachFlash(JedecFlash(base: r.base, size: r.size));
+    fresh.attachFlash(JedecFlash.forRegion(r));
   }
   fresh.reset();
   for (var i = 0; i < 1500000; i++) {

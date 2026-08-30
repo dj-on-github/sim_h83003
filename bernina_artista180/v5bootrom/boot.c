@@ -338,8 +338,10 @@ void serial_rx_error_nak(void)
 #define ST_GO         0xA0 /* H'001F8C -- hand over to the application */
 #define ST_HALT       0xE6 /* H'001F9C -- stop, but keep serving the link */
 #define ST_CONFIRM    0xB4 /* H'001CAC -- wait for the host's confirmation */
-#define ST_VER_HI     0x32 /* H'00189C -- report the version, high nibble */
-#define ST_VER_LO     0x33 /* H'0018BA -- and the low nibble */
+//#define ST_VER_HI     0x32 /* H'00189C -- report the version, high nibble */
+//#define ST_VER_LO     0x33 /* H'0018BA -- and the low nibble */
+#define ST_VER_HI     0x35 /* H'00189C -- report the version, high nibble */
+#define ST_VER_LO     0x31 /* H'0018BA -- and the low nibble */
 #define ST_BAUD_DIGIT 0x28 /* H'001836 -- states 28-29, the new rate divisor */
 #define ST_BAUD_LO    0x29
 #define ST_BAUD_APPLY 0x2A /* H'001860 -- switch rate and re-establish contact */

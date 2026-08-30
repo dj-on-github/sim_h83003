@@ -28,5 +28,12 @@ def main(out):
     open(out, 'wb').write(dev)
     print('wrote %s, %d bytes' % (out, len(dev)))
 
+    # The permanent block on its own, padded to its full H'800 with erased
+    # bytes. A first install writes exactly these eight pages, so it wants
+    # the block as it appears in the device rather than as the linker left
+    # it -- stage0.bin stops at the last section and is short of a page.
+    open('permanent.bin', 'wb').write(dev[:0x800])
+    print('wrote permanent.bin, 2048 bytes (pages 0-7)')
+
 if __name__ == '__main__':
     main(sys.argv[1])
