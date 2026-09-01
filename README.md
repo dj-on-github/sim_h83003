@@ -225,7 +225,99 @@ the Artista 180 firmware dumped directly from an Artista 180.
   ```bash
   flutter run -d macos --args dump.bin
   ```
+- **Back — stepping backwards.** Switch on *Keep history* in Settings and
+  the **Back** button walks the machine backwards an instruction at a time.
+  It is enabled while the CPU is halted, unlike Step: sitting on a fault and
+  wanting to see what led to it is the reason it exists.
+
+  Most H8 instructions change one register and the flags and touch no memory
+  at all, so a record is small. It is kept as flat words rather than an object
+  per instruction, which works out at about **25 bytes an instruction** —
+  a million steps of history in 24 MB, where an object apiece would be six
+  times that. The depth is chosen in Settings, which also shows how many
+  instructions are held and what they are costing.
+
+  The journal alone cannot put back a *peripheral*: a timer counts into its
+  own counter rather than working it out from the clock, so winding the clock
+  back leaves the timer where it was — and a machine that looks right and
+  then takes an interrupt that never happened is worse than no rewind at all.
+  So the machine's state outside memory, which is small, is also kept every
+  128 instructions. A step back winds memory and the registers to the last
+  kept point, puts that state back, and replays the few instructions in
+  between. What comes out is the machine as it actually was, peripherals
+  included, and stepping forward again retraces the same run exactly.
+
+  When the history has been trimmed past the last kept state, a step back
+  over a peripheral write says so rather than quietly being approximate.
+
+  Recording makes the machine run about **1.4× slower** (measured over five
+  million instructions of the artista 180 boot), so it is off unless asked
+  for — in Settings, or `"history": {"enabled": true}` in `~/.h8simrc`.
 - **Registers** — tap any register or CCR flag to edit it.
+
+## Comparing two images
+
+`tool/lockstep.dart` runs two machines side by side and stops at the first
+instruction where they part company. It is the whole-machine complement to
+`compare_routines`, which does the same thing one routine at a time.
+
+```bash
+dart run tool/lockstep.dart old.bin new.bin --compare state
+```
+
+Three things can be compared, and which one to use depends on how alike the
+two images are meant to be:
+
+- **`state`** (the default) — the PC, the registers and the flags. A
+  difference is caught at the instruction that *caused* it rather than at the
+  branch that later revealed it.
+- **`pc`** — the code only. Right when the two images genuinely differ
+  somewhere you do not care about; `--settle N` and `--ignore FROM:TO` step
+  over it.
+- **`writes`** — not the code at all, only what each side writes to a
+  `--watch` range, in order. Two implementations of the same routine make the
+  same writes however they get there, so this is the comparison that survives
+  a rewrite.
+
+That last one is the answer to "does the C version behave the same". The
+rebuilt application and the original paint the screen identically:
+
+```bash
+dart run tool/lockstep.dart original.bin mergedapp.bin \
+    --compare writes --watch 040000:044AFF
+```
+
+```
+In step for all 57600 writes compared.
+Both sides then stopped writing, having agreed about everything either of
+them wrote (6055990 and 5887647 instructions run).
+```
+
+Three full screen paints, byte for byte, through a different instruction
+stream and about 3% fewer instructions.
+
+Comparing an image against **itself** with a key held on one side is how to
+ask what a button actually does — the answer is wherever the two runs first
+disagree:
+
+```bash
+dart run tool/lockstep.dart dump.bin dump.bin --hold-b 77
+```
+
+```
+Parted company at step 1902064, on er5
+  002507FF against 002507FB
+
+  H'208E8C  MOV.B @H'060000:24,R5L
+  H'208E92  NOT.B R5L
+```
+
+which is the key-matrix return latch, read by the key scanner — found without
+knowing where the scanner was.
+
+A report says how it ended as well as what it found: a run that reached its
+instruction limit has not proved anything past that limit, and it says so
+rather than reading like agreement.
 
 ## The built-in demo
 
@@ -288,6 +380,9 @@ distribution, which the app is not aimed at.
 | `lib/snapshot.dart` | Whole-machine save and restore, EEPROM included |
 | `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/screen/IO/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
+| `lib/lockstep.dart` | Two machines run side by side, stopped where they part company |
+| `lib/undo.dart` | What each instruction changed, kept so it can be put back |
+| `tool/lockstep.dart` | The whole-machine comparison: two images, the first instruction they disagree on |
 | `tool/compare_routines.dart` | Runs every case in a spec: one routine on both images, results and memory compared |
 | `tool/trace_case.dart` | One case's call sequence on both images, with arguments and a watched range, to find where two runs part company |
 | `tool/make_icons.py` | Regenerates the app icon and every platform variant |

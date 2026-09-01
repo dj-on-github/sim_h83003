@@ -36,6 +36,7 @@ import 'sim_config.dart';
 import 'sim_config_file.dart';
 import 'pin_roles.dart';
 import 'snapshot.dart';
+import 'undo.dart';
 import 'read_file.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
@@ -326,6 +327,9 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _panelKey = GlobalKey();
   final GlobalKey _watchKey = GlobalKey();
 
+  /// How many instructions of history to keep when it is switched on.
+  int _historySteps = 200000;
+
   /// The condition typed into the Watch pane, and why it would not parse.
   final TextEditingController _condCtl = TextEditingController();
   String? _condError;
@@ -526,6 +530,9 @@ class _SimulatorPageState extends State<SimulatorPage>
     }
     cpu.writeWatches.addAll(c.watch.writes);
 
+    _historySteps = c.history.steps;
+    if (c.history.enabled) cpu.undo = UndoJournal()..limit = _historySteps;
+
     for (final t in c.traces) {
       _traces.add(TraceEntry(
           target: t.target, bits: t.bits, bigEndian: t.bigEndian));
@@ -669,6 +676,10 @@ class _SimulatorPageState extends State<SimulatorPage>
         condition: _condCtl.text.trim().isEmpty ? null : _condCtl.text.trim(),
         armed: cpu.stopWhen != null,
         writes: cpu.writeWatches.toList(),
+      ),
+      history: HistoryConfig(
+        enabled: cpu.undo != null,
+        steps: _historySteps,
       ),
       dataBreakpoints: cpu.dataBreaks.toList()..sort(),
       instructionBreakpoints: cpu.instrBreaks.toList()..sort(),
@@ -905,6 +916,27 @@ class _SimulatorPageState extends State<SimulatorPage>
     });
     if (cpu.breakAddr != null) _reportDataBreak();
     if (cpu.conditionHit) _reportConditionStop();
+  }
+
+  /// Puts the last instruction back.
+  ///
+  /// Nothing is said when it worked -- the register panel and the views show
+  /// it. Something is said when the rewind could not be exact, because a
+  /// machine that looks right and is not is worse than one that says so.
+  void _stepBack() {
+    final exact = cpu.canStepBackExactly;
+    setState(() {
+      cpu.stepBack();
+      _memRev++;
+      _codeRev++;
+      _screenRev.value++;
+      _followPc();
+    });
+    if (exact == false) {
+      _showSnack('Stepped back past a write to a peripheral, and the history '
+          'no longer reaches a kept state — the CPU and memory are right, '
+          'the peripherals are not.');
+    }
   }
 
   /// Says which address stopped the run and which instruction touched it.
@@ -1737,10 +1769,14 @@ class _SimulatorPageState extends State<SimulatorPage>
 
             return AlertDialog(
               title: const Text('Settings'),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+              // Scrollable: the dialog has grown a section at a time, and a
+              // plain Column overflows on a short window rather than letting
+              // the last thing added be reached.
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
                   Row(
                     children: [
                       const Text('Theme'),
@@ -1806,6 +1842,51 @@ class _SimulatorPageState extends State<SimulatorPage>
                   ),
                   const SizedBox(height: 4),
                   CheckboxListTile(
+                    key: const Key('historyEnableCheckbox'),
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Keep history, so Back works'),
+                    subtitle: Text(cpu.undo == null
+                        ? 'Records what each instruction changed, so Back can '
+                            'put it back. Runs about 1.4x slower while it is '
+                            'on, and holds about 25 bytes an instruction.'
+                        : '${cpu.undo!.length} instruction(s) held, '
+                            '${(cpu.undo!.bytesHeld / 1048576).toStringAsFixed(1)} MB'),
+                    value: cpu.undo != null,
+                    onChanged: (v) => setLocal(() => setState(() {
+                          cpu.undo = (v ?? false)
+                              ? (UndoJournal()..limit = _historySteps)
+                              : null;
+                        })),
+                  ),
+                  if (cpu.undo != null)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 16, bottom: 8),
+                      child: Row(children: [
+                        const Text('Instructions to keep'),
+                        const SizedBox(width: 12),
+                        DropdownButton<int>(
+                          key: const Key('historyDepthDropdown'),
+                          value: _historySteps,
+                          items: const [
+                            DropdownMenuItem(
+                                value: 50000, child: Text('50,000')),
+                            DropdownMenuItem(
+                                value: 200000, child: Text('200,000')),
+                            DropdownMenuItem(
+                                value: 1000000, child: Text('1,000,000')),
+                            DropdownMenuItem(
+                                value: 5000000, child: Text('5,000,000')),
+                          ],
+                          onChanged: (v) => v == null
+                              ? null
+                              : setLocal(() => setState(() {
+                                    _historySteps = v;
+                                    cpu.undo?.limit = v;
+                                  })),
+                        ),
+                      ]),
+                    ),
+                  CheckboxListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('Delete all breakpoints'),
                     subtitle: Text(
@@ -1837,7 +1918,8 @@ class _SimulatorPageState extends State<SimulatorPage>
                       child: const Text('Save settings'),
                     ),
                   ]),
-                ],
+                  ],
+                ),
               ),
               actions: [
                 TextButton(
@@ -6071,6 +6153,15 @@ class _SimulatorPageState extends State<SimulatorPage>
               icon: Icons.pause,
               label: 'Pause',
               onPressed: _running ? _pause : null,
+            ),
+            _ctrlButton(
+              icon: Icons.skip_previous,
+              // Enabled while halted, unlike Step: sitting on a fault and
+              // wanting to see what led to it is the reason this exists.
+              label: 'Back',
+              onPressed: (_running || !(cpu.undo?.isNotEmpty ?? false))
+                  ? null
+                  : _stepBack,
             ),
             _ctrlButton(
               icon: Icons.skip_next,

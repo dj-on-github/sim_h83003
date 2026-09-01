@@ -14,6 +14,7 @@ import 'package:sim_h83003/sim_config.dart';
 void main() {
   snapshotConfigTests();
   watchConfigTests();
+  historyConfigTests();
   group('addresses', () {
     test('are read in the three ways they get written', () {
       expect(parseAddress('11B10E'), 0x11B10E);
@@ -254,6 +255,36 @@ void watchConfigTests() {
     test('comes back written the way the app writes addresses', () {
       expect(formatRange((0x11B10E, 0x11B10E)), '11B10E');
       expect(formatRange((0x11B10E, 0x11B10F)), '11B10E-11B10F');
+    });
+  });
+}
+
+/// Keeping enough of each instruction to step back over it.
+void historyConfigTests() {
+  group('history in the config', () {
+    test('is off by default, because recording costs speed', () {
+      final c = SimConfig.parse('{}');
+      expect(c.history.enabled, isFalse);
+      expect(c.history.steps, 200000);
+    });
+
+    test('is read and written', () {
+      final c = SimConfig.parse(
+          '{"history": {"enabled": true, "steps": 1000000}}');
+      expect(c.history.enabled, isTrue);
+      expect(c.history.steps, 1000000);
+      final back = SimConfig.parse(c.toText());
+      expect(back.history.enabled, isTrue);
+      expect(back.history.steps, 1000000);
+    });
+
+    test('a nonsense depth falls back rather than keeping nothing', () {
+      // A zero here would switch the feature on and have it hold no history,
+      // which looks like it is broken rather than like it is off.
+      expect(SimConfig.parse('{"history": {"steps": 0}}').history.steps, 200000);
+      expect(SimConfig.parse('{"history": {"steps": -5}}').history.steps, 200000);
+      expect(SimConfig.parse('{"history": {"steps": "lots"}}').history.steps,
+          200000);
     });
   });
 }

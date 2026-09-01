@@ -25,6 +25,7 @@ import 'itu.dart';
 import 'sci.dart';
 import 'sparse_memory.dart';
 import 'keypad.dart';
+import 'undo.dart';
 import 'condition.dart';
 
 /// CCR flag bit masks (I UI H U N Z V C).
@@ -397,6 +398,111 @@ class H8Cpu {
     return c?.value(_conditionView);
   }
 
+  /// Set to keep an undo record per instruction, so the machine can be
+  /// stepped backwards. Null -- the default -- records nothing and costs a
+  /// null test per instruction.
+  ///
+  /// What comes back is the registers, the flags, the cycle count and
+  /// memory. Not the peripherals: see [UndoJournal]. A step that touched
+  /// one is marked, so an approximate rewind can be told from an exact one.
+  UndoJournal? undo;
+
+  /// The register file as it was before the instruction now running, so
+  /// only what changed has to be recorded. A field, not a local, so that
+  /// recording costs no allocation per instruction.
+  final Uint32List _undoBefore = Uint32List(8);
+
+  /// Puts the last instruction back. False when there is nothing to undo.
+  ///
+  /// The journal gives back the registers, the flags and memory. It cannot
+  /// give back a peripheral -- a timer counts into its own counter rather
+  /// than working it out from the clock -- so the machine is wound back to
+  /// the last kept state at or before where it is going, that state is put
+  /// back, and the few instructions in between are run again. What comes
+  /// out is the machine as it actually was, peripherals and all.
+  ///
+  /// Without a checkpoint to reach (the history having been trimmed past
+  /// it) the journal is used on its own, which is exact for everything but
+  /// the peripherals. [canStepBackExactly] says which of the two it will be.
+  bool stepBack() {
+    final j = undo;
+    if (j == null || j.isEmpty) return false;
+    final target = j.position - 1;
+    final mark = j.checkpointAtOrBefore(target);
+    if (mark == null) {
+      _applyUndo(j.pop()!);
+      return true;
+    }
+
+    final (from, state) = mark;
+    while (j.position > from) {
+      _applyUndo(j.pop()!);
+    }
+    restoreState(state);
+    j.dropCheckpointsAfter(from);
+    _replay(target - from);
+    return true;
+  }
+
+  /// Runs [count] instructions again over ground already covered.
+  ///
+  /// A replay is not a run: it must not stop on a condition, must not count
+  /// towards the profile, and must not put the writes it makes into the
+  /// write history a second time -- they are already in it from the first
+  /// time round.
+  void _replay(int count) {
+    final heldCondition = stopWhen;
+    final heldProfiling = profiling;
+    final heldWrites = writeLog.length;
+    stopWhen = null;
+    profiling = false;
+    for (var i = 0; i < count; i++) {
+      step();
+    }
+    stopWhen = heldCondition;
+    profiling = heldProfiling;
+    if (writeLog.length > heldWrites) {
+      writeLog.removeRange(heldWrites, writeLog.length);
+    }
+    conditionHit = false;
+    clearBreakHit();
+  }
+
+  /// Puts one instruction's changes back.
+  ///
+  /// Memory goes back to front: an address written twice by one instruction
+  /// has to end up holding what it held before the first of them, not what
+  /// it held between the two.
+  void _applyUndo(UndoStep u) {
+    for (var i = u.memory.length - 1; i >= 0; i--) {
+      mem.poke(u.memory[i].$1, u.memory[i].$2);
+    }
+    for (final (index, value) in u.registers) {
+      er[index] = value;
+    }
+    pc = u.pc;
+    _instrPc = u.pc;
+    ccr = u.ccr;
+    cycles = u.cycles;
+    halted = u.halted;
+    sleeping = u.sleeping;
+    if (!halted) haltReason = '';
+    clearBreakHit();
+    conditionHit = false;
+  }
+
+  /// Whether the last instruction can be put back exactly -- peripherals
+  /// and all. Null when there is nothing to put back.
+  ///
+  /// True when there is a kept state to wind back to, or when the step
+  /// touched no peripheral and so needs none.
+  bool? get canStepBackExactly {
+    final j = undo;
+    if (j == null || j.isEmpty) return null;
+    if (j.checkpointAtOrBefore(j.position - 1) != null) return true;
+    return j.newestIsExact;
+  }
+
   /// Runs one instruction without asking the condition.
   ///
   /// This is what resuming from a condition stop means. The stop happens
@@ -634,30 +740,40 @@ class H8Cpu {
       }
     }
     addr &= 0xFFFFFF;
+    // The byte as plain memory holds it, before it goes. A device-backed
+    // address has nothing there to put back, which is what noteDevice is
+    // for -- the marks are set here, next to the writes they describe, so
+    // that they cannot drift away from them.
+    undo?.noteWrite(addr, mem.peek(addr));
     if (profiling) dataAccessCount.bump(addr);
     if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) _noteBreak(addr);
     if (addr >= 0xFFFFB0 && addr <= 0xFFFFBD) {
       for (final s in sci) {
         if (s.owns(addr)) {
+          undo?.noteDevice();
           s.write(addr, value);
           return;
         }
       }
     }
     if (itu.owns(addr)) {
+      undo?.noteDevice();
       itu.write(addr, value);
       return;
     }
     if (dmac.owns(addr)) {
+      undo?.noteDevice();
       dmac.write(addr, value);
       return;
     }
     if (adc.owns(addr)) {
+      undo?.noteDevice();
       adc.write(addr, value);
       return;
     }
     for (final f in flash) {
       if (f.owns(addr)) {
+        undo?.noteDevice();
         f.write(addr, value);
         return;
       }
@@ -666,7 +782,10 @@ class H8Cpu {
     // A bit-banged bus has no controller to notice an edge, so the device
     // has to be told whenever either of the two registers it watches moves.
     final e = eeprom;
-    if (e != null && (addr == e.drAddr || addr == e.ddrAddr)) e.portWritten();
+    if (e != null && (addr == e.drAddr || addr == e.ddrAddr)) {
+      undo?.noteDevice();
+      e.portWritten();
+    }
   }
 
   int readW(int addr) {
@@ -837,6 +956,9 @@ class H8Cpu {
     halted = false;
     sleeping = false;
     haltReason = '';
+    // The history is of a run that is over. Keeping it would let a step
+    // back cross the reset into a machine that no longer exists.
+    undo?.clear();
     clearBreakHit();
   }
 
@@ -1052,6 +1174,28 @@ class H8Cpu {
   static const int sleepStates = 2;
 
   int step() {
+    final j = undo;
+    if (j == null) return _step();
+    // Taken before the instruction, so the state kept belongs to the
+    // position it is filed under.
+    if (j.wantsCheckpoint) j.addCheckpoint(saveState());
+    _undoBefore.setAll(0, er);
+    j.beginStep(
+        pc: pc, ccr: ccr, cycles: cycles, halted: halted, sleeping: sleeping);
+    final wasCycles = cycles, wasPc = pc;
+    final states = _step();
+    // Nothing ran -- a condition held, or the CPU is halted for good. A
+    // record for it would be a step back that goes nowhere while using one
+    // up, which reads as the history being broken.
+    if (cycles == wasCycles && pc == wasPc) {
+      j.abandonStep();
+    } else {
+      j.endStep(_undoBefore, er);
+    }
+    return states;
+  }
+
+  int _step() {
     // The condition is asked before each instruction rather than after, so
     // "stopped" means "about to execute this", which is what a debugger's
     // stop should mean. The state it sees is the one the instruction before

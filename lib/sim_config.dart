@@ -348,6 +348,28 @@ String formatRange((int, int) r) => r.$1 == r.$2
     ? formatAddress(r.$1)
     : '${formatAddress(r.$1)}-${formatAddress(r.$2)}';
 
+/// Keeping enough of each instruction to step back over it.
+///
+/// Off by default: recording costs speed, and a session that only ever runs
+/// forwards should not pay for it.
+class HistoryConfig {
+  const HistoryConfig({this.enabled = false, this.steps = 200000});
+
+  final bool enabled;
+
+  /// How many instructions to keep.
+  final int steps;
+
+  factory HistoryConfig.fromJson(Map<String, dynamic> j) => HistoryConfig(
+        enabled: j['enabled'] is bool ? j['enabled'] as bool : false,
+        steps: j['steps'] is int && (j['steps'] as int) > 0
+            ? j['steps'] as int
+            : 200000,
+      );
+
+  Map<String, dynamic> toJson() => {'enabled': enabled, 'steps': steps};
+}
+
 /// A memory image to load over the demo program.
 class ImageConfig {
   const ImageConfig({this.file, this.load = false});
@@ -405,6 +427,7 @@ class SimConfig {
     this.image = const ImageConfig(),
     this.snapshot = const SnapshotConfig(),
     this.watch = const WatchConfig(),
+    this.history = const HistoryConfig(),
     this.dataBreakpoints = const [],
     this.instructionBreakpoints = const [],
     this.appearance = const AppearanceConfig(),
@@ -426,6 +449,7 @@ class SimConfig {
   final ImageConfig image;
   final SnapshotConfig snapshot;
   final WatchConfig watch;
+  final HistoryConfig history;
   final List<int> dataBreakpoints;
   final List<int> instructionBreakpoints;
   final AppearanceConfig appearance;
@@ -463,6 +487,7 @@ class SimConfig {
         image: ImageConfig.fromJson(_obj(j['image'])),
         snapshot: SnapshotConfig.fromJson(_obj(j['snapshot'])),
         watch: WatchConfig.fromJson(_obj(j['watch'])),
+        history: HistoryConfig.fromJson(_obj(j['history'])),
         dataBreakpoints: _addresses(j['dataBreakpoints']),
         instructionBreakpoints: _addresses(j['instructionBreakpoints']),
         appearance: AppearanceConfig.fromJson(_obj(j['appearance'])),
@@ -492,6 +517,7 @@ class SimConfig {
         'image': image.toJson(),
         'snapshot': snapshot.toJson(),
         'watch': watch.toJson(),
+        'history': history.toJson(),
         'dataBreakpoints': [for (final a in dataBreakpoints) formatAddress(a)],
         'instructionBreakpoints': [
           for (final a in instructionBreakpoints) formatAddress(a)
