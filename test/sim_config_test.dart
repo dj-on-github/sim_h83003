@@ -12,6 +12,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sim_h83003/sim_config.dart';
 
 void main() {
+  snapshotConfigTests();
+  watchConfigTests();
   group('addresses', () {
     test('are read in the three ways they get written', () {
       expect(parseAddress('11B10E'), 0x11B10E);
@@ -161,10 +163,97 @@ void main() {
 
   group('the view list', () {
     test('keeps its order, which is the order of the tabs', () {
-      final c = SimConfig.parse('{"views": {"memory": false, "buttons": true}}');
+      final c = SimConfig.parse('{"views": {"memory": false, "watch": true}}');
       expect(c.views.asList.first, isFalse);
       expect(c.views.asList.last, isTrue);
-      expect(c.views.asList.length, 12);
+      expect(c.views.asList.length, 13);
+    });
+  });
+}
+
+/// A snapshot named in the config, which beats everything else that touches
+/// the machine because it already holds all of it.
+void snapshotConfigTests() {
+  group('a snapshot in the config', () {
+    test('defaults to none', () {
+      final c = SimConfig.parse('{}');
+      expect(c.snapshot.file, isNull);
+      expect(c.snapshot.load, isFalse);
+    });
+
+    test('is read and written', () {
+      final c = SimConfig.parse(
+          '{"snapshot": {"file": "booted.h8snap", "load": true}}');
+      expect(c.snapshot.file, 'booted.h8snap');
+      expect(c.snapshot.load, isTrue);
+      final back = SimConfig.parse(c.toText());
+      expect(back.snapshot.file, 'booted.h8snap');
+      expect(back.snapshot.load, isTrue);
+    });
+  });
+}
+
+/// The stop condition and the watched ranges: things you set before a run
+/// rather than during one, which is what this file is for.
+void watchConfigTests() {
+  group('a watch in the config', () {
+    test('defaults to nothing armed and nothing watched', () {
+      final c = SimConfig.parse('{}');
+      expect(c.watch.condition, isNull);
+      expect(c.watch.armed, isFalse);
+      expect(c.watch.writes, isEmpty);
+    });
+
+    test('reads a condition and the ranges to record', () {
+      final c = SimConfig.parse('''
+{"watch": {"condition": "[11B10E].w == 77", "armed": true,
+           "writes": ["11B10E-11B10F", "H'FFFFC7"]}}''');
+      expect(c.watch.condition, '[11B10E].w == 77');
+      expect(c.watch.armed, isTrue);
+      expect(c.watch.writes, [(0x11B10E, 0x11B10F), (0xFFFFC7, 0xFFFFC7)]);
+    });
+
+    test('survives a round trip, ranges and all', () {
+      final a = SimConfig.parse('''
+{"watch": {"condition": "pc == 208E7A", "armed": true,
+           "writes": ["11B10E-11B10F", "200000"]}}''');
+      final b = SimConfig.parse(a.toText());
+      expect(b.watch.condition, 'pc == 208E7A');
+      expect(b.watch.armed, isTrue);
+      expect(b.watch.writes, [(0x11B10E, 0x11B10F), (0x200000, 0x200000)]);
+      expect(a.toText(), contains('"11B10E-11B10F"'));
+      expect(a.toText(), contains('"200000"'),
+          reason: 'a single address stays a single address');
+    });
+
+    test('a condition that no longer parses is still carried through', () {
+      // The app puts it back in the field so it can be seen and fixed.
+      // Dropping it here would lose the user's typing with no sign of it.
+      final c = SimConfig.parse('{"watch": {"condition": "pc == ", '
+          '"armed": true}}');
+      expect(c.watch.condition, 'pc == ');
+    });
+
+    test('a range it cannot read is dropped and the rest kept', () {
+      final c = SimConfig.parse(
+          '{"watch": {"writes": ["11B10E", "rubbish", "200000-200010"]}}');
+      expect(c.watch.writes, [(0x11B10E, 0x11B10E), (0x200000, 0x200010)]);
+    });
+
+    test('a range written backwards is taken the right way round', () {
+      final c = SimConfig.parse('{"watch": {"writes": ["200010-200000"]}}');
+      expect(c.watch.writes, [(0x200000, 0x200010)]);
+    });
+
+    test('a range in H\' form parts at the right dash', () {
+      expect(parseRange("H'11B10E-H'11B10F"), (0x11B10E, 0x11B10F));
+      expect(parseRange('11B10E'), (0x11B10E, 0x11B10E));
+      expect(parseRange('nonsense'), isNull);
+    });
+
+    test('comes back written the way the app writes addresses', () {
+      expect(formatRange((0x11B10E, 0x11B10E)), '11B10E');
+      expect(formatRange((0x11B10E, 0x11B10F)), '11B10E-11B10F');
     });
   });
 }

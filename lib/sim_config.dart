@@ -53,14 +53,15 @@ class ViewConfig {
     this.flash = false,
     this.eeprom = false,
     this.buttons = false,
+    this.watch = false,
   });
 
   final bool memory, disassembly, screen, sci, itu, dma;
-  final bool io, trace, profile, flash, eeprom, buttons;
+  final bool io, trace, profile, flash, eeprom, buttons, watch;
 
   static const _keys = [
     'memory', 'disassembly', 'screen', 'sci', 'itu', 'dma',
-    'io', 'trace', 'profile', 'flash', 'eeprom', 'buttons',
+    'io', 'trace', 'profile', 'flash', 'eeprom', 'buttons', 'watch',
   ];
 
   factory ViewConfig.fromJson(Map<String, dynamic> j) {
@@ -79,12 +80,13 @@ class ViewConfig {
       flash: at('flash', false),
       eeprom: at('eeprom', false),
       buttons: at('buttons', false),
+      watch: at('watch', false),
     );
   }
 
   List<bool> get asList => [
         memory, disassembly, screen, sci, itu, dma,
-        io, trace, profile, flash, eeprom, buttons,
+        io, trace, profile, flash, eeprom, buttons, watch,
       ];
 
   Map<String, dynamic> toJson() {
@@ -260,6 +262,92 @@ class EepromConfig {
       {'file': file, 'enable': enable, 'verifyFriendly': verifyFriendly};
 }
 
+/// A snapshot to restore at startup.
+///
+/// It beats everything else in the file that touches the machine: a snapshot
+/// already has the memory image, the flash contents and the EEPROM in it, so
+/// loading one and then loading an image over the top would undo it.
+class SnapshotConfig {
+  const SnapshotConfig({this.file, this.load = false});
+
+  final String? file;
+  final bool load;
+
+  factory SnapshotConfig.fromJson(Map<String, dynamic> j) => SnapshotConfig(
+        file: j['file']?.toString(),
+        load: j['load'] is bool ? j['load'] as bool : false,
+      );
+
+  Map<String, dynamic> toJson() =>
+      {if (file != null) 'file': file, 'load': load};
+}
+
+/// The stop condition and the addresses whose writes are recorded.
+///
+/// Both are things you set before a run rather than during one, which is
+/// what this file is for. The condition is kept as text, not as a parsed
+/// tree: a file with a typo in it should open with the typo showing in the
+/// field, ready to be fixed, rather than being dropped on the way in.
+class WatchConfig {
+  const WatchConfig({this.condition, this.armed = false, this.writes = const []});
+
+  /// The condition, in the language of lib/condition.dart.
+  final String? condition;
+
+  /// Whether it is armed at startup. A condition can be kept in the file
+  /// without stopping every run that starts.
+  final bool armed;
+
+  /// Ranges whose writes are recorded, each a (first, last) pair. A single
+  /// address is written as one string; a range as "first-last".
+  final List<(int, int)> writes;
+
+  factory WatchConfig.fromJson(Map<String, dynamic> j) {
+    final ranges = <(int, int)>[];
+    if (j['writes'] is List) {
+      for (final e in j['writes'] as List) {
+        final r = parseRange(e);
+        if (r != null) ranges.add(r);
+      }
+    }
+    return WatchConfig(
+      condition: j['condition']?.toString(),
+      armed: j['armed'] is bool ? j['armed'] as bool : false,
+      writes: ranges,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        if (condition != null && condition!.isNotEmpty) 'condition': condition,
+        'armed': armed,
+        'writes': [for (final r in writes) formatRange(r)],
+      };
+}
+
+/// Reads "11B10E" or "11B10E-11B10F" into a pair. Null if neither.
+(int, int)? parseRange(Object? v) {
+  if (v is! String) {
+    final one = parseAddress(v);
+    return one == null ? null : (one, one);
+  }
+  final text = v.trim();
+  // Split on the last '-', so a range written with H' prefixes still parts
+  // in the right place.
+  final cut = text.lastIndexOf('-');
+  if (cut > 0) {
+    final a = parseAddress(text.substring(0, cut));
+    final b = parseAddress(text.substring(cut + 1));
+    if (a != null && b != null) return a <= b ? (a, b) : (b, a);
+  }
+  final one = parseAddress(text);
+  return one == null ? null : (one, one);
+}
+
+/// The way back, matching how the app writes addresses everywhere else.
+String formatRange((int, int) r) => r.$1 == r.$2
+    ? formatAddress(r.$1)
+    : '${formatAddress(r.$1)}-${formatAddress(r.$2)}';
+
 /// A memory image to load over the demo program.
 class ImageConfig {
   const ImageConfig({this.file, this.load = false});
@@ -315,6 +403,8 @@ class SimConfig {
     this.eeprom = const EepromConfig(),
     this.heldKeys = const [],
     this.image = const ImageConfig(),
+    this.snapshot = const SnapshotConfig(),
+    this.watch = const WatchConfig(),
     this.dataBreakpoints = const [],
     this.instructionBreakpoints = const [],
     this.appearance = const AppearanceConfig(),
@@ -334,6 +424,8 @@ class SimConfig {
   final List<int> heldKeys;
 
   final ImageConfig image;
+  final SnapshotConfig snapshot;
+  final WatchConfig watch;
   final List<int> dataBreakpoints;
   final List<int> instructionBreakpoints;
   final AppearanceConfig appearance;
@@ -369,6 +461,8 @@ class SimConfig {
         eeprom: EepromConfig.fromJson(_obj(j['eeprom'])),
         heldKeys: _addresses(j['heldKeys']),
         image: ImageConfig.fromJson(_obj(j['image'])),
+        snapshot: SnapshotConfig.fromJson(_obj(j['snapshot'])),
+        watch: WatchConfig.fromJson(_obj(j['watch'])),
         dataBreakpoints: _addresses(j['dataBreakpoints']),
         instructionBreakpoints: _addresses(j['instructionBreakpoints']),
         appearance: AppearanceConfig.fromJson(_obj(j['appearance'])),
@@ -396,6 +490,8 @@ class SimConfig {
         'eeprom': eeprom.toJson(),
         'heldKeys': [for (final k in heldKeys) formatAddress(k, 2)],
         'image': image.toJson(),
+        'snapshot': snapshot.toJson(),
+        'watch': watch.toJson(),
         'dataBreakpoints': [for (final a in dataBreakpoints) formatAddress(a)],
         'instructionBreakpoints': [
           for (final a in instructionBreakpoints) formatAddress(a)

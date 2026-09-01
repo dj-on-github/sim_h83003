@@ -168,6 +168,42 @@ the Artista 180 firmware dumped directly from an Artista 180.
   matters more than matching the datasheet.
 - **Profile view** — switch the profiler on (top bar), Run, and see the
   hottest data addresses and instructions.
+- **Watch view** — two questions a breakpoint cannot answer. A breakpoint
+  says "stop here"; these say **stop when this is true** and **who wrote
+  that**. Between them they replace most of what `tool/` used to be: a
+  program written again with a different test compiled into it.
+
+  **Stop when** takes a condition and pauses Run the moment it holds,
+  *before* the instruction it holds at, so "stopped" means "about to execute
+  this". Numbers are hex, because that is how every address in this machine
+  is written everywhere else; a leading `#` makes one decimal.
+
+  ```
+  [11B10E].w == 77            the panel is asking for clr
+  pc >= 208E7A && pc < 208F00 execution has entered key_scan
+  [FFFFC7] & 4                the sewing light has come on
+  er0 != 0 && [200004].l == 3F0000
+  cycles > #25000000          a fixed distance into the boot
+  ```
+
+  `[addr]` reads a byte, `.w` a word and `.l` a long, big-endian as the H8
+  is; the address can be worked out (`[11B10E + 1]`). Registers are read by
+  name — `pc`, `ccr`, `cycles`, `sp`, `er0`-`er7`, `r0`-`r7`, `e0`-`e7` and
+  the flag letters. `&&` and `||` short-circuit, so a condition can guard
+  its own reads. A condition that will not parse says why under the field
+  rather than in a snack that has gone by the time you look back at it, and
+  one that cannot be evaluated at run time stops rather than throwing out of
+  the run loop. Resuming runs the instruction it stopped on before asking
+  again, so Run does not sit on the same instruction for ever.
+
+  **Record writes to** takes an address or a range (`11B10E-11B10F`) and
+  logs every write that lands in it: the cycle count, the address of the
+  instruction that did it — its own address, not wherever the fetch had
+  reached — the address written, and what was displaced. A write that
+  changed nothing is marked as such, because the firmware rewrites the same
+  value constantly and a log that does not say so is mostly noise. The log
+  is capped and shows newest first. Both the condition and the watch list
+  are saved to `~/.h8simrc` with the rest of the session.
 - **Responsiveness while running** — Run executes in short batches inside a
   16 ms frame timer with a time budget, so the window stays interactive and
   Pause takes effect immediately. The disassembly is only re-swept when the
@@ -247,6 +283,9 @@ distribution, which the app is not aimed at.
 | `lib/adc.dart` | The A/D converter: eight inputs, conversion timing, ADI |
 | `lib/flash.dart` | JEDEC flash devices on the external bus: unlock sequences, program, erase |
 | `lib/i2c_eeprom.dart` | The bit-banged serial EEPROM on port 4, and the JSON file it lives in |
+| `lib/condition.dart` | The stop-condition language: lexer, parser and evaluator, with no CPU in it |
+| `lib/sim_config.dart` | `~/.h8simrc`: the settings a session needs before it is any use |
+| `lib/snapshot.dart` | Whole-machine save and restore, EEPROM included |
 | `lib/main.dart` | The Flutter UI (register panel, memory/disassembly/screen/IO/profile views, controls) |
 | `test/h8cpu_test.dart` | Unit tests with hand-assembled instruction encodings |
 | `tool/compare_routines.dart` | Runs every case in a spec: one routine on both images, results and memory compared |

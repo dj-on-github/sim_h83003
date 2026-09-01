@@ -14,6 +14,7 @@ import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
+import 'condition.dart';
 import 'dmac.dart';
 import 'emb_relay.dart';
 import 'emb_server.dart';
@@ -34,6 +35,8 @@ import 'tcp_link.dart';
 import 'sim_config.dart';
 import 'sim_config_file.dart';
 import 'pin_roles.dart';
+import 'snapshot.dart';
+import 'read_file.dart';
 // Re-exported so existing importers of main.dart keep working.
 export 'symbols.dart' show parseSymbolTable, symbolAddress;
 // Writes a file to a chosen path on desktop/mobile; no-op stub on web.
@@ -212,6 +215,9 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// Path of the last program loaded, used to prefill "Open by path".
   String? _lastProgramPath;
 
+  /// Where the last snapshot was written, so the config can name it.
+  String? _snapshotPath;
+
   /// Likewise for the last symbol table.
   String? _lastSymbolPath;
 
@@ -302,6 +308,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   bool _viewFlash = false;
   bool _viewEeprom = false;
   bool _viewPanel = false;
+  bool _viewWatch = false;
 
   /// Stable keys so each pane is *moved* (not rebuilt) when the layout
   /// switches between the tabbed and side-by-side arrangements.
@@ -317,6 +324,14 @@ class _SimulatorPageState extends State<SimulatorPage>
   final GlobalKey _flashKey = GlobalKey();
   final GlobalKey _eepromKey = GlobalKey();
   final GlobalKey _panelKey = GlobalKey();
+  final GlobalKey _watchKey = GlobalKey();
+
+  /// The condition typed into the Watch pane, and why it would not parse.
+  final TextEditingController _condCtl = TextEditingController();
+  String? _condError;
+
+  /// The address or range being added to the write watch list.
+  final TextEditingController _watchAddrCtl = TextEditingController();
 
   /// SCI tab, host serial bridge. One simulated channel can be joined to a
   /// real port on this machine, so the software that talks to a Bernina can
@@ -430,7 +445,7 @@ class _SimulatorPageState extends State<SimulatorPage>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 12, vsync: this);
+    _tab = TabController(length: 13, vsync: this);
     // The front panel stays on the bus for the life of the app: it answers
     // for the key latch and holds the knob pins, and an unattached one would
     // leave the firmware scanning a dead matrix.
@@ -473,6 +488,7 @@ class _SimulatorPageState extends State<SimulatorPage>
     _viewFlash = v.flash;
     _viewEeprom = v.eeprom;
     _viewPanel = v.buttons;
+    _viewWatch = v.watch;
 
     // In the narrow layout there is one tab rather than a set of panes, so
     // the first view asked for is the one to open on.
@@ -496,6 +512,19 @@ class _SimulatorPageState extends State<SimulatorPage>
     for (final a in c.instructionBreakpoints) {
       cpu.instrBreaks.add(a & SparseMemory.addrMask);
     }
+
+    // A condition kept in the file opens in the field whether or not it is
+    // armed, so one that no longer parses can be seen and fixed rather than
+    // vanishing on the way in.
+    _condCtl.text = c.watch.condition ?? '';
+    if (c.watch.armed && _condCtl.text.isNotEmpty) {
+      try {
+        cpu.stopWhen = Condition.parse(_condCtl.text);
+      } on FormatException catch (e) {
+        _condError = e is ConditionError ? e.message : '$e';
+      }
+    }
+    cpu.writeWatches.addAll(c.watch.writes);
 
     for (final t in c.traces) {
       _traces.add(TraceEntry(
@@ -529,6 +558,18 @@ class _SimulatorPageState extends State<SimulatorPage>
       final err = widget.configError;
       if (err != null) {
         _showSnack('~/$kConfigFileName could not be read: $err');
+      }
+      // A snapshot last, and instead of the rest: it already holds the
+      // memory, the flash contents and the EEPROM, so anything loaded over
+      // the top of it would undo it.
+      if (c.snapshot.load && (c.snapshot.file?.isNotEmpty ?? false)) {
+        final bytes = readFileBytes(c.snapshot.file!);
+        if (bytes == null) {
+          _showSnack('Could not read the snapshot ${c.snapshot.file}.');
+        } else {
+          _applySnapshotBytes(bytes, c.snapshot.file!);
+          return;
+        }
       }
       if (c.flash.enable) {
         await _setFlashOn(true);
@@ -580,6 +621,7 @@ class _SimulatorPageState extends State<SimulatorPage>
         flash: _viewFlash,
         eeprom: _viewEeprom,
         buttons: _viewPanel,
+        watch: _viewWatch,
       ),
       memory: MemoryConfig(
           followPc: _followPcInMemory, address: _memBase),
@@ -616,6 +658,17 @@ class _SimulatorPageState extends State<SimulatorPage>
       image: ImageConfig(
         file: _lastProgramPath,
         load: _lastProgramPath != null,
+      ),
+      snapshot: SnapshotConfig(
+        file: _snapshotPath,
+        // Only offered as something to restore once one has been written:
+        // naming a file that is not there would fail on every start.
+        load: _snapshotPath != null,
+      ),
+      watch: WatchConfig(
+        condition: _condCtl.text.trim().isEmpty ? null : _condCtl.text.trim(),
+        armed: cpu.stopWhen != null,
+        writes: cpu.writeWatches.toList(),
       ),
       dataBreakpoints: cpu.dataBreaks.toList()..sort(),
       instructionBreakpoints: cpu.instrBreaks.toList()..sort(),
@@ -685,6 +738,8 @@ class _SimulatorPageState extends State<SimulatorPage>
     _memScroll.dispose();
     _disasmScroll.dispose();
     _tcpPortCtl.dispose();
+    _condCtl.dispose();
+    _watchAddrCtl.dispose();
     _screenRev.dispose();
     super.dispose();
   }
@@ -837,12 +892,19 @@ class _SimulatorPageState extends State<SimulatorPage>
   void _step() {
     setState(() {
       cpu.clearBreakHit();
-      cpu.step();
+      // Stopped on a condition that still holds: run the instruction it
+      // stopped on rather than asking again and going nowhere.
+      if (cpu.conditionHit) {
+        cpu.stepPastCondition();
+      } else {
+        cpu.step();
+      }
       _memRev++;
       _screenRev.value++;
       _followPc();
     });
     if (cpu.breakAddr != null) _reportDataBreak();
+    if (cpu.conditionHit) _reportConditionStop();
   }
 
   /// Says which address stopped the run and which instruction touched it.
@@ -875,6 +937,9 @@ class _SimulatorPageState extends State<SimulatorPage>
     // Allow the very first instruction to execute even if it sits on an
     // instruction breakpoint, so Run resumes from where it was paused.
     var firstStep = true;
+    // Resuming from a condition stop: same allowance, for the same reason.
+    if (cpu.conditionHit && !cpu.halted) cpu.stepPastCondition();
+    cpu.conditionHit = false;
     // The CPU runs decoupled from the 16ms frame timer: each tick executes
     // as many instructions as fit in a wall-clock budget, optionally paced
     // to a target clock speed. The views repaint at most once per 300ms.
@@ -917,7 +982,7 @@ class _SimulatorPageState extends State<SimulatorPage>
               stopped = true;
               break;
             }
-            if (cpu.breakHit) {
+            if (cpu.breakHit || cpu.conditionHit) {
               paused = true;
               stopped = true;
               break;
@@ -945,6 +1010,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             if (stopping) _pause();
           });
           if (paused && cpu.breakAddr != null) _reportDataBreak();
+          if (paused && cpu.conditionHit) _reportConditionStop();
         }
       });
     });
@@ -1753,14 +1819,14 @@ class _SimulatorPageState extends State<SimulatorPage>
                   // The whole session, not just what is in this dialog: the
                   // views, the memory window, the SCI link, the pin
                   // overrides, the traces, the flash and EEPROM, the keys
-                  // held down and every breakpoint.
+                  // held down, every breakpoint and the watch.
                   Row(children: [
                     Expanded(
                       child: Text(
                         'Save the whole session — views, memory window, SCI '
                         'link, pin overrides, traces, flash, EEPROM, held '
-                        'keys and breakpoints — to ~/$kConfigFileName, to be '
-                        'picked up next time.',
+                        'keys, breakpoints and the watch — to '
+                        '~/$kConfigFileName, to be picked up next time.',
                         style: TextStyle(color: _inkA(0.7), fontSize: 12),
                       ),
                     ),
@@ -1848,6 +1914,19 @@ class _SimulatorPageState extends State<SimulatorPage>
             icon: const Icon(Icons.save_outlined),
           ),
           IconButton(
+            key: const Key('snapshotSaveButton'),
+            tooltip: 'Save a snapshot: the whole machine, including the '
+                'EEPROM, so it can be put back without booting it again',
+            onPressed: () => unawaited(_saveSnapshot()),
+            icon: const Icon(Icons.photo_camera_outlined),
+          ),
+          IconButton(
+            key: const Key('snapshotLoadButton'),
+            tooltip: 'Restore a snapshot',
+            onPressed: () => unawaited(_loadSnapshotFile()),
+            icon: const Icon(Icons.restore_outlined),
+          ),
+          IconButton(
             tooltip: "Reset (load reset vector at H'000000)",
             onPressed: _reset,
             icon: const Icon(Icons.restart_alt),
@@ -1900,6 +1979,7 @@ class _SimulatorPageState extends State<SimulatorPage>
             Tab(text: 'Flash'),
             Tab(text: 'EEPROM'),
             Tab(text: 'Buttons'),
+            Tab(text: 'Watch'),
           ],
         ),
         Expanded(
@@ -1927,6 +2007,8 @@ class _SimulatorPageState extends State<SimulatorPage>
                   key: _eepromKey, child: _KeepAlive(child: _eepromView())),
               KeyedSubtree(
                   key: _panelKey, child: _KeepAlive(child: _panelView())),
+              KeyedSubtree(
+                  key: _watchKey, child: _KeepAlive(child: _watchView())),
             ],
           ),
         ),
@@ -2025,6 +2107,13 @@ class _SimulatorPageState extends State<SimulatorPage>
           flex: 1,
           width: null
         ),
+      if (_viewWatch)
+        (
+          pane: KeyedSubtree(
+              key: _watchKey, child: _KeepAlive(child: _watchView())),
+          flex: wideFlex,
+          width: null
+        ),
     ];
     if (entries.isEmpty) {
       return const Center(child: Text('Select a view above'));
@@ -2111,6 +2200,7 @@ class _SimulatorPageState extends State<SimulatorPage>
         _viewToggle('FLASH', _viewFlash, (v) => _viewFlash = v),
         _viewToggle('EEPROM', _viewEeprom, (v) => _viewEeprom = v),
         _viewToggle('BTN', _viewPanel, (v) => _viewPanel = v),
+        _viewToggle('WATCH', _viewWatch, (v) => _viewWatch = v),
       ],
     );
   }
@@ -2128,7 +2218,8 @@ class _SimulatorPageState extends State<SimulatorPage>
         (_viewProfile ? 1 : 0) +
         (_viewFlash ? 1 : 0) +
         (_viewEeprom ? 1 : 0) +
-        (_viewPanel ? 1 : 0);
+        (_viewPanel ? 1 : 0) +
+        (_viewWatch ? 1 : 0);
     return Tooltip(
       message: enabled
           ? 'Show the $label view'
@@ -4770,6 +4861,80 @@ class _SimulatorPageState extends State<SimulatorPage>
   /// this is the array as it stands and not whatever a device in the middle
   /// of an autoselect would answer with. It works with the model off as well
   /// as on, which is how a starting image gets made from a memory dump.
+  // ---- snapshots ---------------------------------------------------------
+  //
+  // Getting this machine to a drawn screen costs twenty-five million
+  // instructions, and every investigation used to pay that again from the
+  // top. A snapshot is the whole machine -- registers, peripherals, memory,
+  // held pins, the panel and the EEPROM -- so it comes back exactly where it
+  // was left, with the settings it had worked out about itself still in it.
+
+  /// Writes the machine to a file.
+  Future<void> _saveSnapshot() async {
+    _pause();
+    final snap = Snapshot.capture(
+      cpu,
+      eepromModel: _eeprom,
+      panel: _keypad,
+      note: 'PC ${_hex6(cpu.pc)}, ${cpu.cycles} cycles',
+    );
+    final bytes = Uint8List.fromList(snap.encode());
+    try {
+      final path = await FilePicker.saveFile(
+        dialogTitle: 'Save snapshot',
+        fileName: 'machine.h8snap',
+        bytes: bytes,
+      );
+      if (path == null) {
+        _showSnack('Save cancelled.');
+        return;
+      }
+      await writeBytesToPath(path, bytes);
+      _snapshotPath = path;
+      _showSnack('Snapshot written to $path '
+          '(${bytes.length} bytes for ${snap.memoryBytes} of memory).');
+    } catch (e) {
+      _showSnack('Could not write the snapshot: $e');
+    }
+  }
+
+  /// Picks a snapshot and puts the machine back.
+  Future<void> _loadSnapshotFile() async {
+    _pause();
+    try {
+      final picked =
+          await FilePicker.pickFiles(type: FileType.any, withData: true);
+      final file = picked?.files.singleOrNull;
+      final data = file?.bytes;
+      if (data == null) {
+        _showSnack('Nothing loaded.');
+        return;
+      }
+      _applySnapshotBytes(data, file?.path ?? file?.name ?? 'the file');
+    } catch (e) {
+      _showSnack('Could not read the snapshot: $e');
+    }
+  }
+
+  /// Puts [data] into the machine, from wherever it came.
+  void _applySnapshotBytes(List<int> data, String from) {
+    try {
+      final snap = Snapshot.decode(data);
+      setState(() {
+        snap.apply(cpu, eepromModel: _eeprom, panel: _keypad);
+        _memRev++;
+        _codeRev++;
+        _screenRev.value++;
+        _memBase = cpu.pc & 0xFFFFF8;
+      });
+      _scrollToPc();
+      _showSnack('Restored from $from'
+          '${snap.note.isEmpty ? '' : ' — ${snap.note}'}.');
+    } catch (e) {
+      _showSnack('$from is not a snapshot this build can read: $e');
+    }
+  }
+
   Future<void> _saveFlashImage() async {
     _pause();
     final image = buildFlashImage(cpu.mem.peek);
@@ -5041,6 +5206,260 @@ class _SimulatorPageState extends State<SimulatorPage>
         ),
       );
 
+
+  // ---- the Watch pane ----------------------------------------------------
+  //
+  // Two questions that the breakpoint cannot answer. "Stop here" is what a
+  // breakpoint is for; "stop when this is true" and "who wrote that" are
+  // different questions, and until now each one meant writing another
+  // program in tool/ with the test compiled into it.
+
+  /// Reads the condition field, reporting a typo in place rather than in a
+  /// snack that has gone by the time the user looks back at the field.
+  void _armCondition() {
+    final text = _condCtl.text.trim();
+    setState(() {
+      _condError = null;
+      cpu.conditionHit = false;
+      if (text.isEmpty) {
+        cpu.stopWhen = null;
+        return;
+      }
+      try {
+        cpu.stopWhen = Condition.parse(text);
+      } on FormatException catch (e) {
+        cpu.stopWhen = null;
+        _condError = e is ConditionError ? e.message : e.message.toString();
+      }
+    });
+  }
+
+  void _disarmCondition() {
+    setState(() {
+      cpu.stopWhen = null;
+      cpu.conditionHit = false;
+      _condError = null;
+    });
+  }
+
+  /// Says what was true when the run stopped, and what the condition worked
+  /// out to -- "it stopped" on its own leaves you guessing which term of an
+  /// && it was.
+  void _reportConditionStop() {
+    final c = cpu.stopWhen;
+    if (c == null) return;
+    String detail;
+    try {
+      final v = cpu.conditionValue();
+      detail = v == null
+          ? ''
+          : " (= H'${v.toRadixString(16).toUpperCase()})";
+    } catch (_) {
+      detail = ' (could not be worked out, which is why it stopped)';
+    }
+    _showSnack("Stopped: $c$detail at H'${_hex6(cpu.pc)}");
+  }
+
+  void _addWriteWatch() {
+    final r = parseRange(_watchAddrCtl.text.trim());
+    if (r == null) {
+      _showSnack('Not an address or range: "${_watchAddrCtl.text.trim()}"');
+      return;
+    }
+    setState(() {
+      if (!cpu.writeWatches.contains(r)) cpu.writeWatches.add(r);
+      _watchAddrCtl.clear();
+    });
+  }
+
+  /// The symbol at an address, in brackets, or nothing.
+  String _symbolSuffix(int addr) {
+    final name = _symbols[addr];
+    return name == null ? '' : '  $name';
+  }
+
+  Widget _watchView() {
+    final armed = cpu.stopWhen != null;
+    final log = cpu.writeLog;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _watchHeading('STOP WHEN'),
+          const SizedBox(height: 6),
+          // A Wrap, not a Row: this pane shares the window with the others
+          // in the wide layout, and a Row here overflows rather than wrapping.
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              // A maximum, not a fixed width: this pane can be a third of
+              // the window, and a field wider than the pane is a field with
+              // its end cut off.
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 340),
+                child: TextField(
+                  key: const Key('conditionField'),
+                  controller: _condCtl,
+                  style: TextStyle(fontFamily: _font, color: _ink),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    border: const OutlineInputBorder(),
+                    hintText: "[11B10E].w == 77",
+                    errorText: _condError,
+                  ),
+                  onSubmitted: (_) => _armCondition(),
+                ),
+              ),
+              FilledButton(
+                key: const Key('conditionArmButton'),
+                onPressed: _armCondition,
+                child: Text(armed ? 'Re-arm' : 'Arm'),
+              ),
+              OutlinedButton(
+                key: const Key('conditionDisarmButton'),
+                onPressed: armed ? _disarmCondition : null,
+                child: const Text('Disarm'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            armed
+                ? (cpu.conditionHit
+                    ? 'Stopped on: ${cpu.stopWhen}'
+                    : 'Armed: ${cpu.stopWhen}')
+                : 'Nothing armed. Numbers are hex; #10 is ten. '
+                    '[addr] reads a byte, .w a word, .l a long.',
+            style: TextStyle(fontFamily: _font, color: _inkA(0.75)),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Examples:  pc >= 208E7A && pc < 208F00   ·   [FFFFC7] & 4   ·   '
+            'er0 != 0   ·   cycles > #25000000',
+            style: TextStyle(fontFamily: _font, color: _inkA(0.55)),
+          ),
+          const Divider(height: 24),
+          _watchHeading('RECORD WRITES TO'),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 220),
+                child: TextField(
+                  key: const Key('watchAddressField'),
+                  controller: _watchAddrCtl,
+                  style: TextStyle(fontFamily: _font, color: _ink),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    hintText: '11B10E  or  11B10E-11B10F',
+                  ),
+                  onSubmitted: (_) => _addWriteWatch(),
+                ),
+              ),
+              FilledButton(
+                key: const Key('watchAddButton'),
+                onPressed: _addWriteWatch,
+                child: const Text('Watch'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (cpu.writeWatches.isEmpty)
+            Text('Nothing watched, so nothing is being recorded.',
+                style: TextStyle(fontFamily: _font, color: _inkA(0.75)))
+          else
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final r in cpu.writeWatches.toList())
+                  InputChip(
+                    label: Text("H'${formatRange(r)}${_symbolSuffix(r.$1)}",
+                        style: TextStyle(fontFamily: _font)),
+                    onDeleted: () =>
+                        setState(() => cpu.writeWatches.remove(r)),
+                  ),
+              ],
+            ),
+          const Divider(height: 24),
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _watchHeading('WRITE HISTORY'),
+              Text(
+                log.isEmpty
+                    ? ''
+                    : '${log.length} write${log.length == 1 ? '' : 's'}'
+                        '${log.length >= cpu.writeLogLimit ? ', oldest dropped' : ''}',
+                style: TextStyle(fontFamily: _font, color: _inkA(0.75)),
+              ),
+              OutlinedButton(
+                key: const Key('watchClearLogButton'),
+                onPressed: log.isEmpty
+                    ? null
+                    : () => setState(cpu.clearWriteLog),
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (log.isEmpty)
+            Text('Nothing recorded yet.',
+                style: TextStyle(fontFamily: _font, color: _inkA(0.75)))
+          else
+            Table(
+              columnWidths: const {
+                0: IntrinsicColumnWidth(),
+                1: IntrinsicColumnWidth(),
+                2: IntrinsicColumnWidth(),
+                3: IntrinsicColumnWidth(),
+              },
+              children: [
+                TableRow(children: [
+                  _flashCell('CYCLES', bold: true),
+                  _flashCell('WRITTEN BY', bold: true),
+                  _flashCell('ADDRESS', bold: true),
+                  _flashCell('WAS -> IS', bold: true),
+                ]),
+                // Newest first: the write you are looking for is the one
+                // that just happened, not the one from the start of the boot.
+                for (final w in log.reversed.take(500))
+                  TableRow(children: [
+                    _flashCell('${w.cycles}'),
+                    _flashCell("H'${_hex6(w.pc)}${_symbolSuffix(w.pc)}"),
+                    _flashCell("H'${_hex6(w.addr)}${_symbolSuffix(w.addr)}"),
+                    _flashCell(
+                      "H'${_hex2(w.was)} -> H'${_hex2(w.value)}"
+                      '${w.changed ? '' : '   (no change)'}',
+                    ),
+                  ]),
+              ],
+            ),
+          if (log.length > 500)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text('Showing the newest 500 of ${log.length}.',
+                  style: TextStyle(fontFamily: _font, color: _inkA(0.55))),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _watchHeading(String text) => Text(
+        text,
+        style: TextStyle(
+            fontFamily: _font, color: _ink, fontWeight: FontWeight.bold),
+      );
 
   // ---- the serial EEPROM on port 4 --------------------------------------
   //

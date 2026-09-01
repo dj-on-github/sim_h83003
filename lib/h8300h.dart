@@ -25,6 +25,7 @@ import 'itu.dart';
 import 'sci.dart';
 import 'sparse_memory.dart';
 import 'keypad.dart';
+import 'condition.dart';
 
 /// CCR flag bit masks (I UI H U N Z V C).
 class H8Flag {
@@ -48,6 +49,32 @@ class H8Flag {
 /// [value] is an override. While it is null the window reads out of memory,
 /// which for a full memory dump means the byte the machine was holding when
 /// the dump was taken — so nothing changes until an input is driven.
+/// One write the machine made to a watched address.
+///
+/// The breakpoint answers "stop here"; this answers "who did that", which is
+/// the question that actually comes up. The PC is the instruction's own
+/// address, not wherever the fetch had reached.
+class WriteRecord {
+  const WriteRecord({
+    required this.cycles,
+    required this.pc,
+    required this.addr,
+    required this.value,
+    required this.was,
+  });
+
+  final int cycles;
+  final int pc;
+  final int addr;
+  final int value;
+
+  /// What was there before, so a write that changed nothing is visible as
+  /// such rather than looking like a change.
+  final int was;
+
+  bool get changed => value != was;
+}
+
 class ExternalInputs {
   ExternalInputs({
     required this.name,
@@ -341,6 +368,63 @@ class H8Cpu {
   /// Level the outside world holds each pin at, by data register address.
   final Map<int, int> pinLevel = {};
 
+  /// Address ranges whose writes are recorded, as (first, last) inclusive.
+  /// Empty means record nothing, which costs one test per write.
+  final List<(int, int)> writeWatches = [];
+
+  /// The writes that have landed in those ranges, oldest first. Capped at
+  /// [writeLogLimit]: a watch left on a busy address would otherwise grow
+  /// without end.
+  final List<WriteRecord> writeLog = [];
+
+  /// The most the log will hold. It is a cap, not a size: the oldest are
+  /// dropped in batches, so the log sits a little under this while a busy
+  /// address is watched.
+  int writeLogLimit = 5000;
+
+  /// Forgets what has been recorded, leaving the watches armed.
+  void clearWriteLog() => writeLog.clear();
+
+  /// Stop as soon as this holds. Checked before each instruction while it is
+  /// set, and nothing at all when it is not.
+  Condition? stopWhen;
+
+  /// What the armed condition works out to right now. Null when none is
+  /// armed; throws the same way evaluation does, so the caller can say that
+  /// a condition could not be worked out rather than showing a wrong number.
+  int? conditionValue() {
+    final c = stopWhen;
+    return c?.value(_conditionView);
+  }
+
+  /// Runs one instruction without asking the condition.
+  ///
+  /// This is what resuming from a condition stop means. The stop happens
+  /// before the instruction, so the instruction it stopped on has not run
+  /// yet; asking again before it runs would stop on it for ever. The
+  /// instruction breakpoint gets the same allowance when Run is pressed.
+  int stepPastCondition() {
+    final held = stopWhen;
+    stopWhen = null;
+    conditionHit = false;
+    final n = step();
+    stopWhen = held;
+    return n;
+  }
+
+  /// Set when [stopWhen] has held. The caller clears it.
+  bool conditionHit = false;
+
+  late final MachineView _conditionView = _CpuView(this);
+
+  /// True when [addr] is inside a watched range.
+  bool _watched(int addr) {
+    for (final (first, last) in writeWatches) {
+      if (addr >= first && addr <= last) return true;
+    }
+    return false;
+  }
+
   /// Which pins the outside world is driving, by data register address.
   final Map<int, int> pinDriven = {};
 
@@ -526,6 +610,29 @@ class H8Cpu {
   }
 
   void writeB(int addr, int value) {
+    // Recorded before the write, so the log can say what was displaced. Only
+    // when something is watching: an empty list costs one test.
+    if (writeWatches.isNotEmpty) {
+      final a = addr & 0xFFFFFF;
+      if (_watched(a)) {
+        writeLog.add(WriteRecord(
+          cycles: cycles,
+          pc: _instrPc,
+          addr: a,
+          value: value & 0xFF,
+          // peekBus, not readB: readB is the CPU's own read path, and a
+          // watch on a receive register would eat the byte it was there to
+          // watch. Looking is what the memory view does too.
+          was: peekBus(a),
+        ));
+        // Dropped a batch at a time. removeAt(0) is O(n), so a watch on a
+        // busy address would spend the whole run shuffling the list; the
+        // log still never holds more than writeLogLimit.
+        if (writeLog.length > writeLogLimit) {
+          writeLog.removeRange(0, (writeLogLimit ~/ 8).clamp(1, writeLog.length));
+        }
+      }
+    }
     addr &= 0xFFFFFF;
     if (profiling) dataAccessCount.bump(addr);
     if (dataBreaks.isNotEmpty && dataBreaks.contains(addr)) _noteBreak(addr);
@@ -945,6 +1052,24 @@ class H8Cpu {
   static const int sleepStates = 2;
 
   int step() {
+    // The condition is asked before each instruction rather than after, so
+    // "stopped" means "about to execute this", which is what a debugger's
+    // stop should mean. The state it sees is the one the instruction before
+    // it left behind.
+    final stop = stopWhen;
+    if (stop != null && !conditionHit) {
+      try {
+        if (stop.test(_conditionView)) {
+          conditionHit = true;
+          return 0;
+        }
+      } catch (_) {
+        // A condition that cannot be evaluated -- an address that reads
+        // oddly, say -- stops rather than throwing out of the run loop.
+        conditionHit = true;
+        return 0;
+      }
+    }
     if (halted && sleeping) cycles += sleepStates;
     // Peripherals run between instructions: they advance with the clock and
     // may raise an interrupt, which is also what wakes a sleeping CPU. Each
@@ -2512,5 +2637,46 @@ class H8Cpu {
     if ((v & 0x80) != 0) f |= H8Flag.n;
     if (v == 0) f |= H8Flag.z;
     ccr = f;
+  }
+}
+
+
+/// Lets a condition read the machine without knowing what a CPU is.
+class _CpuView implements MachineView {
+  _CpuView(this.cpu);
+  final H8Cpu cpu;
+
+  @override
+  int readByte(int addr) => cpu.peekBus(addr & 0xFFFFFF);
+
+  @override
+  int? register(String name) => switch (name) {
+        'pc' => cpu.pc,
+        'ccr' => cpu.ccr,
+        'cycles' => cpu.cycles,
+        'sp' => cpu.er[7],
+        'i' => (cpu.ccr >> 7) & 1,
+        'ui' => (cpu.ccr >> 6) & 1,
+        'h' => (cpu.ccr >> 5) & 1,
+        'u' => (cpu.ccr >> 4) & 1,
+        'n' => (cpu.ccr >> 3) & 1,
+        'z' => (cpu.ccr >> 2) & 1,
+        'v' => (cpu.ccr >> 1) & 1,
+        'c' => cpu.ccr & 1,
+        _ => _numbered(name),
+      };
+
+  int? _numbered(String name) {
+    if (name.length == 3 && name.startsWith('er')) {
+      final n = int.tryParse(name[2]);
+      return n == null || n > 7 ? null : cpu.er[n];
+    }
+    if (name.length == 2) {
+      final n = int.tryParse(name[1]);
+      if (n == null || n > 7) return null;
+      if (name[0] == 'r') return cpu.er[n] & 0xFFFF;
+      if (name[0] == 'e') return (cpu.er[n] >> 16) & 0xFFFF;
+    }
+    return null;
   }
 }
