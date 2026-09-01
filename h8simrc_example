@@ -1,0 +1,51 @@
+{
+  "views": {
+    "memory": false,
+    "disassembly": false,
+    "screen": true,
+    "sci": false,
+    "itu": false,
+    "dma": false,
+    "io": false,
+    "trace": false,
+    "profile": false,
+    "flash": false,
+    "eeprom": false,
+    "buttons": true
+  },
+  "memory": {
+    "followPc": true,
+    "address": "000100"
+  },
+  "sci": {
+    "channel": 1,
+    "transport": "serial",
+    "tcpPort": 5555,
+    "phiHz": 11059200,
+    "bridge": false
+  },
+  "pins": [],
+  "traces": [],
+  "profiling": false,
+  "flash": {
+    "file": "flash_v5_v5.bin",
+    "load": true,
+    "enable": true
+  },
+  "eeprom": {
+    "file": "eeprom.json",
+    "enable": false,
+    "verifyFriendly": false
+  },
+  "heldKeys": [],
+  "image": {
+    "load": false
+  },
+  "dataBreakpoints": [],
+  "instructionBreakpoints": [],
+  "appearance": {
+    "darkMode": true,
+    "fontFamily": "monospace",
+    "cpuHz": 0
+  }
+}
